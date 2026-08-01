@@ -2,6 +2,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include <fstream>
+#include <sstream>
 
 namespace vslam {
 
@@ -11,9 +12,9 @@ Dataset::Dataset(const std::string& path, Type type)
     if (type_ == Type::KITTI) {
         loadKITTIImageList(path);
     } else if (type_ == Type::TUM) {
-        LOG_WARN("TUM dataset support: TODO - parse rgb.txt and associate timestamps");
+        loadTUMImageList(path);
     } else if (type_ == Type::EUROC) {
-        LOG_WARN("EuRoC dataset support: TODO - load from cam0/data.csv");
+        loadEUROCImageList(path);
     }
 }
 
@@ -51,6 +52,50 @@ bool Dataset::loadKITTIImageList(const std::string& path) {
     return !image_paths_.empty();
 }
 
+bool Dataset::loadTUMImageList(const std::string& path) {
+    // TUM RGB-D 官方结构：<path>/rgb.txt，每行 "timestamp rgb/<file>"，# 开头为注释
+    std::ifstream ifs(path + "/rgb.txt");
+    if (!ifs.is_open()) {
+        LOG_WARN("TUM: cannot open " << path << "/rgb.txt");
+        return false;
+    }
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        double ts; std::string file;
+        if (!(iss >> ts >> file)) continue;
+        image_paths_.push_back(path + "/" + file);
+        timestamps_.push_back(ts);
+    }
+    total_frames_ = static_cast<int>(image_paths_.size());
+    LOG_INFO("Loaded " << total_frames_ << " TUM images from " << path);
+    return !image_paths_.empty();
+}
+
+bool Dataset::loadEUROCImageList(const std::string& path) {
+    // EuRoC 官方结构：<path>/cam0/data.csv，每行 "timestamp,<file>"
+    std::ifstream ifs(path + "/cam0/data.csv");
+    if (!ifs.is_open()) {
+        LOG_WARN("EuRoC: cannot open " << path << "/cam0/data.csv");
+        return false;
+    }
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::string ts_str, file;
+        std::istringstream ss(line);
+        std::getline(ss, ts_str, ',');
+        std::getline(ss, file, ',');
+        if (file.empty()) continue;
+        image_paths_.push_back(path + "/cam0/data/" + file);
+        timestamps_.push_back(std::stod(ts_str));
+    }
+    total_frames_ = static_cast<int>(image_paths_.size());
+    LOG_INFO("Loaded " << total_frames_ << " EuRoC images from " << path);
+    return !image_paths_.empty();
+}
+
 bool Dataset::nextFrame(cv::Mat& image, double& timestamp) {
     if (type_ == Type::CAMERA) {
         if (!cap_.isOpened()) return false;
@@ -67,8 +112,10 @@ bool Dataset::nextFrame(cv::Mat& image, double& timestamp) {
 
     // 读取彩色图像（VO 内部转灰度，Viewer 显示彩色视频流）
     image = cv::imread(image_paths_[current_index_], cv::IMREAD_COLOR);
-    // KITTI 数据集：文件名即时间戳的隐式编码
-    timestamp = static_cast<double>(current_index_) / 10.0; // 假设 10fps
+    // 时间戳：TUM/EuRoC 用数据集自带时间戳；KITTI 假设 10fps
+    timestamp = !timestamps_.empty()
+        ? timestamps_[current_index_]
+        : static_cast<double>(current_index_) / 10.0;
     current_index_++;
     return !image.empty();
 }

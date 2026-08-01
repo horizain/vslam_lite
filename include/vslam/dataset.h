@@ -35,12 +35,17 @@ public:
 
 private:
     bool loadKITTIImageList(const std::string& path);
+    /// TUM: 解析 <path>/rgb.txt（每行 "timestamp rgb/<file>"）
+    bool loadTUMImageList(const std::string& path);
+    /// EuRoC: 解析 <path>/cam0/data.csv（每行 "timestamp,<file>"）
+    bool loadEUROCImageList(const std::string& path);
 
     Type type_;
     vslam::Camera camera_;
 
-    // 数据集文件列表 / 摄像头句柄
+    // 数据集文件列表 / 时间戳 / 摄像头句柄
     std::vector<std::string> image_paths_;
+    std::vector<double>      timestamps_;   // 数据集自带时间戳（KITTI 为空则按 10fps 推算）
     cv::VideoCapture cap_;
 
     int current_index_ = 0;

@@ -32,6 +32,12 @@ int main(int argc, char** argv) {
     std::string traj_path   = "trajectory.txt";
 
     // ---- 解析命令行参数 ----
+    // 用法: run_vo <dataset_path|camera_index> [config.yaml] [trajectory.txt] [--tum|--euroc]
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--tum")       dataset_type = vslam::Dataset::Type::TUM;
+        else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
+    }
     if (argc >= 2) {
         input_path = argv[1];
         // 如果第一个参数是数字，视为摄像头索引
@@ -39,11 +45,14 @@ int main(int argc, char** argv) {
             dataset_type = vslam::Dataset::Type::CAMERA;
         }
     } else {
-        std::cout << "Usage: run_vo <dataset_path|camera_index> [config.yaml] [trajectory.txt]\n";
-        std::cout << "  dataset_path: path to image directory\n";
+        std::cout << "Usage: run_vo <dataset_path|camera_index> [config.yaml] [trajectory.txt] [--tum|--euroc]\n";
+        std::cout << "  dataset_path: path to image directory (KITTI) / dataset root (TUM, EuRoC)\n";
         std::cout << "  camera_index: integer (e.g., 0) for live camera\n";
+        std::cout << "  --tum / --euroc: dataset format flag\n";
         std::cout << "\nExample:\n";
         std::cout << "  ./run_vo /data/kitti/00/image_0\n";
+        std::cout << "  ./run_vo /data/tum/rgbd_dataset_freiburg1_xyz --tum\n";
+        std::cout << "  ./run_vo /data/euroc/MH_01 --euroc\n";
         std::cout << "  ./run_vo 0\n";
         return 1;
     }

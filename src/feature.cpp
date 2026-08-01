@@ -103,6 +103,8 @@ std::vector<unsigned char> FeatureMatcher::trackLK(
         if (status[i]) {
             cv::KeyPoint kp;
             kp.pt = curr_pts[i];
+            kp.size = 31;   // ORB 默认 patch 尺寸（否则描述子退化）
+            kp.angle = 0;
             curr_frame->keypoints.push_back(kp);
             // 保持地图点的关联
             if (i < prev_frame->map_points.size())

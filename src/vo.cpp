@@ -4,6 +4,9 @@
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <set>
+#include <algorithm>
+
 namespace vslam {
 
 VOConfig VOConfig::fromYaml(const std::string& path) {
@@ -39,8 +42,7 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
     : camera_(camera), cfg_(cfg), map_(std::make_shared<Map>()) {
     feature_matcher_.setParams(cfg_.num_features, cfg_.scale_factor, cfg_.pyramid_levels);
     if (cfg_.feature_method != 0) {
-        LOG_WARN("feature_method=" << cfg_.feature_method
-                 << " (LK 光流) not implemented yet, using ORB");
+        LOG_INFO("feature_method=" << cfg_.feature_method << " (LK 光流)");
     }
 }
 
@@ -59,8 +61,20 @@ SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
     static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
     clahe->apply(curr_frame_->image_gray, curr_frame_->image_gray);
 
-    // 2. 提取特征
-    feature_matcher_.extract(curr_frame_);
+    // 2. 提取/跟踪特征
+    // LK 模式（feature_method=1）：TRACKING 阶段用光流跟踪上一帧，不重新提取 ORB
+    const bool use_lk = (cfg_.feature_method == 1 && state_ == State::TRACKING
+                         && prev_frame_ && !prev_frame_->keypoints.empty());
+    if (use_lk) {
+        feature_matcher_.trackLK(prev_frame_, curr_frame_);
+        if (curr_frame_->keypoints.size() < (size_t)cfg_.min_matches_track) {
+            LOG_WARN("LK track degraded (" << curr_frame_->keypoints.size()
+                     << " pts), fallback to ORB extraction");
+            feature_matcher_.extract(curr_frame_);
+        }
+    } else {
+        feature_matcher_.extract(curr_frame_);
+    }
     if (curr_frame_->keypoints.empty()) {
         LOG_WARN("No features extracted, skipping frame");
         updateStatus(0, 0, 0.0);
@@ -72,12 +86,17 @@ SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
         bool ok = tryInitialize();
         if (ok) { state_ = State::TRACKING; }
     } else if (state_ == State::TRACKING) {
-        trackFrame();
+        // LK 模式：描述子为空说明走的是光流路径，用索引对齐的 PnP 跟踪
+        if (cfg_.feature_method == 1 && curr_frame_->descriptors.empty())
+            trackFrameLK();
+        else
+            trackFrame();
         if (needNewKeyFrame()) insertKeyFrame();
     } else if (state_ == State::LOST) {
         if (tryRelocalize()) { state_ = State::TRACKING; }
     }
 
+    prev_frame_ = curr_frame_;
     trajectory_.push_back(curr_frame_->pose_cw.t);
     return curr_frame_->pose_cw;
 }
@@ -222,19 +241,72 @@ SE3 VisualOdometry::trackFrame() {
 }
 
 // ============================================================
+// LK 光流跟踪（feature_method=1）
+// 光流后 map_points 与关键点索引对齐（继承自上一帧），直接做 PnP
+// ============================================================
+SE3 VisualOdometry::trackFrameLK() {
+    if (!curr_frame_) return SE3();
+
+    std::vector<cv::Point3f> pts3d;
+    std::vector<cv::Point2f> pts2d;
+    std::vector<int> kp_idx;
+    for (size_t i = 0; i < curr_frame_->keypoints.size(); i++) {
+        auto& mp = curr_frame_->map_points[i];
+        if (mp) {
+            pts3d.emplace_back((float)mp->pos_w.x(), (float)mp->pos_w.y(), (float)mp->pos_w.z());
+            pts2d.push_back(curr_frame_->keypoints[i].pt);
+            kp_idx.push_back((int)i);
+        }
+    }
+
+    int inliers_cnt = 0;
+    if (pts3d.size() >= 6) {
+        cv::Mat rvec, tvec;
+        std::vector<int> inliers;
+        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_.K(),
+                                     cv::Mat(), rvec, tvec,
+                                     false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
+        if (ok && inliers.size() >= 10) {
+            cv::Mat R;
+            cv::Rodrigues(rvec, R);
+            curr_frame_->pose_cw = matToSE3(R, tvec);
+            inliers_cnt = (int)inliers.size();
+            for (int idx : inliers) {
+                if (idx >= 0 && idx < (int)kp_idx.size()) {
+                    auto& mp = curr_frame_->map_points[kp_idx[idx]];
+                    if (mp) mp->observed_count++;
+                }
+            }
+            updateStatus((int)pts3d.size(), inliers_cnt, 0.0);
+            return curr_frame_->pose_cw;
+        }
+    }
+
+    // LK PnP 失败 → 重新提取 ORB 特征，回退到 ORB 匹配跟踪
+    LOG_WARN("LK PnP failed (" << pts3d.size() << " 3D pts), fallback to ORB track");
+    feature_matcher_.extract(curr_frame_);
+    return trackFrame();
+}
+
+// ============================================================
 // 重定位（LOST 状态下尝试匹配所有关键帧恢复跟踪）
 // ============================================================
 bool VisualOdometry::tryRelocalize() {
     auto all_kfs = map_->getAllKeyFrames();
     if (all_kfs.empty()) return false;
 
+    // LK 模式：当前帧可能无描述子，重定位前先提取 ORB
+    if (curr_frame_->descriptors.empty())
+        feature_matcher_.extract(curr_frame_);
+
     int best_inliers = 0;
     SE3 best_pose;
     Frame::Ptr best_kf;
 
-    for (auto& kf : all_kfs) {
+    // 对单个关键帧做 PnP 匹配，内点达标(20)即返回 true
+    auto try_kf = [&](const Frame::Ptr& kf) -> bool {
         auto matches = feature_matcher_.match(kf, curr_frame_, cfg_.match_ratio, true);
-        if ((int)matches.size() < cfg_.min_matches_init) continue;
+        if ((int)matches.size() < cfg_.min_matches_init) return false;
 
         std::vector<cv::Point3f> pts3d;
         std::vector<cv::Point2f> pts2d;
@@ -245,7 +317,7 @@ bool VisualOdometry::tryRelocalize() {
                 pts2d.push_back(curr_frame_->keypoints[m.trainIdx].pt);
             }
         }
-        if (pts3d.size() < 10) continue;
+        if (pts3d.size() < 10) return false;
 
         cv::Mat rvec, tvec;
         std::vector<int> inliers;
@@ -256,6 +328,19 @@ bool VisualOdometry::tryRelocalize() {
             best_inliers = (int)inliers.size();
             best_pose = matToSE3(cv::Mat(rvec), tvec);
             best_kf = kf;
+        }
+        return best_inliers >= 20;
+    };
+
+    // 1) 优先尝试最近的关键帧（时间邻近，成功率最高）
+    int recent_n = std::min(5, (int)all_kfs.size());
+    for (int i = (int)all_kfs.size() - recent_n; i < (int)all_kfs.size(); i++) {
+        if (try_kf(all_kfs[i])) break;
+    }
+    // 2) 仍不足则全量遍历（处理回环回到历史位置的情况）
+    if (best_inliers < 20) {
+        for (auto& kf : all_kfs) {
+            if (try_kf(kf)) break;
         }
     }
 
@@ -277,21 +362,68 @@ bool VisualOdometry::tryRelocalize() {
 // ============================================================
 void VisualOdometry::insertKeyFrame() {
     map_->insertKeyFrame(curr_frame_);
+    // LK 模式：关键帧用干净的 ORB 特征重建（LK 关键点无方向，描述子无法与
+    // 历史关键帧匹配），保证与上一关键帧的 ORB 匹配/三角化可靠；
+    // 普通帧仍用 LK 光流跟踪（从关键帧 ORB 特征出发）
+    if (cfg_.feature_method == 1)
+        feature_matcher_.extract(curr_frame_);
     triangulateNewPoints(ref_frame_, curr_frame_,
         feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
     ref_frame_ = curr_frame_;
 
     LOG_INFO("New KF. mp=" << map_->mapPointCount());
 
-    auto all_kfs = map_->getAllKeyFrames();
-    int n = cfg_.local_window_size;
-    std::vector<Frame::Ptr> window;
-    int start = std::max(0, (int)all_kfs.size() - n);
-    for (int i = start; i < (int)all_kfs.size(); i++)
-        window.push_back(all_kfs[i]);
-
+    // 共视图滑动窗口（按共视地图点数选帧）+ Local BA
+    std::vector<Frame::Ptr> window = selectLocalWindow(cfg_.local_window_size);
     Optimizer::localBundleAdjustment(camera_, map_, window, cfg_.local_ba_iterations);
     updateStatus(status_.matches, status_.inliers, status_.parallax);
+}
+
+// ============================================================
+// 共视图滑动窗口：与当前关键帧共视地图点最多的帧 + 当前帧
+// ============================================================
+std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
+    std::vector<Frame::Ptr> window;
+    auto all_kfs = map_->getAllKeyFrames();
+    if (all_kfs.empty() || !curr_frame_) return window;
+
+    // 当前帧引用的地图点集合
+    std::set<unsigned long> curr_mps;
+    for (auto& mp : curr_frame_->map_points)
+        if (mp) curr_mps.insert(mp->id);
+
+    // 统计每个关键帧与当前帧的共视点数量
+    struct Candidate { Frame::Ptr kf; int cov; };
+    std::vector<Candidate> cands;
+    for (auto& kf : all_kfs) {
+        if (kf->id == curr_frame_->id) continue;
+        int cov = 0;
+        for (auto& mp : kf->map_points)
+            if (mp && curr_mps.count(mp->id)) cov++;
+        cands.push_back({kf, cov});
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const Candidate& a, const Candidate& b) { return a.cov > b.cov; });
+
+    // 窗口 = 当前帧 + 共视最多的前 n-1 帧（要求至少 2 个共视点）
+    window.push_back(curr_frame_);
+    for (auto& c : cands) {
+        if ((int)window.size() >= n) break;
+        if (c.cov >= 2) window.push_back(c.kf);
+    }
+
+    // 兜底：共视不足时退化为按时间取最近 n 帧
+    if (window.size() < 2) {
+        window.clear();
+        int start = std::max(0, (int)all_kfs.size() - n);
+        for (int i = start; i < (int)all_kfs.size(); i++)
+            window.push_back(all_kfs[i]);
+    }
+
+    // 按 id 排序，最早帧在 index 0（BA 中锚定，保证全局一致）
+    std::sort(window.begin(), window.end(),
+              [](const Frame::Ptr& a, const Frame::Ptr& b) { return a->id < b->id; });
+    return window;
 }
 
 // ============================================================
@@ -345,7 +477,9 @@ bool VisualOdometry::needNewKeyFrame() const {
     Eigen::Quaterniond q_rel = curr_frame_->pose_cw.q * ref_frame_->pose_cw.q.inverse();
     double drot = 2.0 * std::acos(
         std::clamp(std::abs(q_rel.w()), 0.0, 1.0));
-    return dtrans > cfg_.keyframe_translation || drot > cfg_.keyframe_rotation;
+    // 运动阈值 + 匹配衰减阈值：内点过少说明地图不足/视角变化大，强制补充关键帧
+    bool weak_match = status_.inliers < cfg_.keyframe_min_inliers;
+    return dtrans > cfg_.keyframe_translation || drot > cfg_.keyframe_rotation || weak_match;
 }
 
 std::vector<Vec3> VisualOdometry::getTrajectory() const {

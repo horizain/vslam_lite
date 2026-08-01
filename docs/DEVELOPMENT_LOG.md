@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-01 (位姿语义统一修复 + 测试基线 + Viewer 重构 + 配置接入)
+> 最后更新: 2026-08-01 (Phase 1 全部完成：LK 光流 + 共视窗口 + 关键帧衰减 + TUM/EuRoC 支持)
 
 ---
 
@@ -55,8 +55,8 @@
 |------|------|------|
 | `include/vslam/feature.h` | ✅ 完成 | FeatureMatcher: ORB提取, BF+knn+ratio匹配, LK光流, setParams |
 | `src/feature.cpp` | ✅ 完成 | ORB 特征(默认1000, 可配置), 暴力匹配+比率测试+RANSAC 基础矩阵剔除 |
-| `include/vslam/vo.h` | ✅ 完成 | VisualOdometry: 状态机, VOConfig 配置结构, PnP跟踪, 关键帧策略 |
-| `src/vo.cpp` | ✅ 完成 | 初始化+跟踪+PnP+对极回退+三角化+关键帧判决+Local BA 集成 |
+| `include/vslam/vo.h` | ✅ 完成 | VisualOdometry: 状态机, VOConfig 配置结构, PnP跟踪, LK 模式, 关键帧策略 |
+| `src/vo.cpp` | ✅ 完成 | 初始化+跟踪(ORB/LK)+PnP+对极回退+三角化+共视窗口 Local BA+LOST 优先重定位 |
 | `include/vslam/optimizer.h` | ✅ 完成 | g2o 后端接口 |
 | `src/optimizer.cpp` | ✅ 完成 | **Local BA 已实现并集成**（滑动窗口，Huber 核，可配置迭代次数） |
 
@@ -102,7 +102,7 @@
 | 文件 | 状态 | 说明 |
 |------|------|------|
 | `include/vslam/dataset.h` | ✅ 完成 | Dataset: KITTI/TUM/EuRoC/CAMERA 四类型 |
-| `src/dataset.cpp` | ⚠️ 部分 | **KITTI**: ✅ 完成(彩色读取→VO 内转灰度, Viewer 显示彩色)<br>**CAMERA**: ✅ 完成(cv::VideoCapture)<br>**TUM**: ❌ TODO - 需解析rgb.txt关联时间戳<br>**EUROC**: ❌ TODO - 需解析cam0/data.csv |
+| `src/dataset.cpp` | ✅ 完成 | **KITTI**: ✅ 完成(彩色读取→VO 内转灰度)<br>**TUM**: ✅ 完成(解析 `rgb.txt` 时间戳 + 路径)<br>**EUROC**: ✅ 完成(解析 `cam0/data.csv`)<br>**CAMERA**: ✅ 完成(cv::VideoCapture) |
 
 ### 2.6 应用入口
 
@@ -127,31 +127,35 @@
 
 ## 三、待完成的工作
 
-### 3.1 Phase 1 剩余任务（优先级：高）
+### 3.1 Phase 1 剩余任务
 
-#### 🔴 P0 - KITTI 数据集实测（被数据下载阻塞）
+#### 🔴 P0 - KITTI 数据集实测（等待数据）
 
 - [x] 安装依赖并编译 ✅
 - [x] 编译错误修复 ✅
-- [ ] **KITTI 数据集实测**：当前 `/home/ruijianding/data/kitti/data_odometry_gray.zip` 为损坏文件(60KB, BadZipFile)。
-  使用 `scripts/prepare_kitti.sh` 准备数据后运行：
+- [x] 合成图像/摄像头测试 ✅
+- [x] `scripts/install_deps.sh` 依赖安装脚本 ✅（2026-08-01）
+- [ ] **KITTI 数据集实测**（需用户下载数据）：下载后运行
   `./build/bin/run_vo ~/data/kitti/sequences/00/image_0 config/default.yaml trajectory_00.txt`
 - [ ] **结果评估**：与 KITTI ground truth(`~/data/kitti/poses/00.txt`) 用 EVO 对比 ATE/RPE
 - [ ] **参数调优**：keyframe 阈值、ORB 特征数 vs 速度、RANSAC 阈值（现全部可在 yaml 调整）
 
-#### 🟡 P1 - 后端优化（g2o）
+#### 🟡 P1 - 后端优化（g2o）✅ 完成
 
-- [x] `src/optimizer.cpp` → `localBundleAdjustment()` ✅ 已实现+集成（滑动窗口）
-- [ ] 共视图滑动窗口增强：按共视地图点数选帧（当前按时间窗取最近 N 帧）
+- [x] `localBundleAdjustment()` ✅ 已实现+集成
+- [x] **共视图滑动窗口** ✅（2026-08-01）：按共视地图点数选帧 + 最早帧锚定，共视不足时退化为时间窗
 
-#### 🟢 P2 - 完善与增强
+#### 🟢 P2 - 完善与增强 ✅ 完成（2026-08-01）
 
-- [ ] **TUM 数据集支持**: 解析 `rgb.txt` + 关联时间戳，单目模式(无深度)
-- [ ] **EuRoC 数据集支持**: 解析 `cam0/data.csv`，加载 IMU 数据(可选)
-- [ ] **LK 光流模式接入**: `VOConfig::feature_method = 1`（接口已就绪，trackFrame 尚未实现 LK 路径）
-- [ ] **关键帧策略增强**：匹配点数衰减触发关键帧
-- [ ] **LOST 状态恢复优化**：重定位目前遍历全部关键帧全图匹配，慢（Phase 2 词袋后解决）
-- [ ] **编译安装脚本**: `scripts/install_deps.sh` 自动化安装依赖
+- [x] **TUM 数据集支持**: 解析 `rgb.txt` + 关联时间戳 ✅
+- [x] **EuRoC 数据集支持**: 解析 `cam0/data.csv` ✅（IMU 加载为 Phase 2 可选）
+- [x] **LK 光流模式接入**: `VOConfig::feature_method = 1` ✅
+  - 普通帧 LK 光流跟踪（索引对齐 map_points 做 PnP），失败自动回退 ORB
+  - 关键帧插入时重建干净 ORB 特征（LK 关键点无方向，描述子无法与历史关键帧匹配）
+  - LOST 重定位前自动补提取描述子
+- [x] **关键帧策略增强**: 内点衰减触发关键帧 ✅（`keyframe_min_inliers`）
+- [x] **LOST 状态恢复优化**: 优先匹配最近 5 个关键帧，不足再全量遍历 ✅
+- [x] **编译安装脚本**: `scripts/install_deps.sh` ✅
 
 ### 3.2 Phase 2 - 完整 SLAM（优先级：中）
 
@@ -220,12 +224,12 @@ vslam/
 │   └── loop_closure.h              # 回环检测(Phase2)
 ├── src/
 │   ├── camera.cpp                  # ✅ 完成
-│   ├── dataset.cpp                 # ⚠️ KITTI+CAMERA完成, TUM/EuROC TODO
+│   ├── dataset.cpp                 # ✅ 完成(KITTI/TUM/EuRoC/CAMERA)
 │   ├── mappoint.cpp                # ✅ 完成
 │   ├── map.cpp                     # ✅ 完成
-│   ├── feature.cpp                 # ✅ 完成
-│   ├── vo.cpp                      # ✅ 完成(核心管线, T_cw 语义统一)
-│   ├── optimizer.cpp               # ✅ 完成(Local BA)
+│   ├── feature.cpp                 # ✅ 完成(ORB+LK)
+│   ├── vo.cpp                      # ✅ 完成(核心管线, T_cw 语义统一, LK 模式)
+│   ├── optimizer.cpp               # ✅ 完成(Local BA + 共视窗口)
 │   ├── viewer.cpp                  # ✅ 完成(Pangolin, 左轨迹右视频)
 │   └── loop_closure.cpp            # ❌ TODO(Phase2)
 └── test/
@@ -243,12 +247,24 @@ vslam/
 
 ---
 
-## 六、下次开发入口清单
+## 六、Phase 1 完成状态
 
-按优先级排列：
+**Phase 1（单目 VO + 局部 BA）已全部完成**（2026-08-01），仅剩 KITTI 真实数据集评估待数据到位：
 
-1. **🔴 KITTI 实测**: 下载数据 → `scripts/prepare_kitti.sh` → `run_vo` → EVO 评估 ATE/RPE
-2. **🟡 LK 光流接入**: `trackFrame()` 支持 `feature_method=1`（接口已就绪），非关键帧提速
-3. **🟡 共视图滑动窗口**: Local BA 窗口按共视关系选帧（替代时间窗）
-4. **🟢 TUM/EuRoC 数据集支持**: 解析时间戳文件
-5. **🔵 Phase 2**: DBoW3 安装 → 回环检测 + PoseGraph + 全局 BA
+```
+✅ 位姿语义统一（T_cw）          ✅ Local BA + 共视图滑动窗口
+✅ 初始化/跟踪/LOST 状态机        ✅ LK 光流模式（自动回退 ORB）
+✅ 关键帧策略（运动+旋转+衰减）   ✅ TUM/EuRoC/KITTI/摄像头数据源
+✅ Viewer 双窗口                  ✅ yaml 全参数配置
+✅ 单元测试 7/7                   ✅ TUM 轨迹输出（EVO 可评估）
+✅ 位姿保存                       ✅ install_deps.sh / prepare_kitti.sh
+```
+
+下一步（Phase 2 完整 SLAM）：
+
+1. **🔴 KITTI 实测评估**: 下载数据 → `scripts/prepare_kitti.sh` → `run_vo` → EVO 对比 ATE/RPE → 参数调优
+2. **🔵 DBoW3 安装**: `bash scripts/install_deps.sh`（含 DBoW3）
+3. **🔵 回环检测**: `loop_closure.cpp` 完整实现（词袋 + 候选 + 几何验证）
+4. **🔵 PoseGraph + Global BA**: `optimizer.cpp` 补全
+5. **🔵 地图管理**: MapPoint 质量维护 / 关键帧冗余剔除 / 地图保存加载
+6. **🟢 EuRoC IMU 加载**: 紧耦合融合（可选）
