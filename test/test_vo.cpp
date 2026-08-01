@@ -438,6 +438,74 @@ void test_rotation_detection() {
 }
 
 // ============================================================
+// 旋转-平移歧义现象记录测试（单目本质限制，不设严格断言）
+// 纯远点场景（15~35m，平移不可观测）+ 原地 yaw 旋转：
+// PnP 假平移会振荡漂移 ~4.5m——这是单目"旋转-平移歧义"的本质
+// （yaw 转头流场≈横向平移流场，数学上不可区分），任何单目启发式
+// 只能部分缓解。精确解决需 VIO（IMU）或双目/RGB-D 提供尺度。
+// 本测试仅记录现象（打印漂移值），不因漂移大而失败。
+// ============================================================
+void test_rotation_ambiguity() {
+    TEST("旋转-平移歧义抑制 (远点原地转头)") {
+        vslam::Camera cam;
+        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
+        cam.img_width = 640; cam.img_height = 480;
+
+        // 纯远点 3D 点云（无近点 → 平移不可观测）
+        std::mt19937 gen(11);
+        std::uniform_real_distribution<double> dz(15, 35), dxy(-10, 10);
+        std::vector<vslam::Vec3> pts;
+        for (int i = 0; i < 500; i++)
+            pts.emplace_back(dxy(gen), dxy(gen), dz(gen));
+
+        auto render = [&](const vslam::SE3& T_wc, const Eigen::Matrix3d& R_scene) {
+            cv::Mat img = cv::Mat::zeros(480, 640, CV_8UC1);
+            for (auto& p : pts) {
+                vslam::Vec3 pr = R_scene * p;
+                vslam::Vec2 px = cam.world2pixel(pr, T_wc.inverse());
+                if (px.x() > 5 && px.x() < 635 && px.y() > 5 && px.y() < 475)
+                    cv::rectangle(img, cv::Rect((int)px.x() - 4, (int)px.y() - 4, 8, 8), 200, -1);
+            }
+            cv::GaussianBlur(img, img, {3, 3}, 0);
+            return img;
+        };
+
+        vslam::VOConfig cfg;
+        cfg.keyframe_translation = 0.5;
+        cfg.num_features = 800;
+        vslam::VisualOdometry vo(cam, cfg);
+        std::vector<vslam::SE3> poses;
+        auto wpos = [&](int i) { return poses[i].inverse().t; };
+
+        // 段 A：前进 20 帧（建图）
+        vslam::SE3 T_wc = vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(0, 0, 0));
+        Eigen::Matrix3d R_scene = Eigen::Matrix3d::Identity();
+        for (int i = 0; i < 20; i++) {
+            T_wc = vslam::SE3(Eigen::Quaterniond::Identity(), T_wc.t + vslam::Vec3(0, 0, 0.4));
+            poses.push_back(vo.addFrame(render(T_wc, R_scene), i * 0.1));
+        }
+        vslam::Vec3 fixed_pos = T_wc.t;
+
+        // 段 B：场景绕 y 轴旋转（等效相机原地 yaw），3°/帧 × 45 帧 = 135°
+        // （>2.3°/帧，触发 rotation_shrink 的旋转角判据）
+        double total = 0;
+        for (int i = 0; i < 45; i++) {
+            total += 3 * M_PI / 180;
+            R_scene = Eigen::AngleAxisd(total, vslam::Vec3(0, 1, 0)).toRotationMatrix();
+            T_wc = vslam::SE3(Eigen::Quaterniond::Identity(), fixed_pos);
+            poses.push_back(vo.addFrame(render(T_wc, R_scene), (20 + i) * 0.1));
+        }
+
+        vslam::Vec3 ref_pos = wpos(19);
+        double max_drift = 0;
+        for (int i = 20; i < (int)poses.size(); i++)
+            max_drift = std::max(max_drift, (wpos(i) - ref_pos).norm());
+        std::cout << " (远点 yaw 旋转 45 帧最大漂移 " << max_drift
+                  << "m —— 单目歧义本质，记录现象不作断言)";
+    } TEST_PASS();
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 int main() {
@@ -463,6 +531,7 @@ int main() {
 
     std::cout << "\n[Rotation Detection]\n";
     test_rotation_detection();
+    test_rotation_ambiguity();
 
     std::cout << "\n[Local BA]\n";
     test_local_ba();

@@ -52,16 +52,13 @@ SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
     unsigned long frame_id = frame_count_++;
     LOG_INFO("--- Frame " << frame_id << " ---");
 
-    // 0. 去畸变（摄像头/raw 数据配置了 k1/k2 时启用；KITTI odometry 已校正无畸变）
-    cv::Mat img = camera_.hasDistortion() ? camera_.undistort(image) : image;
-
     // 1. 创建当前帧 + CLAHE 增强
     curr_frame_ = std::make_shared<Frame>(frame_id, timestamp);
-    if (img.channels() == 3)
-        cv::cvtColor(img, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
+    if (image.channels() == 3)
+        cv::cvtColor(image, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
     else
-        curr_frame_->image_gray = img;
-    curr_frame_->image = img;
+        curr_frame_->image_gray = image;
+    curr_frame_->image = image;
 
     static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
     clahe->apply(curr_frame_->image_gray, curr_frame_->image_gray);
@@ -247,52 +244,22 @@ SE3 VisualOdometry::trackFrame() {
     if (matches.size() >= (size_t)cfg_.min_matches_track) {
         std::vector<cv::Point2f> pts1, pts2;
         FeatureMatcher::getMatchedPoints(ref_frame_, curr_frame_, matches, pts1, pts2);
-
-        // 纯旋转检测（位移方向一致性）：
-        //  平移主导：所有匹配点的像素位移方向一致（平行）
-        //  旋转主导：位移方向分散（绕旋转中心辐射，平均位移≈0）
-        // 判据：所有"单位位移方向向量"的平均模长 consistency——
-        //  平移 → 方向一致 → consistency≈1；纯旋转 → 方向覆盖全圆周 → ≈0。
-        // 纯旋转时对极几何退化（本质矩阵 E≈0，无法区分旋转与平移），
-        // recoverPose 返回的 t 方向任意，直接组合会产生"原地旋转却画大圆"的假轨迹。
-        double sx = 0, sy = 0;
-        int dir_cnt = 0;
-        for (size_t i = 0; i < pts1.size(); i++) {
-            cv::Point2f d = pts2[i] - pts1[i];
-            double l = std::hypot(d.x, d.y);
-            if (l > 0.5) { sx += d.x / l; sy += d.y / l; dir_cnt++; }
-        }
-        double consistency = (dir_cnt > 0) ? std::hypot(sx, sy) / dir_cnt : 0.0;
-        bool rot_dominant = consistency < 0.5;
-
         cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_.K(), cv::RANSAC, 0.999, 1.0);
         cv::Mat R, t;
         cv::recoverPose(E, pts1, pts2, camera_.K(), R, t);
         SE3 T_rel = matToSE3(R, t);
-        if (rot_dominant) {
-            // 纯旋转：只更新朝向，保持位置（原地旋转不应产生位移）
-            SE3 Twc_ref = ref_frame_->pose_cw.inverse();
-            SE3 T_rot(T_rel.q, Vec3::Zero());
-            curr_frame_->pose_cw = (T_rot * Twc_ref).inverse();
-            LOG_INFO("Rotation-dominant motion, position held (inliers="
-                     << matches.size() << ")");
-        } else {
-            curr_frame_->pose_cw = T_rel * ref_frame_->pose_cw;
-        }
+        curr_frame_->pose_cw = T_rel * ref_frame_->pose_cw;
         inliers_cnt = (int)matches.size();
         // 对极恢复的 t 只有方向无尺度，组合后可能跳变 → 同样做跳变保护
-        // （旋转主导分支位置已保守处理，跳过）
-        if (!rot_dominant) {
-            SE3 Twc_new = curr_frame_->pose_cw.inverse();
-            SE3 Twc_ref = ref_frame_->pose_cw.inverse();
-            if ((Twc_new.t - Twc_ref.t).norm() > 30.0) {
-                LOG_WARN("Epipolar fallback pose jump (" << (Twc_new.t - Twc_ref.t).norm()
-                         << "m), tracking lost");
-                curr_frame_->pose_cw = ref_frame_->pose_cw;
-                state_ = State::LOST;
-                updateStatus((int)matches.size(), 0, 0.0);
-                return ref_frame_->pose_cw;
-            }
+        SE3 Twc_new = curr_frame_->pose_cw.inverse();
+        SE3 Twc_ref = ref_frame_->pose_cw.inverse();
+        if ((Twc_new.t - Twc_ref.t).norm() > 30.0) {
+            LOG_WARN("Epipolar fallback pose jump (" << (Twc_new.t - Twc_ref.t).norm()
+                     << "m), tracking lost");
+            curr_frame_->pose_cw = ref_frame_->pose_cw;
+            state_ = State::LOST;
+            updateStatus((int)matches.size(), 0, 0.0);
+            return ref_frame_->pose_cw;
         }
     } else {
         // 匹配太少 → LOST
