@@ -67,23 +67,27 @@ int main(int argc, char** argv) {
         traj_path = argv[3];
     }
 
-    // ---- 加载相机参数 ----
-    vslam::Camera camera;
-    if (dataset_type != vslam::Dataset::Type::CAMERA) {
-        camera = vslam::Camera::fromYaml(config_path);
-    } else {
-        // 摄像头模式使用默认参数（实际应通过标定获取）
-        camera.fx = 500; camera.fy = 500;
-        camera.cx = 320; camera.cy = 240;
-        camera.img_width = 640; camera.img_height = 480;
-        LOG_WARN("Using default camera params for live camera - calibrate for best results");
-    }
-
-    // ---- 创建数据源 ----
+    // ---- 创建数据源（先创建，便于读取数据集自带标定）----
     vslam::Dataset dataset(
         dataset_type == vslam::Dataset::Type::CAMERA
             ? vslam::Dataset(std::stoi(input_path))
             : vslam::Dataset(input_path, dataset_type));
+
+    // ---- 加载相机参数：优先数据集标定（KITTI calib.txt），否则配置文件 ----
+    vslam::Camera camera;
+    if (dataset_type != vslam::Dataset::Type::CAMERA && dataset.hasCalibration()) {
+        camera = dataset.getCamera();
+    } else if (dataset_type != vslam::Dataset::Type::CAMERA) {
+        camera = vslam::Camera::fromYaml(config_path);
+    } else {
+        // 摄像头模式使用默认参数（建议先用标定工具获取真实内参）
+        camera.fx = 500; camera.fy = 500;
+        camera.cx = 320; camera.cy = 240;
+        camera.img_width = 640; camera.img_height = 480;
+        LOG_WARN("Camera mode: using DEFAULT intrinsics (500/500/320/240). "
+                 "For accurate rotation/scale, calibrate your camera "
+                 "(e.g. OpenCV chessboard calibration) and pass config.yaml.");
+    }
 
     // ---- 初始化 VO（加载 VO/Feature/Optimizer 参数）----
     vslam::VOConfig vo_cfg = vslam::VOConfig::fromYaml(config_path);

@@ -13,6 +13,7 @@ Dataset::Dataset(const std::string& path, Type type)
 
     if (type_ == Type::KITTI) {
         loadKITTIImageList(path);
+        loadCalibration(path);   // 自动读取 calib.txt 内参（各序列内参不同）
     } else if (type_ == Type::TUM) {
         loadTUMImageList(path);
     } else if (type_ == Type::EUROC) {
@@ -52,6 +53,51 @@ bool Dataset::loadKITTIImageList(const std::string& path) {
     total_frames_ = static_cast<int>(image_paths_.size());
     LOG_INFO("Loaded " << total_frames_ << " images from " << path);
     return !image_paths_.empty();
+}
+
+bool Dataset::loadCalibration(const std::string& image_dir) {
+    // KITTI 结构：<sequences>/<seq>/image_0/，calib.txt 在 <sequences>/<seq>/calib.txt
+    std::string calib_path = image_dir + "/../calib.txt";
+    std::ifstream ifs(calib_path);
+    if (!ifs.is_open()) {
+        calib_path = image_dir + "/calib.txt";   // 兼容直接指向序列目录
+        ifs.open(calib_path);
+    }
+    if (!ifs.is_open()) {
+        LOG_WARN("KITTI: calib.txt not found (" << calib_path << "), falling back to config");
+        return false;
+    }
+    // 找 P0 行（左目投影矩阵 3x4），提取 fx fy cx cy
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.rfind("P0:", 0) != 0) continue;
+        std::istringstream iss(line.substr(3));
+        std::vector<double> m;
+        double v;
+        while (iss >> v) m.push_back(v);
+        if (m.size() >= 12) {
+            camera_.fx = m[0];
+            camera_.cx = m[2];
+            camera_.fy = m[5];
+            camera_.cy = m[6];
+            // 图像尺寸：从第一帧获取（calib.txt 不含）
+            if (!image_paths_.empty()) {
+                cv::Mat first = cv::imread(image_paths_[0], cv::IMREAD_GRAYSCALE);
+                if (!first.empty()) {
+                    camera_.img_width  = first.cols;
+                    camera_.img_height = first.rows;
+                }
+            }
+            calib_loaded_ = true;
+            LOG_INFO("Loaded KITTI calibration from " << calib_path
+                     << " (fx=" << camera_.fx << " cx=" << camera_.cx
+                     << " cy=" << camera_.cy << " img=" << camera_.img_width
+                     << "x" << camera_.img_height << ")");
+            return true;
+        }
+    }
+    LOG_WARN("KITTI: no P0 in " << calib_path);
+    return false;
 }
 
 bool Dataset::loadTUMImageList(const std::string& path) {

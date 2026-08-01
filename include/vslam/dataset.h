@@ -27,6 +27,9 @@ public:
     /// 获取相机模型（从数据集自带参数或标定文件读取）
     const vslam::Camera& getCamera() const { return camera_; }
 
+    /// 是否从数据集加载了标定内参（否则由调用方用配置文件）
+    bool hasCalibration() const { return calib_loaded_; }
+
     /// 获取数据集类型
     Type type() const { return type_; }
 
@@ -39,6 +42,8 @@ private:
     bool loadTUMImageList(const std::string& path);
     /// EuRoC: 解析 <path>/cam0/data.csv（每行 "timestamp,<file>"）
     bool loadEUROCImageList(const std::string& path);
+    /// KITTI: 从 <image_dir>/../calib.txt 读取 P0 内参（KITTI 图像已校正，无畸变系数）
+    bool loadCalibration(const std::string& image_dir);
 
     Type type_;
     vslam::Camera camera_;
@@ -48,6 +53,7 @@ private:
     std::vector<double>      timestamps_;   // 数据集自带时间戳（KITTI 为空则按 10fps 推算）
     cv::VideoCapture cap_;
 
+    bool calib_loaded_ = false;
     int current_index_ = 0;
     int total_frames_  = 0;
 };

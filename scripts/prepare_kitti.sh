@@ -75,6 +75,14 @@ for name in z.namelist():
         out.write(z.read(name))
     count += 1
 print(f"    {seq}: {count} 张图像")
+# 顺带解压标定文件（内参自动加载用）
+for calib_name in [f"dataset/sequences/{seq}/calib.txt",
+                   f"data_odometry_gray/dataset/sequences/{seq}/calib.txt"]:
+    if calib_name in z.namelist():
+        with open(f"sequences/{seq}/calib.txt", "wb") as out:
+            out.write(z.read(calib_name))
+        print(f"    {seq}: calib.txt")
+        break
 PYEOF
 done
 

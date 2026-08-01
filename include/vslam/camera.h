@@ -1,6 +1,8 @@
 #pragma once
 
 #include "vslam/common.h"
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
 #include <string>
 #include <memory>
 
@@ -45,6 +47,7 @@ public:
     double fx = 0, fy = 0, cx = 0, cy = 0;
     int    img_width = 0, img_height = 0;
     double k1 = 0, k2 = 0, p1 = 0, p2 = 0, k3 = 0;  // 畸变
+    mutable cv::Mat mapx_, mapy_;  // 去畸变 remap 表（懒初始化）
 
     MonocularCamera() = default;
 
@@ -57,6 +60,22 @@ public:
     }
     cv::Mat distCoeffs() const {
         return (cv::Mat_<double>(5, 1) << k1, k2, p1, p2, k3);
+    }
+
+    /// 是否配置了畸变（非零畸变系数）
+    bool hasDistortion() const { return k1 != 0 || k2 != 0 || p1 != 0 || p2 != 0 || k3 != 0; }
+
+    /// 去畸变（预计算 remap 表加速；无畸变时原样返回）
+    cv::Mat undistort(const cv::Mat& img) const {
+        if (!hasDistortion()) return img;
+        if (mapx_.empty()) {
+            cv::initUndistortRectifyMap(K(), distCoeffs(), cv::Mat(), K(),
+                                        cv::Size(img_width, img_height),
+                                        CV_32FC1, mapx_, mapy_);
+        }
+        cv::Mat out;
+        cv::remap(img, out, mapx_, mapy_, cv::INTER_LINEAR);
+        return out;
     }
 
     int width()  const override { return img_width; }

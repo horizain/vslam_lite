@@ -402,6 +402,42 @@ void test_local_ba() {
 }
 
 // ============================================================
+// 纯旋转检测判据测试
+// 对极几何在纯旋转时退化（E≈0，旋转/平移不可分），trackFrame 用
+// "匹配点像素位移方向一致性"判断：平移主导方向一致，旋转主导方向分散。
+// ============================================================
+void test_rotation_detection() {
+    // 与 vo.cpp 对极回退分支相同的判据逻辑（单位位移方向向量的平均模长）
+    auto rot_dominant = [](const std::vector<cv::Point2f>& ds) {
+        double sx = 0, sy = 0;
+        int cnt = 0;
+        for (auto& d : ds) {
+            double l = std::hypot(d.x, d.y);
+            if (l > 0.5) { sx += d.x / l; sy += d.y / l; cnt++; }
+        }
+        double consistency = (cnt > 0) ? std::hypot(sx, sy) / cnt : 0.0;
+        return consistency < 0.5;   // 方向分散 → 旋转主导
+    };
+
+    TEST("纯旋转检测判据 (平移≠旋转)") {
+        // 平移主导：所有像素位移方向一致 (5,3)
+        std::vector<cv::Point2f> trans;
+        for (int i = 0; i < 10; i++) trans.emplace_back(5.f, 3.f);
+        // 旋转主导：绕图像中心 (320,240) 旋转 10°（位移方向绕中心辐射，方向分散）
+        std::vector<cv::Point2f> rot;
+        for (int i = 0; i < 12; i++) {
+            double a = i * 2 * M_PI / 12;
+            cv::Point2f p(320 + 200 * std::cos(a), 240 + 200 * std::sin(a));
+            cv::Point2f q(320 + 200 * std::cos(a + 0.17), 240 + 200 * std::sin(a + 0.17));
+            rot.push_back(q - p);
+        }
+        assert(!rot_dominant(trans));   // 平移 → 判为平移
+        assert(rot_dominant(rot));      // 旋转 → 判为旋转
+        std::cout << " (trans=" << rot_dominant(trans) << " rot=" << rot_dominant(rot) << ")";
+    } TEST_PASS();
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 int main() {
@@ -424,6 +460,9 @@ int main() {
 
     std::cout << "\n[LK Tracking]\n";
     test_lk_tracking();
+
+    std::cout << "\n[Rotation Detection]\n";
+    test_rotation_detection();
 
     std::cout << "\n[Local BA]\n";
     test_local_ba();
