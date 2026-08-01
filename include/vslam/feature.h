@@ -12,6 +12,9 @@ class FeatureMatcher {
 public:
     FeatureMatcher();
 
+    /// 设置 ORB 提取参数（重建提取器）
+    void setParams(int num_features, double scale_factor, int pyramid_levels);
+
     /// 对一帧图像提取 ORB 特征，结果写入 frame.keypoints / frame.descriptors
     void extract(Frame::Ptr frame);
 

@@ -114,7 +114,11 @@ void test_vo_initialization() {
         cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
         cam.img_width = 640; cam.img_height = 480;
 
-        vslam::VisualOdometry vo(cam);
+        // 合成场景特征匹配数较少，显式放宽初始化阈值（验证 VOConfig 接口生效）
+        vslam::VOConfig cfg;
+        cfg.min_matches_init = 20;
+
+        vslam::VisualOdometry vo(cam, cfg);
 
         // 第一帧
         auto pose1 = vo.addFrame(img1, 0.0);

@@ -22,7 +22,8 @@ using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>
 void Optimizer::localBundleAdjustment(
     const Camera& camera,
     Map::Ptr map,
-    const std::vector<Frame::Ptr>& active_kfs) {
+    const std::vector<Frame::Ptr>& active_kfs,
+    int max_iterations) {
 
     if (active_kfs.size() < 2) {
         LOG_INFO("Local BA: not enough keyframes (" << active_kfs.size() << ")");
@@ -164,7 +165,7 @@ void Optimizer::localBundleAdjustment(
     // 6. 执行优化
     // ========================================================
     optimizer.initializeOptimization();
-    optimizer.optimize(10);
+    optimizer.optimize(max_iterations);
 
     // ========================================================
     // 7. 回写优化结果

@@ -12,13 +12,15 @@ namespace vslam {
 class Optimizer {
 public:
     /// 局部 Bundle Adjustment：优化当前关键帧及其共视帧 + 地图点
-    /// @param camera      相机内参
-    /// @param map         地图
-    /// @param active_kfs  参与优化的关键帧列表（滑动窗口，第一帧固定）
+    /// @param camera          相机内参
+    /// @param map             地图
+    /// @param active_kfs      参与优化的关键帧列表（滑动窗口，第一帧固定）
+    /// @param max_iterations  g2o 最大迭代次数
     static void localBundleAdjustment(
         const Camera& camera,
         Map::Ptr map,
-        const std::vector<Frame::Ptr>& active_kfs);
+        const std::vector<Frame::Ptr>& active_kfs,
+        int max_iterations = 10);
 
     /// 全局 Bundle Adjustment：优化所有关键帧和地图点
     static void globalBundleAdjustment(const Camera& camera, Map::Ptr map);

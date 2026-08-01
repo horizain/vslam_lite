@@ -8,6 +8,25 @@
 
 namespace vslam {
 
+/// VO/Feature/Optimizer 参数（默认值与 config/default.yaml 一致）
+struct VOConfig {
+    int    num_features           = 1000;   // 每帧 ORB 特征数
+    double scale_factor           = 1.2;    // 金字塔尺度因子
+    int    pyramid_levels         = 8;      // 金字塔层数
+    double match_ratio            = 0.7;    // 最近邻/次近邻比率阈值
+    double ransac_pixel_threshold = 3.0;    // PnP RANSAC 重投影误差阈值(px)
+    int    min_matches_init       = 100;    // 初始化最小匹配数
+    int    min_matches_track      = 20;     // 跟踪/对极回退最小匹配数
+    double keyframe_translation   = 0.5;    // 关键帧最小平移(m)
+    double keyframe_rotation      = 0.2;    // 关键帧最小旋转(rad)
+    int    local_window_size      = 10;     // 局部 BA 滑动窗口
+    int    local_ba_iterations    = 10;     // 局部 BA 迭代次数
+    int    feature_method         = 0;      // 0: ORB匹配, 1: LK光流(未实现)
+
+    /// 从 yaml 配置加载（缺省字段保持默认值）
+    static VOConfig fromYaml(const std::string& path);
+};
+
 /// 视觉里程计前端
 class VisualOdometry {
 public:
@@ -26,7 +45,7 @@ public:
         unsigned long keyframes    = 0;
     };
 
-    VisualOdometry(const Camera& camera);
+    VisualOdometry(const Camera& camera, const VOConfig& cfg = VOConfig());
 
     /// 输入一帧图像，返回当前的位姿估计
     SE3 addFrame(const cv::Mat& image, double timestamp = 0.0);
@@ -50,7 +69,7 @@ public:
     bool needNewKeyFrame() const;
 
     /// 设置特征方法（0: ORB匹配, 1: LK光流）
-    void setFeatureMethod(int method) { feature_method_ = method; }
+    void setFeatureMethod(int method) { cfg_.feature_method = method; }
 
 private:
     void updateStatus(int matches, int inliers, double parallax);
@@ -64,6 +83,7 @@ private:
 
     // ---- 成员变量 ----
     Camera    camera_;
+    VOConfig  cfg_;
     State     state_ = State::INITIALIZING;
     Map::Ptr  map_;
 
@@ -71,9 +91,6 @@ private:
     Frame::Ptr curr_frame_;  // 当前帧
 
     FeatureMatcher feature_matcher_;
-
-    int feature_method_ = 0;     // 0: ORB匹配, 1: LK光流
-    int num_features_   = 1000;  // 每帧提取的特征数
 
     // 轨迹记录
     std::vector<Vec3> trajectory_;

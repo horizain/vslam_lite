@@ -2,11 +2,15 @@
  * run_vo.cpp - 视觉里程计演示入口
  *
  * 用法：
- *   ./run_vo [dataset_path] [config.yaml]
+ *   ./run_vo [dataset_path] [config.yaml] [trajectory.txt]
  *
  * 示例：
  *   ./run_vo /data/kitti/sequences/00/image_0 config/default.yaml
+ *   ./run_vo /data/kitti/sequences/00/image_0 config/default.yaml traj.txt
  *   ./run_vo 0                          # 使用摄像头 0
+ *
+ * 输出：运行结束后将轨迹保存为 TUM 格式
+ *   timestamp tx ty tz qx qy qz qw（T_wc，相机在世界系），可直接用 EVO 评估
  */
 
 #include "vslam/vo.h"
@@ -16,12 +20,16 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
+#include <fstream>
+#include <iomanip>
 #include <chrono>
 
 int main(int argc, char** argv) {
     std::string input_path;
     vslam::Dataset::Type dataset_type = vslam::Dataset::Type::KITTI;
     std::string config_path = "config/default.yaml";
+    std::string traj_path   = "trajectory.txt";
 
     // ---- 解析命令行参数 ----
     if (argc >= 2) {
@@ -31,7 +39,7 @@ int main(int argc, char** argv) {
             dataset_type = vslam::Dataset::Type::CAMERA;
         }
     } else {
-        std::cout << "Usage: run_vo <dataset_path|camera_index> [config.yaml]\n";
+        std::cout << "Usage: run_vo <dataset_path|camera_index> [config.yaml] [trajectory.txt]\n";
         std::cout << "  dataset_path: path to image directory\n";
         std::cout << "  camera_index: integer (e.g., 0) for live camera\n";
         std::cout << "\nExample:\n";
@@ -42,6 +50,9 @@ int main(int argc, char** argv) {
 
     if (argc >= 3) {
         config_path = argv[2];
+    }
+    if (argc >= 4) {
+        traj_path = argv[3];
     }
 
     // ---- 加载相机参数 ----
@@ -62,8 +73,9 @@ int main(int argc, char** argv) {
             ? vslam::Dataset(std::stoi(input_path))
             : vslam::Dataset(input_path, dataset_type));
 
-    // ---- 初始化 VO ----
-    vslam::VisualOdometry vo(camera);
+    // ---- 初始化 VO（加载 VO/Feature/Optimizer 参数）----
+    vslam::VOConfig vo_cfg = vslam::VOConfig::fromYaml(config_path);
+    vslam::VisualOdometry vo(camera, vo_cfg);
 
     // ---- 初始化可视化 ----
     vslam::Viewer viewer;
@@ -75,6 +87,9 @@ int main(int argc, char** argv) {
     int frame_count = 0;
     auto start_time = std::chrono::steady_clock::now();
 
+    // 记录完整位姿（TUM 格式输出用）
+    std::vector<std::pair<double, vslam::SE3>> traj_saved;
+
     LOG_INFO("Starting VO pipeline... Press Ctrl+C or close window to exit.");
 
     while (dataset.nextFrame(image, timestamp) && !viewer.shouldQuit()) {
@@ -82,6 +97,7 @@ int main(int argc, char** argv) {
 
         // 运行一帧 VO
         vslam::SE3 pose = vo.addFrame(image, timestamp);
+        traj_saved.emplace_back(timestamp, pose);
 
         // 更新可视化（彩色视频帧 + 绿色特征点 + 轨迹）
         auto cf = vo.currentFrame();
@@ -115,6 +131,25 @@ int main(int argc, char** argv) {
 
     // ---- 清理 ----
     viewer.stop();
+
+    // ---- 保存轨迹（TUM 格式：time tx ty tz qx qy qz qw，位姿为 T_wc）----
+    if (!traj_saved.empty()) {
+        std::ofstream ofs(traj_path);
+        if (ofs.is_open()) {
+            ofs << std::fixed << std::setprecision(6);
+            for (auto& [ts, pose_cw] : traj_saved) {
+                vslam::SE3 Twc = pose_cw.inverse();  // T_cw → T_wc
+                ofs << ts << " "
+                    << Twc.t.x() << " " << Twc.t.y() << " " << Twc.t.z() << " "
+                    << Twc.q.x() << " " << Twc.q.y() << " " << Twc.q.z() << " "
+                    << Twc.q.w() << "\n";
+            }
+            LOG_INFO("Trajectory saved to " << traj_path
+                     << " (" << traj_saved.size() << " poses, TUM format)");
+        } else {
+            LOG_ERROR("Cannot write trajectory to " << traj_path);
+        }
+    }
 
     auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();

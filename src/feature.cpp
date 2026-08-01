@@ -7,10 +7,15 @@ namespace vslam {
 
 FeatureMatcher::FeatureMatcher() {
     // ORB 特征提取器：1000 个特征点，8 层金字塔，尺度因子 1.2
-    orb_ = cv::ORB::create(2000, 1.2f, 8, 15, 0, 2,
+    orb_ = cv::ORB::create(1000, 1.2f, 8, 15, 0, 2,
                            cv::ORB::HARRIS_SCORE, 19, 10);
     // 暴力匹配器（汉明距离）
     matcher_ = cv::DescriptorMatcher::create(cv::DescriptorMatcher::BRUTEFORCE_HAMMING);
+}
+
+void FeatureMatcher::setParams(int num_features, double scale_factor, int pyramid_levels) {
+    orb_ = cv::ORB::create(num_features, (float)scale_factor, pyramid_levels,
+                           15, 0, 2, cv::ORB::HARRIS_SCORE, 19, 10);
 }
 
 void FeatureMatcher::extract(Frame::Ptr frame) {

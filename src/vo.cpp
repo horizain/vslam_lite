@@ -2,11 +2,46 @@
 #include "vslam/optimizer.h"
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
+#include <yaml-cpp/yaml.h>
 
 namespace vslam {
 
-VisualOdometry::VisualOdometry(const Camera& camera)
-    : camera_(camera), map_(std::make_shared<Map>()) {
+VOConfig VOConfig::fromYaml(const std::string& path) {
+    VOConfig cfg;
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        if (auto f = root["Feature"]) {
+            if (f["num_features"])    cfg.num_features           = f["num_features"].as<int>();
+            if (f["scale_factor"])    cfg.scale_factor           = f["scale_factor"].as<double>();
+            if (f["pyramid_levels"])  cfg.pyramid_levels         = f["pyramid_levels"].as<int>();
+            if (f["match_ratio"])     cfg.match_ratio            = f["match_ratio"].as<double>();
+            if (f["ransac_threshold"]) cfg.ransac_pixel_threshold = f["ransac_threshold"].as<double>();
+        }
+        if (auto v = root["VO"]) {
+            if (v["method"])              cfg.feature_method       = v["method"].as<int>();
+            if (v["min_matches_init"])    cfg.min_matches_init     = v["min_matches_init"].as<int>();
+            if (v["min_matches_track"])   cfg.min_matches_track    = v["min_matches_track"].as<int>();
+            if (v["keyframe_translation"]) cfg.keyframe_translation = v["keyframe_translation"].as<double>();
+            if (v["keyframe_rotation"])   cfg.keyframe_rotation    = v["keyframe_rotation"].as<double>();
+        }
+        if (auto o = root["Optimizer"]) {
+            if (o["local_window_size"])   cfg.local_window_size   = o["local_window_size"].as<int>();
+            if (o["local_ba_iterations"]) cfg.local_ba_iterations = o["local_ba_iterations"].as<int>();
+        }
+        LOG_INFO("VO config loaded from: " << path);
+    } catch (const std::exception& e) {
+        LOG_WARN("VOConfig::fromYaml failed (" << e.what() << "), using defaults");
+    }
+    return cfg;
+}
+
+VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
+    : camera_(camera), cfg_(cfg), map_(std::make_shared<Map>()) {
+    feature_matcher_.setParams(cfg_.num_features, cfg_.scale_factor, cfg_.pyramid_levels);
+    if (cfg_.feature_method != 0) {
+        LOG_WARN("feature_method=" << cfg_.feature_method
+                 << " (LK 光流) not implemented yet, using ORB");
+    }
 }
 
 SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
@@ -69,8 +104,8 @@ bool VisualOdometry::tryInitialize() {
         return false;
     }
 
-    auto matches = feature_matcher_.match(ref_frame_, curr_frame_, 0.7, true);
-    if (matches.size() < 30) {
+    auto matches = feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true);
+    if (matches.size() < (size_t)cfg_.min_matches_init) {
         LOG_INFO("Init: too few matches (" << matches.size() << ")");
         ref_frame_ = curr_frame_;
         updateStatus((int)matches.size(), 0, 0.0);
@@ -122,7 +157,7 @@ bool VisualOdometry::tryInitialize() {
 SE3 VisualOdometry::trackFrame() {
     if (!ref_frame_ || !curr_frame_) return SE3();
 
-    auto matches = feature_matcher_.match(ref_frame_, curr_frame_, 0.7, true);
+    auto matches = feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true);
 
     // 收集 3D-2D 对应（保留 pts3d[i] 与 matches 的映射，供内点观测计数）
     std::vector<cv::Point3f> pts3d;
@@ -146,7 +181,7 @@ SE3 VisualOdometry::trackFrame() {
         std::vector<int> inliers;
         bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_.K(),
                                      cv::Mat(), rvec, tvec,
-                                     false, 100, 4.0, 0.99, inliers);
+                                     false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
         if (ok && inliers.size() >= 10) {
             cv::Mat R;
             cv::Rodrigues(rvec, R);
@@ -166,7 +201,7 @@ SE3 VisualOdometry::trackFrame() {
 
     // 对极几何回退
     // recoverPose 返回 T_rel 满足 p_c2 = T_rel * p_c1 → T_cw2 = T_rel * T_cw1
-    if (matches.size() >= 20) {
+    if (matches.size() >= (size_t)cfg_.min_matches_track) {
         std::vector<cv::Point2f> pts1, pts2;
         FeatureMatcher::getMatchedPoints(ref_frame_, curr_frame_, matches, pts1, pts2);
         cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_.K(), cv::RANSAC, 0.999, 1.0);
@@ -198,8 +233,8 @@ bool VisualOdometry::tryRelocalize() {
     Frame::Ptr best_kf;
 
     for (auto& kf : all_kfs) {
-        auto matches = feature_matcher_.match(kf, curr_frame_, 0.8, true);
-        if ((int)matches.size() < 30) continue;
+        auto matches = feature_matcher_.match(kf, curr_frame_, cfg_.match_ratio, true);
+        if ((int)matches.size() < cfg_.min_matches_init) continue;
 
         std::vector<cv::Point3f> pts3d;
         std::vector<cv::Point2f> pts2d;
@@ -216,7 +251,7 @@ bool VisualOdometry::tryRelocalize() {
         std::vector<int> inliers;
         bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_.K(),
                                      cv::Mat(), rvec, tvec,
-                                     false, 100, 4.0, 0.99, inliers);
+                                     false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
         if (ok && (int)inliers.size() > best_inliers) {
             best_inliers = (int)inliers.size();
             best_pose = matToSE3(cv::Mat(rvec), tvec);
@@ -243,19 +278,19 @@ bool VisualOdometry::tryRelocalize() {
 void VisualOdometry::insertKeyFrame() {
     map_->insertKeyFrame(curr_frame_);
     triangulateNewPoints(ref_frame_, curr_frame_,
-        feature_matcher_.match(ref_frame_, curr_frame_, 0.7, true));
+        feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
     ref_frame_ = curr_frame_;
 
     LOG_INFO("New KF. mp=" << map_->mapPointCount());
 
     auto all_kfs = map_->getAllKeyFrames();
-    int n = 8;
+    int n = cfg_.local_window_size;
     std::vector<Frame::Ptr> window;
     int start = std::max(0, (int)all_kfs.size() - n);
     for (int i = start; i < (int)all_kfs.size(); i++)
         window.push_back(all_kfs[i]);
 
-    Optimizer::localBundleAdjustment(camera_, map_, window);
+    Optimizer::localBundleAdjustment(camera_, map_, window, cfg_.local_ba_iterations);
     updateStatus(status_.matches, status_.inliers, status_.parallax);
 }
 
@@ -310,7 +345,7 @@ bool VisualOdometry::needNewKeyFrame() const {
     Eigen::Quaterniond q_rel = curr_frame_->pose_cw.q * ref_frame_->pose_cw.q.inverse();
     double drot = 2.0 * std::acos(
         std::clamp(std::abs(q_rel.w()), 0.0, 1.0));
-    return dtrans > 0.5 || drot > 0.3;
+    return dtrans > cfg_.keyframe_translation || drot > cfg_.keyframe_rotation;
 }
 
 std::vector<Vec3> VisualOdometry::getTrajectory() const {
