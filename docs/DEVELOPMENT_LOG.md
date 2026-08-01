@@ -9,7 +9,7 @@
 
 从零构建教学级 VSLAM 系统，遵循第一性原理，只保留核心逻辑，适合初学者逐文件阅读学习。
 
-**技术栈:** C++17 / OpenCV / Eigen3 / Pangolin / g2o / DBoW3(Phase2)
+**技术栈:** C++23 / OpenCV / Eigen3 / Pangolin / g2o / DBoW3(Phase2)
 
 ---
 

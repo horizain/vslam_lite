@@ -23,6 +23,7 @@
 #include <vector>
 #include <fstream>
 #include <iomanip>
+#include <format>
 #include <chrono>
 
 int main(int argc, char** argv) {
@@ -120,11 +121,11 @@ int main(int argc, char** argv) {
             case vslam::VisualOdometry::State::TRACKING:     state_str = "TRACKING"; break;
             case vslam::VisualOdometry::State::LOST:         state_str = "LOST"; break;
         }
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s | Matches:%d Inl:%d Parallax:%.2f | MP:%lu KF:%lu",
-                 state_str.c_str(), st.matches, st.inliers,
-                 st.parallax, st.map_points, st.keyframes);
-        viewer.setStatus(buf);
+        // 更新状态栏（std::format 类型安全，替代 snprintf）
+        std::string status = std::format("{} | Matches:{} Inl:{} Parallax:{:.2f} | MP:{} KF:{}",
+                                         state_str, st.matches, st.inliers,
+                                         st.parallax, st.map_points, st.keyframes);
+        viewer.setStatus(status);
 
         // 打印状态
         if (frame_count % 30 == 0) {

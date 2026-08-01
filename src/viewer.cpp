@@ -2,6 +2,8 @@
 
 #include <pangolin/pangolin.h>
 #include <opencv2/imgproc.hpp>
+#include <ranges>
+#include <algorithm>
 
 namespace vslam {
 
@@ -88,9 +90,10 @@ void Viewer::renderLoop() {
             {
                 std::lock_guard<std::mutex> lock(data_mutex_);
                 if (!trajectory_.empty()) {
-                    double mx = 0, mz = 0;
-                    for (auto& p : trajectory_) { mx = std::max(mx, std::abs(p.x())); mz = std::max(mz, std::abs(p.z())); }
-                    range = std::max({mx, mz, 5.0}) * 1.5;
+                    // C++23 ranges：views::transform 映射坐标 → ranges::max 取最大绝对值
+                    auto xs = trajectory_ | std::views::transform([](const Vec3& p) { return std::abs(p.x()); });
+                    auto zs = trajectory_ | std::views::transform([](const Vec3& p) { return std::abs(p.z()); });
+                    range = std::max({std::ranges::max(xs), std::ranges::max(zs), 5.0}) * 1.5;
                 }
             }
             glOrtho(-range, range, -range, range, -1, 1);

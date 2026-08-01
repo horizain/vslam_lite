@@ -27,13 +27,13 @@ struct SE3 {
     SE3(const Eigen::Quaterniond& q_, const Vec3& t_) : q(q_), t(t_) {}
 
     /// 从 4x4 变换矩阵构造
-    static SE3 fromMatrix(const Mat44& T) {
+    [[nodiscard]] static SE3 fromMatrix(const Mat44& T) {
         Eigen::Matrix3d R = T.block<3, 3>(0, 0);
         return SE3(Eigen::Quaterniond(R), T.block<3, 1>(0, 3));
     }
 
     /// 转为 4x4 变换矩阵
-    Mat44 matrix() const {
+    [[nodiscard]] Mat44 matrix() const {
         Mat44 T = Mat44::Identity();
         T.block<3, 3>(0, 0) = q.toRotationMatrix();
         T.block<3, 1>(0, 3) = t;
@@ -41,18 +41,18 @@ struct SE3 {
     }
 
     /// 逆变换
-    SE3 inverse() const {
+    [[nodiscard]] SE3 inverse() const {
         Eigen::Quaterniond q_inv = q.inverse();
         return SE3(q_inv, -(q_inv * t));
     }
 
     /// 组合变换：this * other
-    SE3 operator*(const SE3& other) const {
+    [[nodiscard]] SE3 operator*(const SE3& other) const {
         return SE3(q * other.q, q * other.t + t);
     }
 
     /// 变换一个 3D 点
-    Vec3 operator*(const Vec3& p) const {
+    [[nodiscard]] Vec3 operator*(const Vec3& p) const {
         return q * p + t;
     }
 };

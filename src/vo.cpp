@@ -6,6 +6,7 @@
 
 #include <set>
 #include <algorithm>
+#include <ranges>
 
 namespace vslam {
 
@@ -179,11 +180,11 @@ SE3 VisualOdometry::trackFrame() {
     auto matches = feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true);
 
     // 收集 3D-2D 对应（保留 pts3d[i] 与 matches 的映射，供内点观测计数）
+    // C++23 的 views::enumerate 同时给出索引与元素
     std::vector<cv::Point3f> pts3d;
     std::vector<cv::Point2f> pts2d;
     std::vector<int> match_idx;
-    for (size_t k = 0; k < matches.size(); k++) {
-        const auto& m = matches[k];
+    for (auto [k, m] : matches | std::views::enumerate) {
         auto& mp = ref_frame_->map_points[m.queryIdx];
         if (mp) {
             pts3d.emplace_back((float)mp->pos_w.x(), (float)mp->pos_w.y(), (float)mp->pos_w.z());
@@ -402,8 +403,8 @@ std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
             if (mp && curr_mps.count(mp->id)) cov++;
         cands.push_back({kf, cov});
     }
-    std::sort(cands.begin(), cands.end(),
-              [](const Candidate& a, const Candidate& b) { return a.cov > b.cov; });
+    // C++23 ranges：按共视点数量降序（投影 &Candidate::cov，免手写比较器）
+    std::ranges::sort(cands, std::greater<>{}, &Candidate::cov);
 
     // 窗口 = 当前帧 + 共视最多的前 n-1 帧（要求至少 2 个共视点）
     window.push_back(curr_frame_);
@@ -420,9 +421,8 @@ std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
             window.push_back(all_kfs[i]);
     }
 
-    // 按 id 排序，最早帧在 index 0（BA 中锚定，保证全局一致）
-    std::sort(window.begin(), window.end(),
-              [](const Frame::Ptr& a, const Frame::Ptr& b) { return a->id < b->id; });
+    // 按 id 升序，最早帧在 index 0（BA 中锚定，保证全局一致）
+    std::ranges::sort(window, {}, [](const Frame::Ptr& f) { return f->id; });
     return window;
 }
 

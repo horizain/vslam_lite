@@ -3,6 +3,8 @@
 #include <opencv2/videoio.hpp>
 #include <fstream>
 #include <sstream>
+#include <ranges>
+#include <algorithm>
 
 namespace vslam {
 
@@ -46,7 +48,7 @@ bool Dataset::loadKITTIImageList(const std::string& path) {
     }
 
     image_paths_.assign(files.begin(), files.end());
-    std::sort(image_paths_.begin(), image_paths_.end());
+    std::ranges::sort(image_paths_);
     total_frames_ = static_cast<int>(image_paths_.size());
     LOG_INFO("Loaded " << total_frames_ << " images from " << path);
     return !image_paths_.empty();
