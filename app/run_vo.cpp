@@ -77,8 +77,14 @@ int main(int argc, char** argv) {
     vslam::Camera camera;
     if (dataset_type != vslam::Dataset::Type::CAMERA && dataset.hasCalibration()) {
         camera = dataset.getCamera();
+        LOG_INFO("Using camera intrinsics from dataset calib.txt"
+                 << " (fx=" << camera.fx << " cx=" << camera.cx
+                 << " cy=" << camera.cy << " img=" << camera.img_width
+                 << "x" << camera.img_height << ")");
     } else if (dataset_type != vslam::Dataset::Type::CAMERA) {
         camera = vslam::Camera::fromYaml(config_path);
+        LOG_INFO("Using camera intrinsics from " << config_path
+                 << " (no dataset calibration found)");
     } else {
         // 摄像头模式使用默认参数（建议先用标定工具获取真实内参）
         camera.fx = 500; camera.fy = 500;
