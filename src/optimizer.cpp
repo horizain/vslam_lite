@@ -1,0 +1,211 @@
+#include "vslam/optimizer.h"
+
+// g2o
+#include <g2o/core/base_unary_edge.h>
+#include <g2o/core/base_binary_edge.h>
+#include <g2o/core/block_solver.h>
+#include <g2o/core/optimization_algorithm_levenberg.h>
+#include <g2o/core/robust_kernel_impl.h>
+#include <g2o/solvers/eigen/linear_solver_eigen.h>
+#include <g2o/types/sba/types_six_dof_expmap.h>
+#include <g2o/types/slam3d/vertex_pointxyz.h>
+
+#include <set>
+#include <unordered_map>
+
+namespace vslam {
+
+// ---- 类型别名 ----
+using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
+using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
+
+void Optimizer::localBundleAdjustment(
+    const Camera& camera,
+    Map::Ptr map,
+    const std::vector<Frame::Ptr>& active_kfs) {
+
+    if (active_kfs.size() < 2) {
+        LOG_INFO("Local BA: not enough keyframes (" << active_kfs.size() << ")");
+        return;
+    }
+
+    // ========================================================
+    // 1. 构建优化器
+    // ========================================================
+    g2o::SparseOptimizer optimizer;
+    auto linearSolver = std::make_unique<LinearSolverType>();
+    auto blockSolver  = std::make_unique<BlockSolverType>(std::move(linearSolver));
+    auto algorithm    = new g2o::OptimizationAlgorithmLevenberg(std::move(blockSolver));
+    optimizer.setAlgorithm(algorithm);
+
+    // ========================================================
+    // 2. 添加相机参数
+    // ========================================================
+    auto* cam_params = new g2o::CameraParameters(
+        camera.fx,
+        g2o::Vector2(camera.cx, camera.cy),
+        0.0);  // baseline = 0 (monocular)
+    cam_params->setId(0);
+    if (!optimizer.addParameter(cam_params)) {
+        LOG_WARN("Local BA: camera parameter already exists");  // will use existing
+    }
+
+    // ========================================================
+    // 3. 添加位姿顶点（每个关键帧一个）
+    // ========================================================
+    std::unordered_map<unsigned long, size_t> kf_id_to_idx;
+
+    for (size_t i = 0; i < active_kfs.size(); i++) {
+        auto& kf = active_kfs[i];
+
+        // g2o 的 VertexSE3Expmap::estimate 语义为 T_wc（相机在世界系），
+        // 而 pose_cw 是 T_cw（世界→相机），需取逆
+        SE3 Twc = kf->pose_cw.inverse();
+        g2o::SE3Quat pose(Twc.q.toRotationMatrix(), Twc.t);
+
+        auto* v_pose = new g2o::VertexSE3Expmap();
+        v_pose->setId(static_cast<int>(i));
+        v_pose->setEstimate(pose);
+        if (i == 0) {
+            v_pose->setFixed(true);  // 锚定第一帧，消除自由度
+        }
+        optimizer.addVertex(v_pose);
+        kf_id_to_idx[kf->id] = i;
+    }
+
+    // ========================================================
+    // 4. 收集活跃窗口内的地图点 + 添加 3D 点顶点
+    // ========================================================
+    struct Observation {
+        size_t    kf_idx;
+        size_t    kp_idx;   // index in keyframe->keypoints
+        Eigen::Vector2d pixel;
+    };
+
+    std::unordered_map<unsigned long, std::vector<Observation>> mp_observations;
+
+    for (size_t i = 0; i < active_kfs.size(); i++) {
+        auto& kf = active_kfs[i];
+        for (size_t j = 0; j < kf->keypoints.size(); j++) {
+            auto& mp = kf->map_points[j];
+            if (mp == nullptr) continue;
+            // 检查这个地图点是否已被添加到优化器
+            if (mp_observations.find(mp->id) == mp_observations.end()) {
+                mp_observations[mp->id] = {};
+            }
+            mp_observations[mp->id].push_back({
+                i, j,
+                Eigen::Vector2d(kf->keypoints[j].pt.x, kf->keypoints[j].pt.y)
+            });
+        }
+    }
+
+    // 只保留被至少 2 帧观测到的地图点
+    int point_vertex_id = static_cast<int>(active_kfs.size());  // 点 ID 从 KF 数量之后开始
+    std::unordered_map<unsigned long, int> mp_id_to_vertex;
+
+    for (auto& [mp_id, obs_list] : mp_observations) {
+        if (obs_list.size() < 2) continue;  // 需要至少两个观测
+
+        auto mp = map->getMapPoint(mp_id);
+        if (!mp) continue;
+
+        auto* v_point = new g2o::VertexPointXYZ();
+        v_point->setId(point_vertex_id);
+        v_point->setEstimate(mp->pos_w);
+        v_point->setMarginalized(true);  // 边缘化 3D 点以加速求解
+        optimizer.addVertex(v_point);
+        mp_id_to_vertex[mp_id] = point_vertex_id;
+        point_vertex_id++;
+    }
+
+    // ========================================================
+    // 5. 添加重投影误差边
+    // ========================================================
+    int edge_count = 0;
+    for (auto& [mp_id, obs_list] : mp_observations) {
+        auto it = mp_id_to_vertex.find(mp_id);
+        if (it == mp_id_to_vertex.end()) continue;
+
+        int point_vid = it->second;
+
+        for (auto& obs : obs_list) {
+            auto* edge = new g2o::EdgeProjectXYZ2UV();
+
+            // 边连接：点顶点(0) + 位姿顶点(1)
+            edge->setVertex(0, dynamic_cast<g2o::VertexPointXYZ*>(
+                optimizer.vertex(point_vid)));
+            edge->setVertex(1, dynamic_cast<g2o::VertexSE3Expmap*>(
+                optimizer.vertex(static_cast<int>(obs.kf_idx))));
+
+            // 观测值：像素坐标
+            edge->setMeasurement(obs.pixel);
+            edge->setInformation(Eigen::Matrix2d::Identity());
+
+            // 关联相机参数
+            edge->setParameterId(0, 0);
+
+            // Huber 鲁棒核函数（抑制外点）
+            auto* robust_kernel = new g2o::RobustKernelHuber();
+            robust_kernel->setDelta(5.991);  // 2 DOF, chi2 95% 阈值
+            edge->setRobustKernel(robust_kernel);
+
+            optimizer.addEdge(edge);
+            edge_count++;
+        }
+    }
+
+    if (edge_count < 10) {
+        LOG_WARN("Local BA: too few edges (" << edge_count << "), skipping optimization");
+        return;
+    }
+
+    // ========================================================
+    // 6. 执行优化
+    // ========================================================
+    optimizer.initializeOptimization();
+    optimizer.optimize(10);
+
+    // ========================================================
+    // 7. 回写优化结果
+    // ========================================================
+    for (size_t i = 0; i < active_kfs.size(); i++) {
+        auto* v_pose = dynamic_cast<g2o::VertexSE3Expmap*>(
+            optimizer.vertex(static_cast<int>(i)));
+        if (!v_pose) continue;
+
+        const g2o::SE3Quat& opt_pose = v_pose->estimate();
+        // g2o 输出为 T_wc，转回 T_cw 存储
+        SE3 Twc(Eigen::Quaterniond(opt_pose.rotation()), opt_pose.translation());
+        active_kfs[i]->pose_cw = Twc.inverse();
+    }
+
+    for (auto& [mp_id, point_vid] : mp_id_to_vertex) {
+        auto* v_point = dynamic_cast<g2o::VertexPointXYZ*>(
+            optimizer.vertex(point_vid));
+        if (!v_point) continue;
+
+        auto mp = map->getMapPoint(mp_id);
+        if (mp) {
+            mp->pos_w = v_point->estimate();
+        }
+    }
+
+    LOG_INFO("Local BA: optimized " << active_kfs.size() << " keyframes, "
+             << mp_id_to_vertex.size() << " points, "
+             << edge_count << " edges");
+}
+
+void Optimizer::globalBundleAdjustment(const Camera& camera, Map::Ptr map) {
+    // 结构同 localBA，但使用所有关键帧和地图点
+    auto all_kfs = map->getAllKeyFrames();
+    localBundleAdjustment(camera, map, all_kfs);
+    LOG_INFO("Global BA complete");
+}
+
+void Optimizer::poseGraphOptimization(Map::Ptr map) {
+    // TODO Phase 2: 只优化关键帧位姿 + 帧间相对位姿约束 + 回环约束
+    LOG_INFO("Pose Graph Optimization - TODO Phase 2");
+}
+
+} // namespace vslam

@@ -1,0 +1,54 @@
+# ============================================================
+# VSLAM 默认配置文件
+# ============================================================
+
+# ---- 相机内参 ----
+Camera:
+  fx: 718.856
+  fy: 718.856
+  cx: 607.193
+  cy: 185.216
+  width: 1241
+  height: 376
+  k1: 0.0
+  k2: 0.0
+  p1: 0.0
+  p2: 0.0
+  k3: 0.0
+
+# ---- 特征参数 ----
+Feature:
+  num_features: 1000       # 每帧提取的 ORB 特征数
+  scale_factor: 1.2        # 金字塔尺度因子
+  pyramid_levels: 8        # 金字塔层数
+  match_ratio: 0.7         # 最近邻/次近邻比率测试阈值
+  ransac_threshold: 3.0    # RANSAC 重投影误差阈值
+
+# ---- VO 参数 ----
+VO:
+  method: 0                # 0 = ORB匹配, 1 = LK光流
+  min_parallax: 0.1        # 初始化的最小视差
+  min_matches_init: 100    # 初始化的最小匹配数
+  min_matches_track: 20    # 跟踪的最小匹配数
+  pnp_min_inliers: 6       # PnP 的最小内点数
+  keyframe_translation: 0.5  # 关键帧选择：最小平移距离（米）
+  keyframe_rotation: 0.2   # 关键帧选择：最小旋转角度（弧度）
+
+# ---- 优化参数 (Phase 1) ----
+Optimizer:
+  local_window_size: 10    # 局部 BA 窗口大小
+  local_ba_iterations: 10  # 局部 BA 迭代次数
+  global_ba_iterations: 20 # 全局 BA 迭代次数
+
+# ---- 回环检测 (Phase 2) ----
+LoopClosure:
+  vocab_path: ""            # 词袋词典路径
+  min_score: 0.3           # 回环候选的最小相似度分数
+  pnp_inlier_ratio: 0.7    # 几何验证的最小内点比例
+
+# ---- 可视化 ----
+Viewer:
+  enabled: true
+  camera_size: 0.1         # 相机位姿显示尺寸
+  point_size: 2            # 地图点显示尺寸
+  trajectory_color: [0.0, 0.8, 1.0]  # 轨迹颜色 (RGB)

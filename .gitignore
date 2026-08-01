@@ -1,0 +1,12 @@
+# 构建产物
+build/
+*.o
+*.a
+*.so
+
+# g2o / 求解器调试残留
+debug.txt
+
+# 编辑器
+.vscode/
+.idea/
