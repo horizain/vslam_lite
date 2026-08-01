@@ -87,12 +87,19 @@ void Viewer::renderLoop() {
             glLoadIdentity();
 
             double range = 50.0;
+            // 只显示最近 kMaxTrajPts 个轨迹点（长跑后轨迹点几十万，全量绘制会卡渲染）
+            constexpr size_t kMaxTrajPts = 3000;
+            size_t traj_start = 0;
             {
                 std::lock_guard<std::mutex> lock(data_mutex_);
+                if (trajectory_.size() > kMaxTrajPts)
+                    traj_start = trajectory_.size() - kMaxTrajPts;
                 if (!trajectory_.empty()) {
-                    // C++23 ranges：views::transform 映射坐标 → ranges::max 取最大绝对值
-                    auto xs = trajectory_ | std::views::transform([](const Vec3& p) { return std::abs(p.x()); });
-                    auto zs = trajectory_ | std::views::transform([](const Vec3& p) { return std::abs(p.z()); });
+                    // C++23 ranges：views::drop+transform 映射坐标 → ranges::max 取最大绝对值
+                    auto xs = trajectory_ | std::views::drop(traj_start)
+                                          | std::views::transform([](const Vec3& p) { return std::abs(p.x()); });
+                    auto zs = trajectory_ | std::views::drop(traj_start)
+                                          | std::views::transform([](const Vec3& p) { return std::abs(p.z()); });
                     range = std::max({std::ranges::max(xs), std::ranges::max(zs), 5.0}) * 1.5;
                 }
             }
@@ -112,7 +119,8 @@ void Viewer::renderLoop() {
                     glColor3f(0.0f, 0.9f, 1.0f);
                     glLineWidth(2.0f);
                     glBegin(GL_LINE_STRIP);
-                    for (auto& p : trajectory_) glVertex2f((float)p.x(), (float)p.z());
+                    for (size_t i = traj_start; i < trajectory_.size(); i++)
+                        glVertex2f((float)trajectory_[i].x(), (float)trajectory_[i].z());
                     glEnd();
 
                     auto& last = trajectory_.back();

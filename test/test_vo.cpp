@@ -25,6 +25,8 @@
 #include <cassert>
 #include <cmath>
 #include <random>
+#include <chrono>
+#include <numeric>
 
 // 简单的测试辅助宏
 #define TEST(name) \
@@ -267,6 +269,84 @@ void test_lk_tracking() {
 }
 
 // ============================================================
+// 长时间运行稳定性测试
+// 守护性能优化：关键帧/地图点必须有界（防"跑一段时间后卡死"），
+// 帧耗时应稳定（不随运行时间增长）。
+// ============================================================
+void test_long_run_stability() {
+    struct Blk { cv::Point3f c; float sx, sy; int gray; };
+    auto render = [](cv::Mat& img, const std::vector<Blk>& blks,
+                     const cv::Mat& K, const cv::Mat& rvec, const cv::Mat& tvec) {
+        for (auto& b : blks) {
+            std::vector<cv::Point3f> corners = {
+                cv::Point3f(b.c.x - b.sx/2, b.c.y - b.sy/2, b.c.z),
+                cv::Point3f(b.c.x + b.sx/2, b.c.y - b.sy/2, b.c.z),
+                cv::Point3f(b.c.x + b.sx/2, b.c.y + b.sy/2, b.c.z),
+                cv::Point3f(b.c.x - b.sx/2, b.c.y + b.sy/2, b.c.z)};
+            std::vector<cv::Point2f> px;
+            cv::projectPoints(corners, rvec, tvec, K, cv::Mat(), px);
+            std::vector<cv::Point> pi;
+            for (auto& q : px) pi.emplace_back(cvRound(q.x), cvRound(q.y));
+            cv::fillConvexPoly(img, pi, cv::Scalar(b.gray));
+        }
+    };
+
+    TEST("长时间运行：关键帧/地图点有界 + 帧耗时稳定") {
+        vslam::Camera cam;
+        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
+        cam.img_width = 640; cam.img_height = 480;
+        cv::Mat K = cam.K();
+
+        std::mt19937 gen(7);
+        std::uniform_real_distribution<double> dx(-4, 4), dy(-3, 3), dz(3, 6),
+                                               ds(0.5, 1.5), dg(80, 255);
+        std::vector<Blk> blks;
+        for (int i = 0; i < 60; i++)
+            blks.push_back({cv::Point3f(dx(gen), dy(gen), dz(gen)),
+                            (float)ds(gen), (float)ds(gen), (int)dg(gen)});
+
+        vslam::VOConfig cfg;
+        cfg.min_matches_init = 20;
+
+        vslam::VisualOdometry vo(cam, cfg);
+
+        // 螺旋路径 150 帧：缓慢前进 + 小幅摆动
+        constexpr int kFrames = 150;
+        std::vector<double> frame_ms;
+        for (int f = 0; f < kFrames; f++) {
+            cv::Mat rvec = (cv::Mat_<double>(3,1) << 0.003*f, 0.005*f, 0);
+            cv::Mat tvec = (cv::Mat_<double>(3,1) << 0.1*f, 0.02*std::sin(f*0.05), 0.1*std::sin(f*0.03));
+            cv::Mat img(480, 640, CV_8UC1, cv::Scalar(64));
+            render(img, blks, K, rvec, tvec);
+
+            auto t0 = std::chrono::steady_clock::now();
+            vo.addFrame(img, f * 0.1);
+            auto t1 = std::chrono::steady_clock::now();
+            frame_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+
+        auto avg = [&](int from, int to) {
+            double s = 0;
+            for (int i = from; i < to; i++) s += frame_ms[i];
+            return s / (to - from);
+        };
+
+        size_t kf = vo.getMap()->keyFrameCount();
+        size_t mp = vo.getMap()->mapPointCount();
+        double avg_first = avg(0, 30), avg_last = avg(kFrames - 30, kFrames);
+
+        std::cout << " (kf=" << kf << " mp=" << mp
+                  << " avg_first=" << avg_first << "ms avg_last=" << avg_last << "ms)";
+
+        // 有界性：关键帧 ≈ 30（每 0.5m 一个，共 15m），地图点几千
+        assert(kf < 80);
+        assert(mp < 15000);
+        // 稳定性：末尾帧耗时不能比开头差 3 倍以上（防增长型卡死回归）
+        assert(avg_last < avg_first * 3.0 + 3.0);
+    } TEST_PASS();
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 int main() {
@@ -289,6 +369,9 @@ int main() {
 
     std::cout << "\n[LK Tracking]\n";
     test_lk_tracking();
+
+    std::cout << "\n[Long-Run Stability]\n";
+    test_long_run_stability();
 
     std::cout << "\n===== All Tests Completed =====\n";
     return 0;

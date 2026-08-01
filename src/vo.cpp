@@ -164,6 +164,7 @@ bool VisualOdometry::tryInitialize() {
 
     map_->insertKeyFrame(ref_frame_);
     map_->insertKeyFrame(curr_frame_);
+    last_kf_frame_id_ = curr_frame_->id;   // 初始化插入的两个关键帧也参与冷却
 
     LOG_INFO("Init OK! parallax=" << parallax << " inliers=" << inliers
              << " mp=" << map_->mapPointCount());
@@ -177,7 +178,9 @@ bool VisualOdometry::tryInitialize() {
 SE3 VisualOdometry::trackFrame() {
     if (!ref_frame_ || !curr_frame_) return SE3();
 
-    auto matches = feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true);
+    // 跟踪匹配不做基础矩阵 RANSAC（省时，且避免共面场景 F 矩阵退化误剔）：
+    // 外点交给下方 solvePnPRansac 自己剔除；仅初始化/回退分支保留 F 矩阵 RANSAC
+    auto matches = feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, false);
 
     // 收集 3D-2D 对应（保留 pts3d[i] 与 matches 的映射，供内点观测计数）
     // C++23 的 views::enumerate 同时给出索引与元素
@@ -333,16 +336,12 @@ bool VisualOdometry::tryRelocalize() {
         return best_inliers >= 20;
     };
 
-    // 1) 优先尝试最近的关键帧（时间邻近，成功率最高）
-    int recent_n = std::min(5, (int)all_kfs.size());
-    for (int i = (int)all_kfs.size() - recent_n; i < (int)all_kfs.size(); i++) {
+    // 从最新关键帧向历史方向尝试，最多 kMaxRelocTries 帧：
+    // 最近帧时间邻近成功率最高，兜底覆盖回环场景，同时限制每帧 LOST 的匹配开销
+    constexpr int kMaxRelocTries = 30;
+    int tried = 0;
+    for (int i = (int)all_kfs.size() - 1; i >= 0 && tried < kMaxRelocTries; i--, tried++) {
         if (try_kf(all_kfs[i])) break;
-    }
-    // 2) 仍不足则全量遍历（处理回环回到历史位置的情况）
-    if (best_inliers < 20) {
-        for (auto& kf : all_kfs) {
-            if (try_kf(kf)) break;
-        }
     }
 
     if (best_inliers >= 20) {
@@ -371,6 +370,11 @@ void VisualOdometry::insertKeyFrame() {
     triangulateNewPoints(ref_frame_, curr_frame_,
         feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
     ref_frame_ = curr_frame_;
+    last_kf_frame_id_ = curr_frame_->id;   // 更新关键帧冷却基准
+
+    // 定期清理观测不足的地图点（每 20 个关键帧一次），防止地图无限增长
+    if (map_->keyFrameCount() % 20 == 0)
+        map_->cullMapPoints(2);
 
     LOG_INFO("New KF. mp=" << map_->mapPointCount());
 
@@ -479,6 +483,11 @@ bool VisualOdometry::needNewKeyFrame() const {
         std::clamp(std::abs(q_rel.w()), 0.0, 1.0));
     // 运动阈值 + 匹配衰减阈值：内点过少说明地图不足/视角变化大，强制补充关键帧
     bool weak_match = status_.inliers < cfg_.keyframe_min_inliers;
+    // 冷却：weak_match 触发需与上一关键帧间隔足够帧数，防止"关键帧风暴"
+    // （一旦地图质量差，无间隔限制会每帧插关键帧 → BA/重定位越来越慢 → 卡死）
+    if (weak_match &&
+        curr_frame_->id - last_kf_frame_id_ < (unsigned long)cfg_.min_keyframe_interval)
+        weak_match = false;
     return dtrans > cfg_.keyframe_translation || drot > cfg_.keyframe_rotation || weak_match;
 }
 

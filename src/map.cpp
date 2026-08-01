@@ -1,5 +1,7 @@
 #include "vslam/map.h"
 
+#include <set>
+
 namespace vslam {
 
 void Map::insertMapPoint(MapPoint::Ptr mp) {
@@ -14,11 +16,21 @@ MapPoint::Ptr Map::getMapPoint(unsigned long id) const {
 }
 
 void Map::cullMapPoints(int min_observations) {
+    // 先找出观测不足的点，从地图移除
+    std::set<unsigned long> removed;
     for (auto it = map_points_.begin(); it != map_points_.end(); ) {
         if (it->second->observed_count < min_observations) {
+            removed.insert(it->first);
             it = map_points_.erase(it);
         } else {
             ++it;
+        }
+    }
+    // 同步清空关键帧中的引用，让内存真正释放
+    if (!removed.empty()) {
+        for (auto& [id, kf] : keyframes_) {
+            for (auto& mp : kf->map_points)
+                if (mp && removed.count(mp->id)) mp.reset();
         }
     }
 }

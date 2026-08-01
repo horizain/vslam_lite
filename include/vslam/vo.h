@@ -20,6 +20,7 @@ struct VOConfig {
     double keyframe_translation   = 0.5;    // 关键帧最小平移(m)
     double keyframe_rotation      = 0.2;    // 关键帧最小旋转(rad)
     int    keyframe_min_inliers   = 15;     // 跟踪内点低于该值 → 强制插入关键帧
+    int    min_keyframe_interval  = 10;     // 关键帧最小帧间隔（防 weak_match 风暴）
     int    local_window_size      = 10;     // 局部 BA 滑动窗口
     int    local_ba_iterations    = 10;     // 局部 BA 迭代次数
     int    feature_method         = 0;      // 0: ORB匹配, 1: LK光流
@@ -101,6 +102,7 @@ private:
     // 轨迹记录
     std::vector<Vec3> trajectory_;
     unsigned long frame_count_ = 0;
+    unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）
     Status status_;  // 当前详细状态（初始化/跟踪/丢失信息）
 };
 

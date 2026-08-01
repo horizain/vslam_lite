@@ -127,6 +127,21 @@
 
 ## 三、待完成的工作
 
+### 3.0 性能优化（2026-08-01）✅
+
+修复"跑一段时间后前端卡住"（增长型性能问题，全部经 Long-Run Stability 测试守护）：
+
+| 问题 | 修复 |
+|------|------|
+| `weak_match` 无条件触发关键帧 → 关键帧风暴 | `min_keyframe_interval=10` 帧冷却（`needNewKeyFrame`） |
+| 地图点从未清理 → 无限增长 | 每 20 个关键帧 `cullMapPoints(2)`，并同步清空关键帧引用释放内存 |
+| Viewer 每帧绘制全部历史轨迹点 → 渲染随运行变卡 | 只显示最近 3000 个轨迹点（`kMaxTrajPts`） |
+| LOST 重定位全量遍历所有关键帧 | 从最新向历史最多尝试 30 帧（`kMaxRelocTries`） |
+| 每帧跟踪重复做基础矩阵 RANSAC | 跟踪匹配改 `use_ransac=false`，外点交给 PnP 自带 RANSAC |
+
+验证（`test_long_run_stability`，150 帧合成序列）：kf=55、mp≈3600（有界），
+末尾帧耗时 ≈ 开头帧耗时（无增长）。10 项测试全部通过。
+
 ### 3.1 Phase 1 剩余任务
 
 #### 🔴 P0 - KITTI 数据集实测（等待数据）
