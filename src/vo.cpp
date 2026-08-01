@@ -31,6 +31,7 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
         if (auto o = root["Optimizer"]) {
             if (o["local_window_size"])   cfg.local_window_size   = o["local_window_size"].as<int>();
             if (o["local_ba_iterations"]) cfg.local_ba_iterations = o["local_ba_iterations"].as<int>();
+            if (o["enable_local_ba"])     cfg.enable_local_ba     = o["enable_local_ba"].as<bool>();
         }
         LOG_INFO("VO config loaded from: " << path);
     } catch (const std::exception& e) {
@@ -92,7 +93,8 @@ SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
             trackFrameLK();
         else
             trackFrame();
-        if (needNewKeyFrame()) insertKeyFrame();
+        // 跟踪可能把状态置为 LOST（跳变保护），此时不能再插入关键帧
+        if (state_ == State::TRACKING && needNewKeyFrame()) insertKeyFrame();
     } else if (state_ == State::LOST) {
         if (tryRelocalize()) { state_ = State::TRACKING; }
     }
@@ -210,14 +212,29 @@ SE3 VisualOdometry::trackFrame() {
             cv::Rodrigues(rvec, R);
             curr_frame_->pose_cw = matToSE3(R, tvec);
             inliers_cnt = (int)inliers.size();
-            // 内点对应的地图点被当前帧再次观测到，累计观测计数
+            // 把内点对应的地图点关联到当前帧（这是关键帧共视统计的基础：
+            // 若不关联，关键帧只与紧邻帧共视，Local BA 窗口永远只有 2 帧）
             for (int idx : inliers) {
-                if (idx >= 0 && idx < (int)match_idx.size()) {
-                    auto& mp = ref_frame_->map_points[matches[match_idx[idx]].queryIdx];
-                    if (mp) mp->observed_count++;
+                if (idx < 0 || idx >= (int)match_idx.size()) continue;
+                auto& mp = ref_frame_->map_points[matches[match_idx[idx]].queryIdx];
+                if (mp) {
+                    mp->observed_count++;
+                    curr_frame_->map_points[matches[match_idx[idx]].trainIdx] = mp;
                 }
             }
             updateStatus((int)matches.size(), inliers_cnt, 0.0);
+
+            // 位姿跳变保护：单帧位移异常说明数值发散（如对极尺度错误累积），
+            // 拒绝该位姿并进入 LOST，等待重定位
+            SE3 Twc_new  = curr_frame_->pose_cw.inverse();
+            SE3 Twc_ref  = ref_frame_->pose_cw.inverse();
+            if ((Twc_new.t - Twc_ref.t).norm() > 30.0) {
+                LOG_WARN("Pose jump detected (" << (Twc_new.t - Twc_ref.t).norm()
+                         << "m), tracking lost");
+                state_ = State::LOST;
+                updateStatus(0, 0, 0.0);
+                return ref_frame_->pose_cw;
+            }
             return curr_frame_->pose_cw;
         }
     }
@@ -233,11 +250,25 @@ SE3 VisualOdometry::trackFrame() {
         SE3 T_rel = matToSE3(R, t);
         curr_frame_->pose_cw = T_rel * ref_frame_->pose_cw;
         inliers_cnt = (int)matches.size();
+        // 对极恢复的 t 只有方向无尺度，组合后可能跳变 → 同样做跳变保护
+        SE3 Twc_new = curr_frame_->pose_cw.inverse();
+        SE3 Twc_ref = ref_frame_->pose_cw.inverse();
+        if ((Twc_new.t - Twc_ref.t).norm() > 30.0) {
+            LOG_WARN("Epipolar fallback pose jump (" << (Twc_new.t - Twc_ref.t).norm()
+                     << "m), tracking lost");
+            curr_frame_->pose_cw = ref_frame_->pose_cw;
+            state_ = State::LOST;
+            updateStatus((int)matches.size(), 0, 0.0);
+            return ref_frame_->pose_cw;
+        }
     } else {
         // 匹配太少 → LOST
         curr_frame_->pose_cw = ref_frame_->pose_cw;
         state_ = State::LOST;
-        LOG_WARN("Tracking lost! matches=" << matches.size());
+        LOG_WARN("Tracking lost! matches=" << matches.size()
+                 << " pts3d=" << pts3d.size()
+                 << " kf_ref=" << (ref_frame_ ? ref_frame_->id : -1)
+                 << " mp_ref=" << (ref_frame_ ? ref_frame_->map_points.size() : 0));
     }
 
     updateStatus((int)matches.size(), inliers_cnt, 0.0);
@@ -310,7 +341,8 @@ bool VisualOdometry::tryRelocalize() {
     // 对单个关键帧做 PnP 匹配，内点达标(20)即返回 true
     auto try_kf = [&](const Frame::Ptr& kf) -> bool {
         auto matches = feature_matcher_.match(kf, curr_frame_, cfg_.match_ratio, true);
-        if ((int)matches.size() < cfg_.min_matches_init) return false;
+        // 重定位用较低门槛（min_matches_init=100 是初始化专用，RANSAC 后常达不到）
+        if ((int)matches.size() < 30) return false;
 
         std::vector<cv::Point3f> pts3d;
         std::vector<cv::Point2f> pts2d;
@@ -380,7 +412,8 @@ void VisualOdometry::insertKeyFrame() {
 
     // 共视图滑动窗口（按共视地图点数选帧）+ Local BA
     std::vector<Frame::Ptr> window = selectLocalWindow(cfg_.local_window_size);
-    Optimizer::localBundleAdjustment(camera_, map_, window, cfg_.local_ba_iterations);
+    if (cfg_.enable_local_ba)
+        Optimizer::localBundleAdjustment(camera_, map_, window, cfg_.local_ba_iterations);
     updateStatus(status_.matches, status_.inliers, status_.parallax);
 }
 
@@ -410,10 +443,10 @@ std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
     // C++23 ranges：按共视点数量降序（投影 &Candidate::cov，免手写比较器）
     std::ranges::sort(cands, std::greater<>{}, &Candidate::cov);
 
-    // 窗口 = 当前帧 + 共视最多的前 n-1 帧（要求至少 2 个共视点）
+    // 窗口 = 当前帧 + 共视最多的前 n-3 帧（预留 2 个尺度锚位）
     window.push_back(curr_frame_);
     for (auto& c : cands) {
-        if ((int)window.size() >= n) break;
+        if ((int)window.size() >= n - 2) break;
         if (c.cov >= 2) window.push_back(c.kf);
     }
 
@@ -425,7 +458,17 @@ std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
             window.push_back(all_kfs[i]);
     }
 
-    // 按 id 升序，最早帧在 index 0（BA 中锚定，保证全局一致）
+    // 强制加入全局最早的两个关键帧（id 0/1，初始化尺度基准）：
+    // BA 固定它们后，每个滑动窗口共用同一基线，避免窗口间锚定帧不同
+    // 导致的尺度漂移。
+    for (auto& kf : all_kfs) {
+        if (kf->id == 0 || kf->id == 1) {
+            if (std::find(window.begin(), window.end(), kf) == window.end())
+                window.push_back(kf);
+        }
+    }
+
+    // 按 id 升序，最早帧在 index 0/1（BA 中固定，尺度锚定）
     std::ranges::sort(window, {}, [](const Frame::Ptr& f) { return f->id; });
     return window;
 }

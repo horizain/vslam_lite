@@ -59,16 +59,20 @@ void Optimizer::localBundleAdjustment(
     for (size_t i = 0; i < active_kfs.size(); i++) {
         auto& kf = active_kfs[i];
 
-        // g2o 的 VertexSE3Expmap::estimate 语义为 T_wc（相机在世界系），
-        // 而 pose_cw 是 T_cw（世界→相机），需取逆
-        SE3 Twc = kf->pose_cw.inverse();
-        g2o::SE3Quat pose(Twc.q.toRotationMatrix(), Twc.t);
+        // 注意：本机 apt 版 g2o 的 VertexSE3Expmap + EdgeProjectXYZ2UV 约定
+        // estimate 为 T_cw（世界→相机，误差 = cam_map(T.map(P_w)) - obs），
+        // 与官方新版（T_wc）不同——实测喂 T_wc 会被反向优化导致位姿跑飞。
+        // 因此直接喂 pose_cw（T_cw 语义）。
+        g2o::SE3Quat pose(kf->pose_cw.q.toRotationMatrix(), kf->pose_cw.t);
 
         auto* v_pose = new g2o::VertexSE3Expmap();
         v_pose->setId(static_cast<int>(i));
         v_pose->setEstimate(pose);
-        if (i == 0) {
-            v_pose->setFixed(true);  // 锚定第一帧，消除自由度
+        // 固定窗口内最早的 2 帧：仅固定第 1 帧只能锚定绝对位置，
+        // 无法约束单目 BA 的尺度自由度（所有点+位姿平移同时缩放 s 时
+        // 重投影不变）。固定两帧 = 固定基线长度 → 尺度锚定。
+        if (i == 0 || i == 1) {
+            v_pose->setFixed(true);
         }
         optimizer.addVertex(v_pose);
         kf_id_to_idx[kf->id] = i;
@@ -106,7 +110,7 @@ void Optimizer::localBundleAdjustment(
     std::unordered_map<unsigned long, int> mp_id_to_vertex;
 
     for (auto& [mp_id, obs_list] : mp_observations) {
-        if (obs_list.size() < 2) continue;  // 需要至少两个观测
+        if (obs_list.size() < 3) continue;  // 至少 3 帧观测，过滤弱观测坏点
 
         auto mp = map->getMapPoint(mp_id);
         if (!mp) continue;
@@ -114,7 +118,11 @@ void Optimizer::localBundleAdjustment(
         auto* v_point = new g2o::VertexPointXYZ();
         v_point->setId(point_vertex_id);
         v_point->setEstimate(mp->pos_w);
-        v_point->setMarginalized(true);  // 边缘化 3D 点以加速求解
+        // Motion-only BA：地图点固定，只优化位姿。
+        // 单目三角化点的尺度由初始化（recoverPose 归一化 t）决定，
+        // 若让点自由优化，存在尺度 gauge 自由度（点+位姿平移同时缩放 s
+        // 重投影不变），实测会让刚插入的关键帧位姿被拉偏直至发散。
+        v_point->setFixed(true);
         optimizer.addVertex(v_point);
         mp_id_to_vertex[mp_id] = point_vertex_id;
         point_vertex_id++;
@@ -176,9 +184,9 @@ void Optimizer::localBundleAdjustment(
         if (!v_pose) continue;
 
         const g2o::SE3Quat& opt_pose = v_pose->estimate();
-        // g2o 输出为 T_wc，转回 T_cw 存储
-        SE3 Twc(Eigen::Quaterniond(opt_pose.rotation()), opt_pose.translation());
-        active_kfs[i]->pose_cw = Twc.inverse();
+        // g2o 输出即 T_cw（与本项目 pose_cw 语义一致），直接回写
+        active_kfs[i]->pose_cw = SE3(
+            Eigen::Quaterniond(opt_pose.rotation()), opt_pose.translation());
     }
 
     for (auto& [mp_id, point_vid] : mp_id_to_vertex) {

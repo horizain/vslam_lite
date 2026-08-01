@@ -59,16 +59,21 @@ for seq in $SEQUENCES; do
     python3 - "$GRAY_ZIP" "$seq" << 'PYEOF'
 import sys, zipfile, os
 zip_path, seq = sys.argv[1], sys.argv[2]
-prefix = f"data_odometry_gray/dataset/sequences/{seq}/"
+# 只解压左目 image_0；精确到 image_0/ 避免右目 image_1 同名文件覆盖
+# （兼容两种 zip 内部前缀：官方 "dataset/sequences/..." 或镜像 "data_odometry_gray/..."）
+prefixes = [f"dataset/sequences/{seq}/image_0/", f"data_odometry_gray/dataset/sequences/{seq}/image_0/"]
 os.makedirs(f"sequences/{seq}/image_0", exist_ok=True)
 z = zipfile.ZipFile(zip_path)
 count = 0
 for name in z.namelist():
-    if name.startswith(prefix) and name.endswith(".png"):
-        base = os.path.basename(name)
-        with open(f"sequences/{seq}/image_0/{base}", "wb") as out:
-            out.write(z.read(name))
-        count += 1
+    if not name.endswith(".png"):
+        continue
+    if not any(name.startswith(p) for p in prefixes):
+        continue
+    base = os.path.basename(name)
+    with open(f"sequences/{seq}/image_0/{base}", "wb") as out:
+        out.write(z.read(name))
+    count += 1
 print(f"    {seq}: {count} 张图像")
 PYEOF
 done

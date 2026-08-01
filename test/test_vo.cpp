@@ -17,6 +17,7 @@
 #include "vslam/feature.h"
 #include "vslam/vo.h"
 #include "vslam/mappoint.h"
+#include "vslam/optimizer.h"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -347,6 +348,60 @@ void test_long_run_stability() {
 }
 
 // ============================================================
+// Local BA 语义回归测试
+// 3 帧已知位姿（1m/帧）+ 精确投影 → BA 后尺度必须保持。
+// 守护：本机 apt 版 g2o 的 EdgeProjectXYZ2UV 用 T_cw 语义，
+// 若喂 T_wc 会被反向优化（实测帧位姿被拉飞、轨迹尺度膨胀）。
+// ============================================================
+void test_local_ba() {
+    TEST("Local BA 保持尺度 (3 帧已知位姿)") {
+        vslam::Camera cam;
+        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
+        cam.img_width = 640; cam.img_height = 480;
+
+        auto map = std::make_shared<vslam::Map>();
+
+        // 3 帧 T_wc：原点、前进 1m、前进 2m（真实尺度）
+        std::vector<vslam::SE3> Twc = {
+            vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(0, 0, 0)),
+            vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(1, 0, 0)),
+            vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(2, 0, 0)),
+        };
+        std::vector<vslam::Frame::Ptr> kfs;
+        for (int i = 0; i < 3; i++) {
+            auto kf = std::make_shared<vslam::Frame>((unsigned long)i, i * 0.1);
+            kf->pose_cw = Twc[i].inverse();
+            kfs.push_back(kf);
+            map->insertKeyFrame(kf);
+        }
+        // 20 个世界点（前方 4~8m），投影到 3 帧
+        std::mt19937 gen(5);
+        std::uniform_real_distribution<double> dx(-2, 2), dy(-2, 2), dz(4, 8);
+        for (int i = 0; i < 20; i++) {
+            auto mp = std::make_shared<vslam::MapPoint>((unsigned long)i);
+            mp->pos_w = vslam::Vec3(dx(gen), dy(gen), dz(gen));
+            mp->observed_count = 3;
+            map->insertMapPoint(mp);
+            for (int f = 0; f < 3; f++) {
+                vslam::Vec2 px = cam.world2pixel(mp->pos_w, kfs[f]->pose_cw);
+                cv::KeyPoint kp;
+                kp.pt = cv::Point2f((float)px.x(), (float)px.y());
+                kfs[f]->keypoints.push_back(kp);
+                kfs[f]->map_points.push_back(mp);
+            }
+        }
+        auto disp = [&](int a, int b) {
+            return (kfs[b]->pose_cw.inverse().t - kfs[a]->pose_cw.inverse().t).norm();
+        };
+        vslam::Optimizer::localBundleAdjustment(cam, map, kfs, 10);
+        // 点固定（motion-only）+ 帧 0/1 固定：尺度必须保持 1m/帧
+        assert(std::abs(disp(0, 1) - 1.0) < 0.2);
+        assert(std::abs(disp(1, 2) - 1.0) < 0.2);
+        std::cout << " (disp01=" << disp(0, 1) << " disp12=" << disp(1, 2) << ")";
+    } TEST_PASS();
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 int main() {
@@ -369,6 +424,9 @@ int main() {
 
     std::cout << "\n[LK Tracking]\n";
     test_lk_tracking();
+
+    std::cout << "\n[Local BA]\n";
+    test_local_ba();
 
     std::cout << "\n[Long-Run Stability]\n";
     test_long_run_stability();

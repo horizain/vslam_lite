@@ -23,6 +23,7 @@ struct VOConfig {
     int    min_keyframe_interval  = 10;     // 关键帧最小帧间隔（防 weak_match 风暴）
     int    local_window_size      = 10;     // 局部 BA 滑动窗口
     int    local_ba_iterations    = 10;     // 局部 BA 迭代次数
+    bool   enable_local_ba        = true;   // 局部 BA 开关（诊断/教学对比用）
     int    feature_method         = 0;      // 0: ORB匹配, 1: LK光流
 
     /// 从 yaml 配置加载（缺省字段保持默认值）

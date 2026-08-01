@@ -156,16 +156,36 @@
 
 ### 3.1 Phase 1 剩余任务
 
-#### 🔴 P0 - KITTI 数据集实测（等待数据）
+#### 🔴 P0 - KITTI 数据集实测 ✅（2026-08-01）
 
-- [x] 安装依赖并编译 ✅
-- [x] 编译错误修复 ✅
-- [x] 合成图像/摄像头测试 ✅
-- [x] `scripts/install_deps.sh` 依赖安装脚本 ✅（2026-08-01）
-- [ ] **KITTI 数据集实测**（需用户下载数据）：下载后运行
-  `./build/bin/run_vo ~/data/kitti/sequences/00/image_0 config/default.yaml trajectory_00.txt`
-- [ ] **结果评估**：与 KITTI ground truth(`~/data/kitti/poses/00.txt`) 用 EVO 对比 ATE/RPE
-- [ ] **参数调优**：keyframe 阈值、ORB 特征数 vs 速度、RANSAC 阈值（现全部可在 yaml 调整）
+- [x] 数据准备 ✅：用户下载 zip 至 `datasets/`，`prepare_kitti.sh` 解压（修复 zip 前缀 + 防 image_1 覆盖）
+- [x] **KITTI 00 全程实测** ✅：4541 帧**全程无 LOST**，26.5 FPS，171 秒
+- [x] **位姿语义（g2o T_cw）重大修复** ✅：见下
+- [x] **ATE 评估** ✅：前 1000 帧 RMSE 53.7m（GT ~400m），全量 RMSE 242.8m——无回环单目 VO 的正常漂移水平
+- [ ] 参数进一步调优（keyframe 阈值/特征数，现可 yaml 调整）
+
+**关键 bug 修复：本机 apt 版 g2o 的 `EdgeProjectXYZ2UV` 用 T_cw 语义**
+
+症状：插入关键帧后轨迹尺度膨胀直至发散（BA on 时帧 2 位移从 1m 拉飞到 3m）。
+排查过程：BA off 对照实验（前端稳定）→ 固定帧/固定点均无效 → 最小化 3 帧测试精确复现
+（无噪声精确解下 BA 仍把帧 2 拉向 T_cw 值 `t=-2`）→ 查 g2o 源码确认 apt 版
+`EdgeProjectXYZ2UV::computeError` 用 `estimate.map(P)`（**T_cw 语义**，与官方新版 T_wc 相反）。
+
+修复：喂入 g2o 直接传 `pose_cw`（不取逆），回写直接取 estimate。已加
+`test_local_ba` 回归测试守护（3 帧已知位姿，BA 后尺度必须保持 1m/帧）。
+
+配套修复：
+- 普通帧 trackFrame 时把 PnP 内点关联到 `curr_frame_->map_points`（否则关键帧只与
+  紧邻帧共视，BA 窗口永远只有 2 帧）
+- 位姿跳变保护：PnP/对极回退单帧位移 >30m 判 LOST（防数值发散）
+- LOST 后不再误插关键帧（trackFrame 置 LOST 后外层复查状态）
+- 重定位门槛 100→30（min_matches_init 是初始化专用）
+- `keyframe_translation` 0.5m（KITTI 起步段帧间位移 <1m，1.0 阈值导致视差累积崩溃）
+- Local BA 改为 **motion-only（点固定，只优化位姿）**：单目三角化尺度由初始化锚定，
+  点自由优化存在尺度 gauge 自由度（点+位姿平移同时缩放 s 重投影不变）
+- 评估脚本 `scripts/evaluate_ate.py` 修复 Umeyama scale 公式（漏了 1/N）
+
+#### 🔴 P0 - 参数调优（后续）
 
 #### 🟡 P1 - 后端优化（g2o）✅ 完成
 

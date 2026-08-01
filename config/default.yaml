@@ -38,6 +38,7 @@ VO:
 Optimizer:
   local_window_size: 10    # 局部 BA 窗口大小
   local_ba_iterations: 10  # 局部 BA 迭代次数
+  enable_local_ba: true    # 局部 BA 开关（false 时仅前端跟踪，用于对比实验）
   global_ba_iterations: 20 # 全局 BA 迭代次数
 
 # ---- 回环检测 (Phase 2) ----

@@ -33,11 +33,13 @@ int main(int argc, char** argv) {
     std::string traj_path   = "trajectory.txt";
 
     // ---- 解析命令行参数 ----
-    // 用法: run_vo <dataset_path|camera_index> [config.yaml] [trajectory.txt] [--tum|--euroc]
+    // 用法: run_vo <dataset_path|camera_index> [config.yaml] [trajectory.txt] [--tum|--euroc] [--headless]
+    bool headless = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--tum")       dataset_type = vslam::Dataset::Type::TUM;
         else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
+        else if (a == "--headless") headless = true;
     }
     if (argc >= 2) {
         input_path = argv[1];
@@ -87,9 +89,9 @@ int main(int argc, char** argv) {
     vslam::VOConfig vo_cfg = vslam::VOConfig::fromYaml(config_path);
     vslam::VisualOdometry vo(camera, vo_cfg);
 
-    // ---- 初始化可视化 ----
+    // ---- 初始化可视化（--headless 跳过，用于批量评估）----
     vslam::Viewer viewer;
-    viewer.start();
+    if (!headless) viewer.start();
 
     // ---- 主循环 ----
     cv::Mat image;
@@ -102,7 +104,7 @@ int main(int argc, char** argv) {
 
     LOG_INFO("Starting VO pipeline... Press Ctrl+C or close window to exit.");
 
-    while (dataset.nextFrame(image, timestamp) && !viewer.shouldQuit()) {
+    while (dataset.nextFrame(image, timestamp) && (headless || !viewer.shouldQuit())) {
         frame_count++;
 
         // 运行一帧 VO
@@ -140,7 +142,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- 清理 ----
-    viewer.stop();
+    if (!headless) viewer.stop();
 
     // ---- 保存轨迹（TUM 格式：time tx ty tz qx qy qz qw，位姿为 T_wc）----
     if (!traj_saved.empty()) {
