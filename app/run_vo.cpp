@@ -138,12 +138,14 @@ int main(int argc, char** argv) {
         switch (st.state) {
             case vslam::VisualOdometry::State::INITIALIZING: state_str = "INIT"; break;
             case vslam::VisualOdometry::State::TRACKING:     state_str = "TRACKING"; break;
+            case vslam::VisualOdometry::State::RECOVERING:   state_str = "RECOVERING"; break;
             case vslam::VisualOdometry::State::LOST:         state_str = "LOST"; break;
         }
         // 更新状态栏（std::format 类型安全，替代 snprintf）
-        std::string status = std::format("{} | Matches:{} Inl:{} Parallax:{:.2f} | MP:{} KF:{}",
+        std::string status = std::format("{} | Matches:{} Inl:{} Parallax:{:.2f} | MP:{} KF:{} SM:{} Lost:{}",
                                          state_str, st.matches, st.inliers,
-                                         st.parallax, st.map_points, st.keyframes);
+                                         st.parallax, st.map_points, st.keyframes,
+                                         st.submap_id, st.lost_frames);
         if (!headless) {
             viewer.setStatus(status);
             // 双目上下排列，避免超宽画面被压缩；单目显示视频流、特征点和世界系轨迹。

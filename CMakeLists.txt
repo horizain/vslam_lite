@@ -70,6 +70,7 @@ set(VSLAM_SOURCES
     src/dataset.cpp
     src/mappoint.cpp
     src/map.cpp
+    src/atlas.cpp
     src/feature.cpp
     src/vo.cpp
     src/optimizer.cpp
@@ -83,6 +84,7 @@ set(VSLAM_HEADERS
     include/vslam/frame.h
     include/vslam/mappoint.h
     include/vslam/map.h
+    include/vslam/atlas.h
     include/vslam/feature.h
     include/vslam/vo.h
     include/vslam/optimizer.h

@@ -4,6 +4,7 @@
 #include "vslam/camera.h"
 #include "vslam/frame.h"
 #include "vslam/map.h"
+#include "vslam/atlas.h"
 #include "vslam/feature.h"
 
 namespace vslam {
@@ -17,6 +18,8 @@ struct VOConfig {
     double ransac_pixel_threshold = 3.0;    // PnP RANSAC 重投影误差阈值(px)
     int    min_matches_init       = 100;    // 初始化最小匹配数
     int    min_matches_track      = 20;     // 跟踪/对极回退最小匹配数
+    int    max_tracking_failures  = 5;      // 连续失败多少帧后进入重定位
+    int    max_relocalize_frames  = 20;     // 重定位失败多少帧后创建新子地图
     double keyframe_translation   = 0.5;    // 关键帧最小平移(m)，单目（尺度归一化后位移小）
     double keyframe_translation_stereo = 1.5;  // 双目/RGB-D 关键帧最小平移(m)：
                                              // 单帧即可建点（绝对尺度），KF 只需服务 BA 稀疏化；
@@ -42,6 +45,7 @@ public:
     enum class State {
         INITIALIZING,  // 正在初始化（等待足够视差的前两帧）
         TRACKING,      // 正常跟踪中
+        RECOVERING,    // 短时跟踪退化，保留位姿并尝试恢复
         LOST           // 跟丢了，需要重定位
     };
 
@@ -52,6 +56,8 @@ public:
         double        parallax     = 0.0;
         unsigned long map_points   = 0;
         unsigned long keyframes    = 0;
+        unsigned long submap_id    = 0;
+        int           lost_frames  = 0;
     };
 
     VisualOdometry(const Camera& camera, const VOConfig& cfg = VOConfig());
@@ -67,6 +73,9 @@ public:
 
     /// 获取地图
     Map::Ptr getMap() const { return map_; }
+
+    /// 获取轻量 Atlas（用于查看子地图数量和状态）
+    Atlas::Ptr getAtlas() const { return atlas_; }
 
     /// 获取当前状态
     State state() const { return state_; }
@@ -100,6 +109,7 @@ private:
     /// 运动先验：ref→上一帧 位移（跳变保护阈值基准）
     double motionPrior() const;
     bool tryRelocalize();               // LOST 状态重定位
+    void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
     void insertKeyFrame();              // 关键帧插入 + 三角化 + BA
     /// 按共视地图点数选取 Local BA 窗口（含当前关键帧，最早帧锚定）
     std::vector<Frame::Ptr> selectLocalWindow(int n) const;
@@ -111,6 +121,7 @@ private:
     Camera    camera_;
     VOConfig  cfg_;
     State     state_ = State::INITIALIZING;
+    Atlas::Ptr atlas_;
     Map::Ptr  map_;
 
     Frame::Ptr ref_frame_;   // 参考帧（上一个关键帧）
@@ -123,6 +134,10 @@ private:
     std::vector<Vec3> trajectory_;
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）
+    SE3 last_valid_pose_cw_;
+    bool has_last_valid_pose_ = false;
+    int tracking_failures_ = 0;
+    int relocalization_frames_ = 0;
     Status status_;  // 当前详细状态（初始化/跟踪/丢失信息）
 };
 

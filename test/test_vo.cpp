@@ -9,6 +9,7 @@
  *   5. recoverPose → T_cw 位姿语义（关键回归测试：修复前的取逆方向会使三角化全部失效）
  *   6. LK 光流模式多帧跟踪
  *   7. T_cw 平移与世界系相机轨迹的语义
+ *   8. MiniAtlas 子地图锚定与切换
  *
  * 编译: cmake -DBUILD_TESTS=ON .. && make test_vo && ./test_vo
  */
@@ -17,6 +18,7 @@
 #include "vslam/camera.h"
 #include "vslam/feature.h"
 #include "vslam/vo.h"
+#include "vslam/atlas.h"
 #include "vslam/mappoint.h"
 #include "vslam/optimizer.h"
 
@@ -625,6 +627,29 @@ void test_stereo_vo() {
     } TEST_PASS();
 }
 
+void test_mini_atlas() {
+    TEST("MiniAtlas 子地图锚定与切换") {
+        vslam::Atlas atlas;
+        auto& first = atlas.createSubmap(vslam::SE3());
+        const auto first_id = first.id;
+        auto first_map = first.map;
+        assert(first_id == 0);
+        assert(first.map != nullptr);
+        assert(atlas.activeMap() == first.map);
+
+        vslam::SE3 anchor(Eigen::Quaterniond::Identity(), vslam::Vec3(10, 2, -3));
+        auto& second = atlas.createSubmap(anchor);
+        assert(second.id == 1);
+        assert(second.origin_Twc.t.isApprox(anchor.t));
+        assert(first.frozen);
+        assert(atlas.activeMap() == second.map);
+        assert(atlas.submapCount() == 2);
+
+        assert(atlas.activate(first_id));
+        assert(atlas.activeMap() == first_map);
+    } TEST_PASS();
+}
+
 // ============================================================
 // 主函数
 // ============================================================
@@ -642,6 +667,9 @@ int main() {
 
     std::cout << "\n[Stereo VO]\n";
     test_stereo_vo();
+
+    std::cout << "\n[MiniAtlas]\n";
+    test_mini_atlas();
 
     std::cout << "\n[Feature Extraction]\n";
     test_feature_extraction();

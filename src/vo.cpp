@@ -27,6 +27,8 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (v["method"])              cfg.feature_method       = v["method"].as<int>();
             if (v["min_matches_init"])    cfg.min_matches_init     = v["min_matches_init"].as<int>();
             if (v["min_matches_track"])   cfg.min_matches_track    = v["min_matches_track"].as<int>();
+            if (v["max_tracking_failures"]) cfg.max_tracking_failures = v["max_tracking_failures"].as<int>();
+            if (v["max_relocalize_frames"]) cfg.max_relocalize_frames = v["max_relocalize_frames"].as<int>();
             if (v["keyframe_translation"]) cfg.keyframe_translation = v["keyframe_translation"].as<double>();
             if (v["keyframe_rotation"])   cfg.keyframe_rotation    = v["keyframe_rotation"].as<double>();
         }
@@ -49,7 +51,8 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
 }
 
 VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
-    : camera_(camera), cfg_(cfg), map_(std::make_shared<Map>()) {
+    : camera_(camera), cfg_(cfg), atlas_(std::make_shared<Atlas>()) {
+    map_ = atlas_->createSubmap(SE3()).map;
     feature_matcher_.setParams(cfg_.num_features, cfg_.scale_factor, cfg_.pyramid_levels);
     if (cfg_.feature_method != 0) {
         LOG_INFO("feature_method=" << cfg_.feature_method << " (LK 光流)");
@@ -105,8 +108,14 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     }
     if (curr_frame_->keypoints.empty()) {
         LOG_WARN("No features extracted, skipping frame");
+        if (state_ != State::INITIALIZING && ref_frame_) {
+            state_ = State::RECOVERING;
+            tracking_failures_++;
+            curr_frame_->pose_cw = has_last_valid_pose_ ? last_valid_pose_cw_
+                                                        : ref_frame_->pose_cw;
+        }
         updateStatus(0, 0, 0.0);
-        return (state_ != State::INITIALIZING) ? ref_frame_->pose_cw : SE3();
+        return (state_ != State::INITIALIZING) ? curr_frame_->pose_cw : SE3();
     }
 
     // 2.5 双目/RGB-D：视差（或深度）→ 每特征点的相机系 3D 观测 pts_c
@@ -115,35 +124,54 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     // 3. 状态机处理
     if (state_ == State::INITIALIZING) {
         bool ok = tryInitialize();
-        if (ok) { state_ = State::TRACKING; }
+        if (ok) {
+            state_ = State::TRACKING;
+            tracking_failures_ = 0;
+            relocalization_frames_ = 0;
+        }
     } else if (state_ == State::TRACKING) {
         // LK 模式：描述子为空说明走的是光流路径，用索引对齐的 PnP 跟踪
         if (cfg_.feature_method == 1 && curr_frame_->descriptors.empty())
             trackFrameLK();
         else
             trackFrame();
-        // 跟踪可能把状态置为 LOST（跳变保护），此时不能再插入关键帧
+        // 跟踪可能把状态置为 RECOVERING（跳变保护），此时不能再插入关键帧
         if (state_ == State::TRACKING && needNewKeyFrame()) insertKeyFrame();
-    } else if (state_ == State::LOST) {
+    }
+
+    if (state_ == State::RECOVERING || state_ == State::LOST) {
+        if (state_ == State::RECOVERING && tracking_failures_ < cfg_.max_tracking_failures) {
+            ++tracking_failures_;
+        } else {
+            state_ = State::LOST;
+        }
+
         if (tryRelocalize()) {
             state_ = State::TRACKING;
-        } else if (camera_->hasPerFrameDepth()) {
-            // 双目/RGB-D 兜底：重定位失败时直接用当前帧重新初始化——
-            // 单帧即有绝对尺度深度，无需历史地图（ORB-SLAM stereo 的 Lost→Reset 语义），
-            // 避免高速段长时间卡在 LOST 循环（每帧 × 30 KF 匹配 → 帧率暴跌）
-            map_->clear();
-            ref_frame_.reset();
-            prev_frame_.reset();
-            trajectory_.clear();
-            last_kf_frame_id_ = 0;
-            if (tryInitialize()) {
-                LOG_WARN("Stereo re-init with current frame (map reset)");
-                state_ = State::TRACKING;
+            tracking_failures_ = 0;
+            relocalization_frames_ = 0;
+        } else {
+            ++relocalization_frames_;
+            if (relocalization_frames_ >= cfg_.max_relocalize_frames) {
+                createSubmap();
+                if (tryInitialize()) {
+                    LOG_WARN((camera_->hasPerFrameDepth()
+                              ? "Stereo re-init in anchored submap"
+                              : "Monocular re-init in anchored submap"));
+                    state_ = State::TRACKING;
+                    tracking_failures_ = 0;
+                    relocalization_frames_ = 0;
+                }
             }
         }
     }
 
     prev_frame_ = curr_frame_;
+    if (state_ == State::TRACKING) {
+        last_valid_pose_cw_ = curr_frame_->pose_cw;
+        has_last_valid_pose_ = true;
+        tracking_failures_ = 0;
+    }
     // pose_cw.t 是世界原点在相机系中的坐标，不是相机位置。
     // 原地旋转时它会随 R_cw 绕圈；轨迹必须记录相机光心 C_w = -R_cw^T t_cw。
     trajectory_.push_back(curr_frame_->pose_cw.camera_position());
@@ -222,6 +250,27 @@ void VisualOdometry::updateStatus(int matches, int inliers, double parallax) {
     status_.parallax   = parallax;
     status_.map_points = map_->mapPointCount();
     status_.keyframes  = map_->keyFrameCount();
+    status_.submap_id  = atlas_->activeSubmap() ? atlas_->activeSubmap()->id : 0;
+    status_.lost_frames = tracking_failures_ + relocalization_frames_;
+}
+
+void VisualOdometry::createSubmap() {
+    // 新子地图的原点必须落在上一段全局轨迹附近。短时丢失时使用最后
+    // 有效位姿；如果还没有有效位姿，则退化为当前参考帧位姿。
+    const SE3 anchor_Twc = has_last_valid_pose_
+        ? last_valid_pose_cw_.inverse()
+        : (ref_frame_ ? ref_frame_->pose_cw.inverse() : SE3());
+
+    auto& submap = atlas_->createSubmap(anchor_Twc);
+    map_ = submap.map;
+    ref_frame_.reset();
+    prev_frame_.reset();
+    last_kf_frame_id_ = 0;
+    curr_frame_->pose_cw = anchor_Twc.inverse();
+    state_ = State::INITIALIZING;
+    tracking_failures_ = 0;
+    relocalization_frames_ = 0;
+    LOG_WARN("Tracking lost for too long; creating anchored submap " << submap.id);
 }
 
 // ============================================================
@@ -275,17 +324,17 @@ bool VisualOdometry::tryInitialize() {
         return false;
     }
 
-    // 第一帧 = 世界原点（T_cw1 = I）
-    // recoverPose 返回的相对变换 T_rel 满足 p_c2 = T_rel * p_c1，
-    // 即 T_cw2 = T_rel（世界系 = 帧1相机系）
-    ref_frame_->pose_cw = SE3();
+    // 第一帧使用当前子地图的锚定位姿。初始子地图锚点为单位位姿，
+    // 后续子地图则继承全局位姿，避免重建后轨迹跳回原点。
+    // recoverPose 返回的相对变换 T_rel 满足 p_c2 = T_rel * p_c1。
+    SE3 anchor_cw = ref_frame_->pose_cw;
     Eigen::Matrix3d R_eigen;
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
             R_eigen(i, j) = R.at<double>(i, j);
     SE3 T_cw2(Eigen::Quaterniond(R_eigen),
               Vec3(t.at<double>(0), t.at<double>(1), t.at<double>(2)));
-    curr_frame_->pose_cw = T_cw2;
+    curr_frame_->pose_cw = T_cw2 * anchor_cw;
 
     triangulateNewPoints(ref_frame_, curr_frame_, matches);
 
@@ -361,7 +410,7 @@ SE3 VisualOdometry::trackFrame() {
                          << "m), retry stereo 3D-3D");
                 // 旋转-平移歧义时 PnP 的假平移不可信，改用双目真实深度重新估计
                 if (tryTrack3D3D(matches)) return curr_frame_->pose_cw;
-                state_ = State::LOST;
+                state_ = State::RECOVERING;
                 updateStatus(0, 0, 0.0);
                 return ref_frame_->pose_cw;
             }
@@ -392,14 +441,14 @@ SE3 VisualOdometry::trackFrame() {
             LOG_WARN("Epipolar fallback pose jump (" << (Twc_new.t - Twc_ref.t).norm()
                      << "m), tracking lost");
             curr_frame_->pose_cw = ref_frame_->pose_cw;
-            state_ = State::LOST;
+            state_ = State::RECOVERING;
             updateStatus((int)matches.size(), 0, 0.0);
             return ref_frame_->pose_cw;
         }
     } else {
         // 匹配太少 → LOST
         curr_frame_->pose_cw = ref_frame_->pose_cw;
-        state_ = State::LOST;
+        state_ = State::RECOVERING;
         LOG_WARN("Tracking lost! matches=" << matches.size()
                  << " pts3d=" << pts3d.size()
                  << " kf_ref=" << (ref_frame_ ? ref_frame_->id : -1)
@@ -562,8 +611,21 @@ SE3 VisualOdometry::trackFrameLK() {
 // 重定位（LOST 状态下尝试匹配所有关键帧恢复跟踪）
 // ============================================================
 bool VisualOdometry::tryRelocalize() {
-    auto all_kfs = map_->getAllKeyFrames();
-    if (all_kfs.empty()) return false;
+    // 先搜索当前子地图，再按新旧顺序搜索历史子地图。候选总数设上限，
+    // 防止连续丢失时 Atlas 越大、单帧重定位开销越高。
+    std::vector<std::pair<unsigned long, Frame::Ptr>> candidates;
+    constexpr int kMaxRelocTries = 60;
+    for (auto it = atlas_->submaps().rbegin();
+         it != atlas_->submaps().rend() && (int)candidates.size() < kMaxRelocTries; ++it) {
+        auto kfs = it->map->getAllKeyFrames();
+        int per_map = 0;
+        for (auto kf_it = kfs.rbegin();
+             kf_it != kfs.rend() && per_map < 30 && (int)candidates.size() < kMaxRelocTries;
+             ++kf_it, ++per_map) {
+            candidates.emplace_back(it->id, *kf_it);
+        }
+    }
+    if (candidates.empty()) return false;
 
     // LK 模式：当前帧可能无描述子，重定位前先提取 ORB
     if (curr_frame_->descriptors.empty())
@@ -572,6 +634,7 @@ bool VisualOdometry::tryRelocalize() {
     int best_inliers = 0;
     SE3 best_pose;
     Frame::Ptr best_kf;
+    unsigned long best_submap_id = 0;
 
     // 对单个关键帧做 PnP 匹配，内点达标(20)即返回 true
     auto try_kf = [&](const Frame::Ptr& kf) -> bool {
@@ -603,18 +666,21 @@ bool VisualOdometry::tryRelocalize() {
         return best_inliers >= 20;
     };
 
-    // 从最新关键帧向历史方向尝试，最多 kMaxRelocTries 帧：
-    // 最近帧时间邻近成功率最高，兜底覆盖回环场景，同时限制每帧 LOST 的匹配开销
-    constexpr int kMaxRelocTries = 30;
-    int tried = 0;
-    for (int i = (int)all_kfs.size() - 1; i >= 0 && tried < kMaxRelocTries; i--, tried++) {
-        if (try_kf(all_kfs[i])) break;
+    // 最近关键帧优先；如果当前子地图失效，继续尝试历史子地图。
+    for (const auto& [submap_id, kf] : candidates) {
+        if (try_kf(kf)) {
+            best_submap_id = submap_id;
+            break;
+        }
     }
 
     if (best_inliers >= 20) {
+        atlas_->activate(best_submap_id);
+        map_ = atlas_->activeMap();
         curr_frame_->pose_cw = best_pose;
         ref_frame_ = best_kf;
-        LOG_INFO("Relocalized! inliers=" << best_inliers);
+        LOG_INFO("Relocalized in submap " << best_submap_id
+                 << "! inliers=" << best_inliers);
         updateStatus(0, best_inliers, 0.0);
         return true;
     }

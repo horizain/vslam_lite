@@ -30,6 +30,8 @@ VO:
   min_parallax: 0.1        # 初始化的最小视差
   min_matches_init: 100    # 初始化的最小匹配数
   min_matches_track: 20    # 跟踪的最小匹配数
+  max_tracking_failures: 5 # 连续跟踪失败多少帧后进入重定位
+  max_relocalize_frames: 20 # 重定位持续失败多少帧后建立新子地图
   pnp_min_inliers: 6       # PnP 的最小内点数
   keyframe_translation: 0.5  # 关键帧选择：最小平移距离（米）
   keyframe_rotation: 0.2   # 关键帧选择：最小旋转角度（弧度）
