@@ -1,0 +1,92 @@
+# ============================================================
+# VSLAM KITTI 00 优化配置
+# 用法: ./build/bin/run_vo datasets/sequences/00 config/kitti00.yaml traj_00.txt --headless
+#
+# 说明:
+#   - KITTI 00 实际内参由 calib.txt 自动加载(见 run_vo 输出), 此处 Camera 段
+#     仅在无 calib.txt 时作为兜底, 保留 KITTI 标称值。
+#   - 优化方向: 提升特征数量与匹配质量 -> 更多共视 3D 点 -> PnP 更稳健,
+#     降低触发 LOST/子地图切换的概率。
+#   - 注意: 配置无法根治"每 20 个关键帧剔除刚建点"与"新子地图冻结轨迹"
+#     两个代码问题, 需要配合代码修复(见 vo.cpp)。
+# ============================================================
+
+# ---- 相机内参(兜底; KITTI 由 calib.txt 覆盖) ----
+Camera:
+  fx: 718.856
+  fy: 718.856
+  cx: 607.193
+  cy: 185.216
+  width: 1241
+  height: 376
+  k1: 0.0
+  k2: 0.0
+  p1: 0.0
+  p2: 0.0
+  k3: 0.0
+
+# ---- 特征参数 ----
+Feature:
+  num_features: 2000       # KITTI 1241x376 宽幅图: 1000 偏稀疏, 2000 提供更密的
+                           # 共视点, 直接缓解 pts3d 过少导致的 PnP 退化
+  scale_factor: 1.2        # 金字塔尺度因子
+  pyramid_levels: 8        # 金字塔层数
+  match_ratio: 0.7         # 最近邻/次近邻比率(0.7 兼顾数量与精度, 曲线段不易掉匹配)
+  ransac_threshold: 3.0    # RANSAC 重投影误差阈值(px)
+
+# ---- VO 参数 ----
+VO:
+  method: 0                # 0 = ORB匹配, 1 = LK光流
+  min_parallax: 0.1
+  min_matches_init: 100
+  min_matches_track: 20
+  pnp_min_inliers: 20      # 特征更多后提高内点门槛, 过滤弱解
+  pnp_min_inlier_ratio: 0.5 # 提高内点比例要求
+  pnp_max_rmse: 3.0        # 略放宽: 避免强视差/部分遮挡帧被误拒(由比例+内点数把关)
+  max_tracking_failures: 5
+  max_relocalize_frames: 20
+  max_frame_translation: 5.0  # KITTI ~1m/帧@10Hz, 高速段放宽防误拒
+  max_frame_rotation: 0.35    # 0.35rad≈20°/帧, 弯道足够
+  keyframe_translation: 0.5   # (单目用)
+  keyframe_rotation: 0.2
+  keyframe_min_inliers: 20
+  min_keyframe_interval: 10
+  max_keyframe_interval: 15
+
+# ---- 优化参数 ----
+Optimizer:
+  local_window_size: 12    # 共视窗口略增大, 提升局部 BA 的约束数量
+  local_ba_iterations: 10
+  enable_local_ba: true
+  global_ba_iterations: 20
+
+# ---- 回环检测 (run_vo 强制关闭, 供 run_slam 使用) ----
+LoopClosure:
+  enable_loop_closure: true
+  vocab_path: "config/ORBvoc.dbow3"
+  min_score: 0.1
+  temporal_window: 30
+  detection_interval: 10
+  pnp_inlier_ratio: 0.85
+  min_loop_inliers: 50
+  loop_cooldown_frames: 200
+
+# ---- 可视化 ----
+Viewer:
+  enabled: true
+  camera_size: 0.1
+  point_size: 2
+  trajectory_color: [0.0, 0.8, 1.0]
+
+# ---- 双目参数 ----
+Stereo:
+  baseline: 0.54           # KITTI 序列 ≈ 0.54m
+  min_depth: 0.5
+  max_depth: 35.0          # 远点视差误差放大为米级, 35m 内较可靠
+  min_points: 40
+  rigid_min_inliers: 15
+  rigid_min_inlier_ratio: 0.5
+  rigid_ransac_threshold: 0.25
+  rigid_max_rmse: 0.25
+  keyframe_translation: 1.2  # KITTI ~1m/帧: 1.2m 约每 1~2 帧一 KF,
+                             # 减少冗余 KF, 同时保留足够三角化基线

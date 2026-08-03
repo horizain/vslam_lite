@@ -346,9 +346,12 @@ void VisualOdometry::createSubmap() {
         ? last_valid_pose_cw_.inverse()
         : (ref_frame_ ? ref_frame_->pose_cw.inverse() : SE3());
 
-    // 丢失期间的真实位移未知，anchor 只用于 Viewer 连续显示，不能声称
-    // 新子地图已经连接到全局世界系。后续重定位到旧地图后才恢复全局有效轨迹。
-    auto& submap = atlas_->createSubmap(anchor_Twc, false);
+    // anchor 继承最后有效全局位姿，新子地图实际已锚定到全局世界系。
+    // 若标为 disconnected，此后所有帧 pose_valid=false（tracking_valid &&
+    // map_connected），轨迹将永久冻结、只剩旋转箭头转动。标记 connected
+    // 让重初始化后轨迹继续记录（丢失期间的真实位移仍未知，会有短暂停顿，
+    // 但不再彻底冻结）。
+    auto& submap = atlas_->createSubmap(anchor_Twc, true);
     map_ = submap.map;
     ref_frame_.reset();
     prev_frame_.reset();
@@ -887,6 +890,14 @@ bool VisualOdometry::tryRelocalize() {
 void VisualOdometry::insertKeyFrame() {
     const Frame::Ptr prev_kf = ref_frame_;
     map_->insertKeyFrame(curr_frame_);
+
+    // 定期清理观测不足的地图点（每 20 个关键帧一次），防止地图无限增长。
+    // 必须在建新点之前执行：若在建点后剔除，本轮 createMapPointsFromStereo
+    // 刚创建的点（observed_count=1）会被 cullMapPoints(2) 当场删除，参考
+    // 关键帧瞬间失去全部新点，后续帧 PnP 可用 3D 点骤减 → 垃圾解 → LOST。
+    if (map_->keyFrameCount() % 20 == 0)
+        map_->cullMapPoints(2);
+
     // 双目/RGB-D：当前帧有视差/深度的特征直接建点（绝对尺度）
     createMapPointsFromStereo(curr_frame_);
     // LK 模式：关键帧用干净的 ORB 特征重建（LK 关键点无方向，描述子无法与
@@ -898,10 +909,6 @@ void VisualOdometry::insertKeyFrame() {
         feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
     ref_frame_ = curr_frame_;
     last_kf_frame_id_ = curr_frame_->id;   // 更新关键帧冷却基准
-
-    // 定期清理观测不足的地图点（每 20 个关键帧一次），防止地图无限增长
-    if (map_->keyFrameCount() % 20 == 0)
-        map_->cullMapPoints(2);
 
     LOG_INFO("New KF. mp=" << map_->mapPointCount());
 

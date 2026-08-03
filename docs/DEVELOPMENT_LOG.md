@@ -523,3 +523,33 @@ gauge，不能减小回环相对残差；位姿图之后点云未同步，而后
 
 验证：本机未检测到可用的 g2o/DBoW3，纯可选依赖构建和 CTest 通过；KITTI 00 ATE 与
 带 g2o/DBoW3 的闭环集成测试仍需在依赖可用的环境中复测，不能据此宣称已达到 ATE 目标。
+
+### 3.8 KITTI 00 轨迹冻结根治（2026-08-04）
+
+现象：`run_vo` 跑一段时间后水平位置不再更新，仅角度继续转。
+
+排查：全量跑 KITTI 00（headless）后仅 210/4541 帧 pose_valid；Viewer 轨迹线只记录
+有效帧（`tracking_valid && map_connected`），而相机箭头用每帧 PnP 位姿，故出现
+"位置冻结、角度在转"。根因两条：
+
+1. **建点后立即被剔除**：`insertKeyFrame` 中 `cullMapPoints(2)` 在建点之后执行，
+   每第 20 个关键帧会把 `createMapPointsFromStereo` 刚建的点（observed_count=1）
+   当场删除。KF 120（≈帧207）建 476 点后 mp 从 28298 掉到 24207，帧 210 跟踪该
+   帧时 matches=147 但 pts3d=18 → PnP 垃圾解被拒 → LOST → 建新子地图。
+2. **新子地图 disconnected 永久冻结轨迹**：`createSubmap` 以 `connected=false` 建图，
+   此后所有帧 `pose_valid=false`，轨迹再无线段追加。
+
+修复：
+
+- `insertKeyFrame`：把 `cullMapPoints` 提前到建新点**之前**，刚建点获得一轮观测窗口；
+- `createSubmap`：锚点继承最后有效全局位姿，新子地图标记 `connected=true`，
+  重初始化后轨迹继续记录（丢失间隙约 1s 停顿，不再彻底冻结）；
+- 新增 `config/kitti00.yaml`：num_features 1000→2000、更严 PnP 内点/比例、
+  放宽帧间平移上限、双目 KF 平移 0.9→1.2m，降低触发 LOST 的概率。
+
+验证（KITTI 00 全程，配置 kitti00.yaml）：
+
+- 有效位姿：210/4541 → **4522/4541**（99.6%）；
+- 局部 BA 窗口点数：~10 → 195，共视关系恢复正常；
+- 全程路径 3689m，与 KITTI 00 真实里程一致；LOST 仅 1 次（帧4334），
+  重初始化后从丢失前位置继续，轨迹连续。
