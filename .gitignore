@@ -12,8 +12,14 @@ debug.txt
 .idea/
 # 数据集（体积大，不纳入版本控制）
 datasets/
+*.zip
 # 轨迹输出（运行产物）
 trajectory_*.txt
+
+# 第三方源码构建产物（源码本体保留在 thirdparty/）
+thirdparty/*/build/
+# DBoW3 预生成词袋二进制（运行时产物，不纳入版本控制）
+*.dbow3
 
 # 运行产物轨迹/评估文件
 *traj*.txt
