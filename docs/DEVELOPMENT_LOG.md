@@ -428,3 +428,75 @@ yaw 转头流场与横向平移流场几乎相同（近大远小一致），这�
 - 新增水平视差、纵向错位拒绝、错误双目初始化和 Atlas 连接状态测试。
 
 验证：构建成功，CTest 全部通过。完整 KITTI 00 ATE 需要用户数据重新运行后确认。
+
+### 3.6 Phase 2 完整 SLAM 闭环（进行中，2026-08-03）
+
+**已完成并验证**：
+
+- **M0 依赖**：DBoW3 经 gitee 镜像克隆编译安装到 `~/.local`（无 sudo）；
+  修复新版 CMake 拒绝 `CMAKE_MINIMUM_REQUIRED(2.8)`（`-DCMAKE_POLICY_VERSION_MINIMUM=3.5`）；
+  DBoW3 的 `DBoW3Config.cmake` **不导出 imported target**，CMakeLists 改用 `${DBoW3_LIBS}` 变量链接。
+- **词典**：新增 `scripts/fetch_vocab.sh`，复用 DBoW3 源码自带的 `orbvoc.dbow3`（48MB，DBoW3 官方格式，
+  无需额外 30MB 下载）；已拷贝到 `config/ORBvoc.dbow3`。
+- **M1 Sim3**（`common.h`）：7 自由度相似变换 + `Sim3::estimate`（Eigen::umeyama，相对奇异值比退化检查）。
+- **M2 回环检测**（`loop_closure.h/cpp` 完整实现）：词袋加载/入库/候选过滤（Top-5 + 时间窗 + 分数）/
+  PnP 几何验证（`min_loop_inliers` + `pnp_inlier_ratio`）/ Sim3 输出（3D-3D Umeyama）。
+- **M3 位姿图优化**（`optimizer.cpp`）：`VertexSE3`（T_wc）+ `EdgeSE3`（Isometry3 测量），
+  相邻边（里程计约束，共视加权）+ 回环边（SE3 丢尺度），首帧固定。
+- **M4 集成**：`app/run_slam.cpp` + CMake 启用；`run_vo` 强制关回环（A/B 对比）；
+  `VOConfig` 新增回环配置段；`handleLoopCorrection`（Sim3 传播 + 位姿图 + 全局 BA + 轨迹更新）。
+
+**单元测试**：25 项全部 PASSED（新增 Sim3 代数/Umeyama 精度/退化输入、位姿图合成漂移校正
+1.79m→4e-5m、合成回环词袋命中+PnP 验证+scale=1+负例 nullptr）。
+
+**踩过的坑（重要）**：
+
+1. **`-march=native` 与 apt g2o 的 Eigen ABI 冲突**：Release 编译用 `-march=native`（AVX/32 字节对齐），
+   apt g2o 库按 SSE/16 字节对齐编译，跨 DSO 传 `Isometry3d` 时 **`EdgeSE3` 测量值静默损坏**
+   （实测测量变为 (0,1,1)），位姿图优化发散（chi2 变负数、位姿飞到 80m+）。
+   **修复**：CMake Release 改为 `-O3 -msse2`（16 字节对齐）。⚠️ 若换 g2o 版本需重新验证此设置。
+2. DBoW3 `transform` 只有 2 参数（BowVector）与 4 参数（vector）重载，无 3 参数版本。
+3. 合成回环测试中相机光轴默认朝 +Z，点云必须放 +Z 前方（否则图像全黑、ORB 无特征）。
+
+**当前阻塞问题（下个模型修复重点）**：
+
+KITTI 00 单目实测（image_0，4541 帧，回环开）：
+
+| 配置 | 回环数 | ATE RMSE |
+|------|--------|----------|
+| run_vo 基线（回环关，min_score 0.3） | 0 | 121.4m |
+| min_score=0.3（旧：只校正回环帧之后段） | 2 | 131.6m |
+| min_score=0.1 + 旧校正 | 9 | 184.5m |
+| min_score=0.1 + **整体变换** | 12 | 213.5m |
+| min_score=0.1 + 整体变换 + 冷却(200帧) + 高门槛(50/0.85) | 挂起中 | ? |
+
+**回环检测本身工作正常**：检测到 kf#66→kf#4509（起点-末端真回环）、kf#193→1630 等；
+PnP 验证内点 160-640，scale=1（同 VO 轨迹尺度一致）。
+
+**问题根因（已定位到代码层面）**：
+
+1. **多次回环校正互相冲突**：旧实现只变换"回环帧之后"段 → 区间嵌套重叠 → 轨迹切碎跳变
+   （实测帧 3380 处跳变 58m）。已改为**整体变换**（整个子地图统一 S_global），消除段间跳变，
+   但整体变换后 ATE 反而更差（213.5m），说明后续仍有多余/错误校正或全局 BA 拉坏轨迹。
+2. **S_global.s 恒为 1**：`verifyLoop` 的 Sim3 用"同一坐标系（VO 世界系 U）"的点做 3D-3D
+   （`T_cw_loop·p_w` 与 `T_cw_curr'·p_w` 都在 U 系）→ 尺度比恒 1，**无法捕捉单目 VO 的全局
+   尺度漂移**（evaluate_ate Sim3 对齐 scale≈1.95）。起点-末端回环本该校正尺度，当前实现只能
+   平移/旋转。
+3. **全局 BA 副作用**：`globalBundleAdjustment` 转发 localBA（motion-only，点固定），
+   每次回环优化全部 2340 KF + 27 万点，主线程阻塞（~5-10s/次），且可能把位姿拉偏
+   （点本身含漂移，固定点约束强）。
+4. **词袋召回与质量权衡**：min_score 0.3 → 只 2 次候选（漏真回环）；0.1 → 12 次
+   （含误报风险）。冷却 + 高门槛（50/0.85）的测试被中断，结果未知。
+
+**建议修复方向（供参考）**：
+
+- 方案 A：**回环验证后做 S_global 合理性检查**（平移量级、与上次校正的一致性），只接受
+  "收敛型"校正；或在检测到起点-末端型回环后冻结后续校正。
+- 方案 B：**verifyLoop 的 Sim3 改为捕捉真实尺度**：用 kf_loop 地图点在**回环前/后的世界系坐标**
+  做 3D-3D（如 ORB-SLAM 的 Sim3Solver），而非相机系坐标。
+- 方案 C：**全局 BA 限幅**：只优化回环帧窗口（非全图），或提高迭代数但减少调用频率。
+- 方案 D（最稳的教学级兜底）：**只接受"回环帧 < 当前帧 40%"且"当前帧 > 60%"的大回环**，
+  一次校正全局尺度与位置，其余小回环仅记录不校正。
+
+**后续待办**：跑通当前参数组合的 KITTI 00 全量评估；更新 PHASE2_DESIGN.md 决策记录；
+确认 ATE 是否达到"显著低于基线 121.4m"的目标。

@@ -48,13 +48,18 @@ Optimizer:
   local_window_size: 10    # 局部 BA 窗口大小
   local_ba_iterations: 10  # 局部 BA 迭代次数
   enable_local_ba: true    # 局部 BA 开关（false 时仅前端跟踪，用于对比实验）
-  global_ba_iterations: 20 # 全局 BA 迭代次数
+  global_ba_iterations: 20 # 全局 BA 迭代次数（回环闭合后触发）
 
 # ---- 回环检测 (Phase 2) ----
 LoopClosure:
-  vocab_path: ""            # 词袋词典路径
-  min_score: 0.3           # 回环候选的最小相似度分数
-  pnp_inlier_ratio: 0.7    # 几何验证的最小内点比例
+  enable_loop_closure: true   # run_slam 默认开；run_vo 入口强制关闭（A/B 对比）
+  vocab_path: "config/ORBvoc.dbow3"  # 词袋词典（scripts/fetch_vocab.sh 获取）
+  min_score: 0.1              # 词袋候选最低分（0.3 召回过低；0.1 + PnP 验证兜底）
+  temporal_window: 30         # 跳过最近 N 个关键帧（时间过滤，刚走过的路不算回环）
+  detection_interval: 10      # 每 N 个关键帧检测一次回环
+  pnp_inlier_ratio: 0.85      # 几何验证最小内点比例（提高，过滤弱验证）
+  min_loop_inliers: 50        # 几何验证最小内点数（提高，过滤弱验证）
+  loop_cooldown_frames: 200   # 回环校正冷却（帧）：同区域连续命中只校正一次
 
 # ---- 可视化 ----
 Viewer:

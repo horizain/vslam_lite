@@ -106,6 +106,8 @@ int main(int argc, char** argv) {
 
     // ---- 初始化 VO（加载 VO/Feature/Optimizer 参数）----
     vslam::VOConfig vo_cfg = vslam::VOConfig::fromYaml(config_path);
+    // run_vo 固定关闭回环：与 run_slam（回环开）构成 A/B 对比基线
+    vo_cfg.enable_loop_closure = false;
     vslam::VisualOdometry vo(camera, vo_cfg);
 
     // ---- 初始化可视化（--headless 跳过，用于批量评估）----

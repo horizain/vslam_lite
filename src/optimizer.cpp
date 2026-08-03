@@ -9,6 +9,8 @@
 #include <g2o/solvers/eigen/linear_solver_eigen.h>
 #include <g2o/types/sba/types_six_dof_expmap.h>
 #include <g2o/types/slam3d/vertex_pointxyz.h>
+#include <g2o/types/slam3d/vertex_se3.h>      // Phase 2 位姿图：VertexSE3
+#include <g2o/types/slam3d/edge_se3.h>        // Phase 2 位姿图：EdgeSE3
 
 #include <set>
 #include <unordered_map>
@@ -20,6 +22,9 @@ namespace vslam {
 // ---- 类型别名 ----
 using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
 using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
+// 位姿图专用：只有 6D 位姿顶点，无 3D 点（纯 pose 求解）
+using PoseBlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 6>>;
+using PoseLinearSolverType = g2o::LinearSolverEigen<PoseBlockSolverType::PoseMatrixType>;
 #endif
 
 void Optimizer::localBundleAdjustment(
@@ -224,9 +229,109 @@ void Optimizer::globalBundleAdjustment(const Camera& camera, Map::Ptr map) {
     LOG_INFO("Global BA complete");
 }
 
-void Optimizer::poseGraphOptimization(Map::Ptr map) {
-    // TODO Phase 2: 只优化关键帧位姿 + 帧间相对位姿约束 + 回环约束
-    LOG_INFO("Pose Graph Optimization - TODO Phase 2");
+void Optimizer::poseGraphOptimization(Map::Ptr map,
+                                      const std::vector<LoopEdge>& loop_edges) {
+#ifndef HAS_G2O
+    (void)map;
+    (void)loop_edges;
+    LOG_WARN("Pose graph optimization skipped: vslam was built without g2o");
+    return;
+#else
+    auto kfs = map->getAllKeyFrames();
+    if (kfs.size() < 2) return;
+
+    // ========================================================
+    // 1. 构建优化器（位姿图专用 <6,6> solver：纯 6D 位姿顶点）
+    // ========================================================
+    g2o::SparseOptimizer optimizer;
+    auto linearSolver = std::make_unique<PoseLinearSolverType>();
+    auto blockSolver  = std::make_unique<PoseBlockSolverType>(std::move(linearSolver));
+    auto algorithm    = new g2o::OptimizationAlgorithmLevenberg(std::move(blockSolver));
+    optimizer.setAlgorithm(algorithm);
+
+    // ========================================================
+    // 2. 位姿顶点：VertexSE3，estimate 为 T_wc（g2o SE3 群运算标准语义）。
+    //    与 localBA 的 EdgeProjectXYZ2UV 特殊 T_cw 语义无关，此处必须喂 T_wc。
+    // ========================================================
+    std::unordered_map<unsigned long, int> kf_vid;
+    for (size_t i = 0; i < kfs.size(); i++) {
+        auto& kf = kfs[i];
+        auto* v = new g2o::VertexSE3();
+        v->setId(static_cast<int>(i));
+        v->setEstimate(Eigen::Isometry3d(kf->pose_cw.inverse().matrix()));
+        if (i == 0) v->setFixed(true);  // 第一个关键帧锚定坐标系
+        optimizer.addVertex(v);
+        kf_vid[kf->id] = static_cast<int>(i);
+    }
+
+    // 添加一条相对位姿边：测量 T_rel 满足 X_b = X_a · T_rel
+    auto add_edge = [&](int vid_a, int vid_b, const SE3& T_rel, double weight) {
+        auto* edge = new g2o::EdgeSE3();
+        edge->setVertex(0, optimizer.vertex(vid_a));
+        edge->setVertex(1, optimizer.vertex(vid_b));
+        edge->setMeasurement(Eigen::Isometry3d(T_rel.matrix()));
+        edge->setInformation(Eigen::MatrixXd::Identity(6, 6) * weight);
+        optimizer.addEdge(edge);
+    };
+
+    // ========================================================
+    // 3. 相邻边（里程计约束）：kf[i-1] → kf[i]
+    //    T_rel = X_prev⁻¹·X_curr = T_cw_prev · T_wc_curr
+    //    信息权重按共视地图点数加权（共视多 → 置信高）
+    // ========================================================
+    int edge_count = 0;
+    for (size_t i = 1; i < kfs.size(); i++) {
+        auto& kf_prev = kfs[i - 1];
+        auto& kf_curr = kfs[i];
+        SE3 T_rel = kf_prev->pose_cw * kf_curr->pose_cw.inverse();
+
+        std::set<unsigned long> prev_mp;
+        for (auto& mp : kf_prev->map_points)
+            if (mp) prev_mp.insert(mp->id);
+        int cov = 0;
+        for (auto& mp : kf_curr->map_points)
+            if (mp && prev_mp.count(mp->id)) cov++;
+        double weight = 1.0 + std::log2(1.0 + cov);
+
+        add_edge(kf_vid[kf_prev->id], kf_vid[kf_curr->id], T_rel, weight);
+        edge_count++;
+    }
+
+    // ========================================================
+    // 4. 回环边：回环帧 a ↔ 当前帧 b（Sim3 已由传播吸收，边用 SE3 丢尺度）
+    // ========================================================
+    for (const auto& le : loop_edges) {
+        auto it_a = kf_vid.find(le.a);
+        auto it_b = kf_vid.find(le.b);
+        if (it_a == kf_vid.end() || it_b == kf_vid.end()) continue;
+        add_edge(it_a->second, it_b->second, le.T_rel, le.weight);
+        edge_count++;
+        LOG_INFO("Pose graph: loop edge kf#" << le.a << " -> kf#" << le.b
+                 << " weight=" << le.weight);
+    }
+
+    if (edge_count < 2) {
+        LOG_WARN("Pose graph: too few edges (" << edge_count << "), skipping");
+        return;
+    }
+
+    // ========================================================
+    // 5. 执行优化 + 回写（estimate 是 T_wc → 取逆写回 pose_cw）
+    // ========================================================
+    optimizer.initializeOptimization();
+    optimizer.optimize(100);
+
+    for (size_t i = 0; i < kfs.size(); i++) {
+        auto* v = dynamic_cast<g2o::VertexSE3*>(optimizer.vertex(static_cast<int>(i)));
+        if (!v) continue;
+        const Eigen::Isometry3d& Twc = v->estimate();
+        kfs[i]->pose_cw = SE3(Eigen::Quaterniond(Twc.linear()), Twc.translation())
+                              .inverse();
+    }
+
+    LOG_INFO("Pose graph: optimized " << kfs.size() << " keyframes, "
+             << edge_count << " edges");
+#endif
 }
 
 } // namespace vslam

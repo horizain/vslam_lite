@@ -6,6 +6,7 @@
 #include "vslam/map.h"
 #include "vslam/atlas.h"
 #include "vslam/feature.h"
+#include "vslam/loop_closure.h"
 #include <string>
 
 namespace vslam {
@@ -46,6 +47,17 @@ struct VOConfig {
     double rigid_min_inlier_ratio = 0.5;    // 3D-3D 最小内点比例
     double rigid_ransac_threshold = 0.25;   // 3D-3D RANSAC 距离阈值(m)
     double rigid_max_rmse         = 0.25;   // 3D-3D 刚体拟合最大 RMSE(m)
+
+    // ---- 回环检测 (Phase 2) ----
+    bool   enable_loop_closure   = false;   // run_slam 默认开、run_vo 默认关（A/B 对比）
+    std::string vocab_path       = "";      // 词袋词典路径（config/ORBvoc.dbow3）
+    double min_score             = 0.3;     // 词袋候选最低分
+    int    temporal_window       = 30;      // 跳过最近 N 个关键帧（时间过滤）
+    int    detection_interval    = 10;      // 每 N 个关键帧检测一次回环
+    double pnp_inlier_ratio      = 0.7;     // 几何验证最小内点比例
+    int    min_loop_inliers      = 30;      // 几何验证最小内点数
+    int    loop_cooldown_frames  = 200;     // 回环校正冷却（帧）：防止同区域连续校正
+    int    global_ba_iterations  = 20;      // 回环后全局 BA 迭代次数
 
     /// 从 yaml 配置加载（缺省字段保持默认值）
     static VOConfig fromYaml(const std::string& path);
@@ -115,6 +127,16 @@ public:
     /// 设置特征方法（0: ORB匹配, 1: LK光流）
     void setFeatureMethod(int method) { cfg_.feature_method = method; }
 
+    /// (Phase 2) 启用回环检测：配置参数 + 加载词袋词典。
+    /// 返回 false 表示词典加载失败（回环保持关闭，VO 不受影响）。
+    bool enableLoopClosure(const std::string& vocab_path);
+
+    /// (Phase 2) 回环是否已启用（词典加载成功）
+    bool loopClosureEnabled() const { return loop_closure_enabled_; }
+
+    /// (Phase 2) 已闭合的回环次数（状态栏/评估用）
+    unsigned long loopClosureCount() const { return loop_closure_count_; }
+
 private:
     void updateStatus(int matches, int inliers, double parallax);
     SE3 addFrameImpl(const cv::Mat& left, const cv::Mat& right, double timestamp);
@@ -139,6 +161,9 @@ private:
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
     void insertKeyFrame();              // 关键帧插入 + 三角化 + BA
+    /// (Phase 2) 回环校正：Sim3 传播 + 位姿图优化 + 全局 BA + 轨迹更新
+    void handleLoopCorrection(const Sim3& sim3_loop_to_curr,
+                              const Frame::Ptr& kf_curr, const Frame::Ptr& kf_loop);
     /// 按共视地图点数选取 Local BA 窗口（含当前关键帧，最早帧锚定）
     std::vector<Frame::Ptr> selectLocalWindow(int n) const;
     void triangulateNewPoints(const Frame::Ptr& f1, const Frame::Ptr& f2,
@@ -160,6 +185,14 @@ private:
 
     // 轨迹记录：相机光心在世界系中的位置 C_w（不是 T_cw.t）
     std::vector<Vec3> trajectory_;
+    std::vector<unsigned long> traj_frame_ids_;  // 轨迹点对应帧号（回环校正用）
+
+    // ---- Phase 2 回环状态 ----
+    std::unique_ptr<LoopClosure> loop_closure_;
+    bool loop_closure_enabled_ = false;
+    unsigned long loop_closure_count_ = 0;   // 已闭合回环次数
+    unsigned long last_loop_kf_id_ = 0;      // 上次回环校正的当前帧号（冷却基准）
+
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）
     SE3 last_valid_pose_cw_;

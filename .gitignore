@@ -14,3 +14,9 @@ debug.txt
 datasets/
 # 轨迹输出（运行产物）
 trajectory_*.txt
+
+# 运行产物轨迹/评估文件
+*traj*.txt
+*traj*.csv
+*traj*.png
+kitti_gt.txt

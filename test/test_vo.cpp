@@ -21,6 +21,7 @@
 #include "vslam/atlas.h"
 #include "vslam/mappoint.h"
 #include "vslam/optimizer.h"
+#include "vslam/loop_closure.h"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <numeric>
 #include <algorithm>
+#include <filesystem>
 
 // 简单的测试辅助宏
 #define TEST(name) \
@@ -724,6 +726,282 @@ void test_mini_atlas() {
 }
 
 // ============================================================
+// Phase 2: Sim3 相似变换（回环校正核心）
+// ============================================================
+void test_sim3() {
+    TEST("Sim3 正变换/逆变换/matrix 互转/toSE3") {
+        const double s = 1.37;
+        const vslam::Sim3 sim(s,
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.5, vslam::Vec3::UnitY())),
+            vslam::Vec3(2.0, -1.5, 3.0));
+        const vslam::Vec3 p(1.0, 2.0, 3.0);
+
+        // 正变换：p' = s·R·p + t
+        vslam::Vec3 p1 = sim * p;
+        vslam::Vec3 expected = s * (sim.q * p) + sim.t;
+        assert(p1.isApprox(expected, 1e-9));
+
+        // 逆变换恢复
+        vslam::Vec3 p2 = sim.inverse() * p1;
+        assert(p2.isApprox(p, 1e-9));
+
+        // matrix()/fromMatrix 互转
+        vslam::Mat44 M = sim.matrix();
+        vslam::Sim3 sim2 = vslam::Sim3::fromMatrix(M);
+        assert(std::abs(sim2.s - sim.s) < 1e-9);
+        assert(sim2.q.toRotationMatrix().isApprox(sim.q.toRotationMatrix(), 1e-9));
+        assert(sim2.t.isApprox(sim.t, 1e-9));
+        // 左上 3x3 = s·R，列范数 = s
+        assert(std::abs(M.block<3, 3>(0, 0).col(0).norm() - s) < 1e-9);
+
+        // toSE3 丢尺度：平移保持，旋转保持，尺度丢失
+        vslam::SE3 se3 = sim.toSE3();
+        assert(se3.t.isApprox(sim.t, 1e-9));
+        assert(se3.q.toRotationMatrix().isApprox(sim.q.toRotationMatrix(), 1e-9));
+
+        // Sim3 组合一致性：sim1 ∘ sim2 作用于点 = 依次作用
+        const vslam::Sim3 sim_a(0.9,
+            Eigen::Quaterniond(Eigen::AngleAxisd(-0.3, vslam::Vec3::UnitX())),
+            vslam::Vec3(1, 1, 1));
+        vslam::Vec3 pa = sim * (sim_a * p);
+        vslam::Mat44 combined = sim.matrix() * sim_a.matrix();
+        assert(pa.isApprox((vslam::Sim3::fromMatrix(combined) * p), 1e-9));
+    } TEST_PASS();
+
+    TEST("Sim3::estimate Umeyama 恢复精度") {
+        std::mt19937 rng(42);
+        std::uniform_real_distribution<double> dist(-5.0, 5.0);
+        const vslam::Sim3 sim(1.37,
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.5, vslam::Vec3::UnitY())),
+            vslam::Vec3(2.0, -1.5, 3.0));
+
+        std::vector<vslam::Vec3> src, dst;
+        for (int i = 0; i < 30; i++) {
+            vslam::Vec3 p(dist(rng), dist(rng), dist(rng));
+            src.push_back(p);
+            dst.push_back(sim * p);
+        }
+        vslam::Sim3 out;
+        assert(vslam::Sim3::estimate(src, dst, out));
+        assert(std::abs(out.s - sim.s) < 1e-6);
+        assert(out.matrix().isApprox(sim.matrix(), 1e-6));
+
+        // 无噪声下逐点恢复
+        for (size_t i = 0; i < src.size(); i++)
+            assert((out * src[i]).isApprox(dst[i], 1e-6));
+    } TEST_PASS();
+
+    TEST("Sim3::estimate 退化输入返回 false") {
+        vslam::Sim3 out;
+        std::vector<vslam::Vec3> src, dst;
+
+        // 点数 < 3
+        src = {vslam::Vec3(0, 0, 0), vslam::Vec3(1, 0, 0)};
+        dst = {vslam::Vec3(0, 0, 0), vslam::Vec3(2, 0, 0)};
+        assert(!vslam::Sim3::estimate(src, dst, out));
+
+        // 共线点（秩 1 退化）
+        src.clear(); dst.clear();
+        for (int i = 0; i < 5; i++) {
+            vslam::Vec3 p(i, 2 * i, -3 * i);
+            src.push_back(p);
+            dst.push_back(1.5 * p + vslam::Vec3(1, 1, 1));
+        }
+        assert(!vslam::Sim3::estimate(src, dst, out));
+
+        // 共面点（z=0，秩 2 退化：深度方向不可观）
+        src.clear(); dst.clear();
+        for (int i = 0; i < 5; i++) {
+            vslam::Vec3 p(i, i * i, 0);
+            src.push_back(p);
+            dst.push_back(1.2 * p + vslam::Vec3(0, 0, 1));
+        }
+        assert(!vslam::Sim3::estimate(src, dst, out));
+    } TEST_PASS();
+}
+
+// ============================================================
+// Phase 2: 位姿图优化（回环约束校正累积漂移）
+// ============================================================
+void test_pose_graph() {
+    TEST("位姿图优化：回环约束校正累积漂移") {
+        const int N = 10;
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> noise(-0.01, 0.01);
+
+        // 真实位姿（T_wc）：沿 X 轴每帧 1m
+        std::vector<vslam::SE3> gt;
+        for (int i = 0; i < N; i++)
+            gt.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(i, 0, 0)));
+
+        // 估计位姿：每帧系统偏航漂移 0.05 rad + 小噪声 → 累计漂移
+        std::vector<vslam::SE3> est;  // T_wc（含漂移）
+        vslam::SE3 cur = gt[0];
+        est.push_back(cur);
+        for (int i = 1; i < N; i++) {
+            vslam::SE3 rel_true(Eigen::Quaterniond::Identity(), vslam::Vec3(1, 0, 0));
+            vslam::SE3 drift(
+                Eigen::Quaterniond(Eigen::AngleAxisd(0.05 + noise(rng), vslam::Vec3::UnitZ())),
+                vslam::Vec3(noise(rng), noise(rng), 0));
+            cur = cur * rel_true * drift;
+            est.push_back(cur);
+        }
+
+        // 建图：关键帧 pose_cw = T_wc⁻¹
+        auto map = std::make_shared<vslam::Map>();
+        for (int i = 0; i < N; i++) {
+            auto kf = std::make_shared<vslam::Frame>((unsigned long)i, (double)i);
+            kf->pose_cw = est[i].inverse();
+            map->insertKeyFrame(kf);
+        }
+
+        // 确认存在显著漂移（否则测试无意义）
+        double err_before = (est[N - 1].t - gt[N - 1].t).norm();
+        assert(err_before > 1.0);
+
+        // 回环边：末帧 → 首帧（已知真实回环约束，高置信）
+        vslam::LoopEdge le;
+        le.a = 0;
+        le.b = (unsigned long)(N - 1);
+        le.T_rel = gt[0].inverse() * gt[N - 1];  // X_0⁻¹·X_{N-1} 的期望值
+        le.weight = 10.0;
+        vslam::Optimizer::poseGraphOptimization(map, {le});
+
+        // 优化后末帧误差应显著下降
+        vslam::SE3 Twc_after = map->getKeyFrame((unsigned long)(N - 1))->pose_cw.inverse();
+        double err_after = (Twc_after.t - gt[N - 1].t).norm();
+        std::cout << " (drift_before=" << err_before << "m after=" << err_after << "m)";
+        assert(err_after < err_before * 0.2);
+        assert(err_after < 0.5);
+    } TEST_PASS();
+}
+
+// ============================================================
+// Phase 2: 合成回环（先走远再回起点，验证词袋检测 + 几何验证 + Sim3）
+// ============================================================
+void test_loop_closure() {
+#ifdef HAS_DBOW3
+    TEST("LoopClosure 合成回环：词袋命中 + PnP 验证 + Sim3 尺度≈1") {
+        // 相机（合成针孔）
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+
+        // 词典路径（项目根运行：config/ORBvoc.dbow3；ctest：../config/...）
+        std::string vocab;
+        for (const auto& p : {"config/ORBvoc.dbow3", "../config/ORBvoc.dbow3"})
+            if (std::filesystem::exists(p)) { vocab = p; break; }
+        assert(!vocab.empty());
+
+        vslam::LoopClosure lc;
+        lc.setParams(0.3, 30, 30, 0.7, 3.0, cam);
+        assert(lc.loadVocabulary(vocab));
+
+        // 世界点云：相机前方（世界系 +Z 方向 10~30m，相机光轴默认朝 +Z）
+        std::mt19937 rng(123);
+        std::uniform_real_distribution<double> d(-12.0, 12.0);
+        std::uniform_real_distribution<double> dz(10.0, 30.0);
+        std::vector<vslam::Vec3> pts;
+        for (int i = 0; i < 800; i++)
+            pts.push_back(vslam::Vec3(d(rng), d(rng), dz(rng)));
+
+        // 渲染：把点云投影到图像（圆点 = 角点），返回像素与对应世界坐标
+        auto render = [&](const vslam::SE3& T_wc,
+                          std::vector<cv::Point2f>& px_out,
+                          std::vector<vslam::Vec3>& pw_out) {
+            cv::Mat img(cam->img_height, cam->img_width, CV_8UC1, cv::Scalar(0));
+            const vslam::SE3 T_cw = T_wc.inverse();
+            px_out.clear(); pw_out.clear();
+            for (size_t i = 0; i < pts.size(); i++) {
+                if ((T_cw * pts[i]).z() < 0.5) continue;
+                const vslam::Vec2 uv = cam->world2pixel(pts[i], T_cw);
+                if (uv.x() < 5 || uv.y() < 5 ||
+                    uv.x() > cam->img_width - 5 || uv.y() > cam->img_height - 5) continue;
+                cv::circle(img, cv::Point((int)uv.x(), (int)uv.y()), 2,
+                           cv::Scalar(140 + (i % 115)), -1);
+                px_out.push_back(cv::Point2f((float)uv.x(), (float)uv.y()));
+                pw_out.push_back(pts[i]);
+            }
+            return img;
+        };
+
+        // 相机位姿序列（T_wc，朝向恒为 -Z）：沿矩形走一圈回到起点
+        const double step = 1.0;
+        std::vector<vslam::SE3> poses;
+        for (int i = 0; i <= 10; i++)  // 段1：+X
+            poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(i * step, 0, 0)));
+        for (int i = 1; i <= 10; i++)  // 段2：+Y
+            poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(10 * step, i * step, 0)));
+        for (int i = 1; i <= 10; i++)  // 段3：-X
+            poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3((10 - i) * step, 10 * step, 0)));
+        for (int i = 1; i <= 10; i++)  // 段4：-Y（回到原点）
+            poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(0, (10 - i) * step, 0)));
+
+        // 逐帧：渲染 → 提取 ORB → 关联地图点 → 入词袋数据库
+        vslam::FeatureMatcher matcher;
+        matcher.setParams(1000, 1.2, 8);
+        vslam::Frame::Ptr last_kf, mid_kf;
+        unsigned long kf_id = 0;
+        for (auto& T_wc : poses) {
+            std::vector<cv::Point2f> px;
+            std::vector<vslam::Vec3> pw;
+            cv::Mat img = render(T_wc, px, pw);
+
+            auto kf = std::make_shared<vslam::Frame>(kf_id, (double)kf_id);
+            kf->image = img;
+            kf->image_gray = img;
+            kf->pose_cw = T_wc.inverse();
+            matcher.extract(kf);
+
+            // 关键点 → 最近圆点 → 世界坐标（3px 内才关联）
+            kf->map_points.assign(kf->keypoints.size(), nullptr);
+            for (size_t j = 0; j < kf->keypoints.size(); j++) {
+                double best_d2 = 9.0;
+                int best_i = -1;
+                for (size_t k = 0; k < px.size(); k++) {
+                    const double dx = kf->keypoints[j].pt.x - px[k].x;
+                    const double dy = kf->keypoints[j].pt.y - px[k].y;
+                    const double d2 = dx * dx + dy * dy;
+                    if (d2 < best_d2) { best_d2 = d2; best_i = (int)k; }
+                }
+                if (best_i >= 0) {
+                    auto mp = std::make_shared<vslam::MapPoint>((unsigned long)j);
+                    mp->pos_w = pw[best_i];
+                    kf->map_points[j] = mp;
+                }
+            }
+            lc.addKeyFrame(kf);
+            last_kf = kf;
+            if (kf_id == 20) mid_kf = kf;  // 中段帧（负例用）
+            kf_id++;
+        }
+
+        // 回环检测：最后一帧（回到原点）应命中早期帧（id 差 > 30，时间窗过滤通过）
+        auto cand = lc.detectLoop(last_kf);
+        std::cout << " (cand=kf#" << (cand ? std::to_string(cand->id) : "null")
+                  << " last=kf#" << last_kf->id << ")";
+        assert(cand != nullptr);
+        assert(cand->id < last_kf->id);
+
+        // 几何验证：PnP 内点足够 + Sim3 尺度 ≈ 1（无尺度变化）
+        vslam::Sim3 sim3;
+        assert(lc.verifyLoop(last_kf, cand, sim3));
+        std::cout << " (scale=" << sim3.s << ")";
+        assert(std::abs(sim3.s - 1.0) < 0.05);
+
+        // 负例：中段帧（id 20，所有高分候选都在时间窗内）应返回 nullptr
+        assert(mid_kf != nullptr);
+        auto none = lc.detectLoop(mid_kf);
+        assert(none == nullptr);
+    } TEST_PASS();
+#else
+    TEST("LoopClosure 合成回环") {
+        std::cout << "SKIPPED (built without DBoW3)";
+    } TEST_PASS();
+#endif
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 int main() {
@@ -745,6 +1023,15 @@ int main() {
 
     std::cout << "\n[MiniAtlas]\n";
     test_mini_atlas();
+
+    std::cout << "\n[Sim3 (Phase 2)]\n";
+    test_sim3();
+
+    std::cout << "\n[Pose Graph (Phase 2)]\n";
+    test_pose_graph();
+
+    std::cout << "\n[Loop Closure (Phase 2)]\n";
+    test_loop_closure();
 
     std::cout << "\n[Feature Extraction]\n";
     test_feature_extraction();

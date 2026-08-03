@@ -57,6 +57,19 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (s["keyframe_translation"])
                 cfg.keyframe_translation_stereo = s["keyframe_translation"].as<double>();
         }
+        if (auto lc = root["LoopClosure"]) {
+            if (lc["enable_loop_closure"]) cfg.enable_loop_closure = lc["enable_loop_closure"].as<bool>();
+            if (lc["vocab_path"])          cfg.vocab_path = lc["vocab_path"].as<std::string>();
+            if (lc["min_score"])           cfg.min_score = lc["min_score"].as<double>();
+            if (lc["temporal_window"])     cfg.temporal_window = lc["temporal_window"].as<int>();
+            if (lc["detection_interval"])  cfg.detection_interval = lc["detection_interval"].as<int>();
+            if (lc["pnp_inlier_ratio"])    cfg.pnp_inlier_ratio = lc["pnp_inlier_ratio"].as<double>();
+            if (lc["min_loop_inliers"])    cfg.min_loop_inliers = lc["min_loop_inliers"].as<int>();
+            if (lc["loop_cooldown_frames"]) cfg.loop_cooldown_frames = lc["loop_cooldown_frames"].as<int>();
+        }
+        if (auto o = root["Optimizer"]) {
+            if (o["global_ba_iterations"]) cfg.global_ba_iterations = o["global_ba_iterations"].as<int>();
+        }
         LOG_INFO("VO config loaded from: " << path);
     } catch (const std::exception& e) {
         LOG_WARN("VOConfig::fromYaml failed (" << e.what() << "), using defaults");
@@ -71,6 +84,22 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
     if (cfg_.feature_method != 0) {
         LOG_INFO("feature_method=" << cfg_.feature_method << " (LK 光流)");
     }
+    // Phase 2：配置中启用回环且给出词典路径时自动加载
+    if (cfg_.enable_loop_closure && !cfg_.vocab_path.empty())
+        enableLoopClosure(cfg_.vocab_path);
+}
+
+bool VisualOdometry::enableLoopClosure(const std::string& vocab_path) {
+    if (!loop_closure_) loop_closure_ = std::make_unique<LoopClosure>();
+    loop_closure_->setParams(cfg_.min_score, cfg_.temporal_window,
+                             cfg_.min_loop_inliers, cfg_.pnp_inlier_ratio,
+                             cfg_.ransac_pixel_threshold, camera_);
+    loop_closure_enabled_ = loop_closure_->loadVocabulary(vocab_path);
+    if (loop_closure_enabled_) {
+        LOG_INFO("Loop closure ENABLED (vocab=" << vocab_path
+                 << ", interval=" << cfg_.detection_interval << ")");
+    }
+    return loop_closure_enabled_;
 }
 
 SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
@@ -208,8 +237,10 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     status_.pose_valid = status_.tracking_valid && status_.map_connected;
     // pose_cw.t 是世界原点在相机系中的坐标，不是相机位置。
     // 原地旋转时它会随 R_cw 绕圈；轨迹必须记录相机光心 C_w = -R_cw^T t_cw。
-    if (status_.pose_valid)
+    if (status_.pose_valid) {
         trajectory_.push_back(curr_frame_->pose_cw.camera_position());
+        traj_frame_ids_.push_back(curr_frame_->id);  // 回环校正定位漂移段用
+    }
     return curr_frame_->pose_cw;
 }
 
@@ -873,7 +904,83 @@ void VisualOdometry::insertKeyFrame() {
     std::vector<Frame::Ptr> window = selectLocalWindow(cfg_.local_window_size);
     if (cfg_.enable_local_ba)
         Optimizer::localBundleAdjustment(camera_, map_, window, cfg_.local_ba_iterations);
+
+    // ============================================================
+    // Phase 2 回环钩子：新关键帧入词袋数据库；每 N 个关键帧检测一次。
+    // 放在 Local BA 之后，避免两处位姿修改互相干扰。
+    // ============================================================
+    if (loop_closure_enabled_ && loop_closure_) {
+        loop_closure_->addKeyFrame(curr_frame_);
+        if (map_->keyFrameCount() % (unsigned long)std::max(1, cfg_.detection_interval) == 0) {
+            // 回环校正冷却：上次校正后至少间隔 N 帧才允许再次校正。
+            // 同一区域会被词袋反复命中（分数高），连续校正会让 S_global
+            // 叠加冲突、轨迹被反复拉扯变形。
+            const bool cooled = curr_frame_->id - last_loop_kf_id_
+                >= (unsigned long)cfg_.loop_cooldown_frames;
+            if (cooled) {
+                auto cand = loop_closure_->detectLoop(curr_frame_);
+                if (cand) {
+                    Sim3 sim3;
+                    if (loop_closure_->verifyLoop(curr_frame_, cand, sim3))
+                        handleLoopCorrection(sim3, curr_frame_, cand);
+                }
+            }
+        }
+    }
+
     updateStatus(status_.matches, status_.inliers, status_.parallax);
+}
+
+// ============================================================
+// Phase 2 回环校正：Sim3 传播 → 位姿图优化 → 全局 BA → 轨迹更新
+// ============================================================
+void VisualOdometry::handleLoopCorrection(const Sim3& sim3_loop_to_curr,
+                                          const Frame::Ptr& kf_curr,
+                                          const Frame::Ptr& kf_loop) {
+    // 1. 合成 S_global：当前子地图坐标系 U → 回环子地图坐标系 W。
+    //    回环尺度下 kf_curr 的位姿 = S ∘ T_cw_loop（相似变换组合）；
+    //    把 VO 坐标系拉回回环坐标系的变换：
+    //    S_global = T_cw_curr_new⁻¹ · T_cw_curr_old
+    const Mat44 T_cw_loop = kf_loop->pose_cw.matrix();
+    const Mat44 T_cw_curr_new = sim3_loop_to_curr.matrix() * T_cw_loop;
+    const Sim3 S_global = Sim3::fromMatrix(
+        T_cw_curr_new.inverse() * kf_curr->pose_cw.matrix());
+
+    // 2. 关键帧位姿传播：整个当前子地图统一变换（整体相似变换保持内部
+    //    相对关系 → 无跳变；多次回环校正自然收敛，不会叠加切碎轨迹）：
+    //    相机位置作为点变换 C_w' = s·R·C_w + t（尺度进入平移），
+    //    朝向旋转合成 R_wc' = R_S·R_wc —— 位姿始终是欧氏变换（SE3）。
+    auto all_kfs = map_->getAllKeyFrames();
+    for (auto& kf : all_kfs) {
+        SE3 Twc = kf->pose_cw.inverse();
+        const Vec3 C_new = S_global * Twc.t;
+        const Eigen::Quaterniond q_new = S_global.q * Twc.q;
+        kf->pose_cw = SE3(q_new, C_new).inverse();
+    }
+
+    // 3. 地图点更新：全部（整个子地图统一变换）
+    for (auto& mp : map_->getAllMapPoints())
+        mp->pos_w = S_global * mp->pos_w;
+
+    // 4. 位姿图优化：相邻边（里程计约束）+ 回环边。
+    //    回环边用 SE3（丢尺度）——尺度已由 Sim3 传播吸收（决策 §4.4）。
+    LoopEdge le;
+    le.a = kf_loop->id;
+    le.b = kf_curr->id;
+    le.T_rel = sim3_loop_to_curr.toSE3().inverse();  // X_b = X_a · T_rel ⇒ T_rel = S⁻¹
+    le.weight = 10.0;  // 回环约束高置信
+    Optimizer::poseGraphOptimization(map_, {le});
+
+    // 5. 全局 BA：回环后全图精修（motion-only，点坐标已由 Sim3 传播修正）
+    Optimizer::globalBundleAdjustment(camera_, map_);
+
+    // 6. 轨迹更新：全部轨迹点应用同一变换（保证 TUM 输出与地图一致）
+    for (auto& p : trajectory_) p = S_global * p;
+
+    loop_closure_count_++;
+    last_loop_kf_id_ = kf_curr->id;  // 更新回环校正冷却基准
+    LOG_INFO("Loop closed! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
+             << " scale=" << sim3_loop_to_curr.s << " (total " << loop_closure_count_ << ")");
 }
 
 // ============================================================

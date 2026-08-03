@@ -1,0 +1,190 @@
+/**
+ * run_slam.cpp - 完整 SLAM 演示入口（Phase 2：VO + 回环检测 + 位姿图 + 全局 BA）
+ *
+ * 用法：
+ *   ./run_slam [dataset_path] [config.yaml] [trajectory.txt]
+ *
+ * 示例：
+ *   ./run_slam datasets/sequences/00 config/default.yaml slam_traj.txt
+ *   ./run_slam 0                          # 使用摄像头 0
+ *
+ * 与 run_vo 的唯一区别：VOConfig.enable_loop_closure 强制置 true
+ * （run_vo 强制置 false），便于 A/B 对比回环对 ATE 的提升。
+ *
+ * 输出：运行结束后保存 TUM 格式轨迹（回环校正后的全局位姿）
+ *   timestamp tx ty tz qx qy qz qw（T_wc，相机在世界系），可直接用 EVO 评估
+ */
+
+#include "vslam/vo.h"
+#include "vslam/dataset.h"
+#include "vslam/viewer.h"
+#include "vslam/camera.h"
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <iomanip>
+#include <format>
+#include <chrono>
+
+int main(int argc, char** argv) {
+    std::string input_path;
+    vslam::Dataset::Type dataset_type = vslam::Dataset::Type::KITTI;
+    std::string config_path = "config/default.yaml";
+    std::string traj_path   = "trajectory.txt";
+
+    // ---- 解析命令行参数（与 run_vo 相同）----
+    bool headless = false;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--tum")       dataset_type = vslam::Dataset::Type::TUM;
+        else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
+        else if (a == "--headless") headless = true;
+    }
+    if (argc >= 2) {
+        input_path = argv[1];
+        if (std::all_of(input_path.begin(), input_path.end(), ::isdigit)) {
+            dataset_type = vslam::Dataset::Type::CAMERA;
+        }
+    } else {
+        std::cout << "Usage: run_slam <dataset_path|camera_index> [config.yaml] [trajectory.txt] [--tum|--euroc]\n";
+        std::cout << "  dataset_path: path to image directory (KITTI) / dataset root (TUM, EuRoC)\n";
+        std::cout << "  camera_index: integer (e.g., 0) for live camera\n";
+        std::cout << "  --tum / --euroc: dataset format flag\n";
+        return 1;
+    }
+    if (argc >= 3) config_path = argv[2];
+    if (argc >= 4) traj_path = argv[3];
+
+    // ---- 创建数据源（先创建，便于读取数据集自带标定）----
+    vslam::Dataset dataset(
+        dataset_type == vslam::Dataset::Type::CAMERA
+            ? vslam::Dataset(std::stoi(input_path))
+            : vslam::Dataset(input_path, dataset_type));
+
+    // ---- 加载相机参数（与 run_vo 相同的优先级）----
+    vslam::Camera camera;
+    if (dataset_type != vslam::Dataset::Type::CAMERA && dataset.hasCalibration()) {
+        camera = dataset.getCamera();
+    } else if (dataset_type != vslam::Dataset::Type::CAMERA) {
+        camera = dataset.isStereo()
+            ? vslam::StereoCamera::fromYaml(config_path)
+            : vslam::MonocularCamera::fromYaml(config_path);
+    } else {
+        camera = std::make_shared<vslam::MonocularCamera>();
+        camera->fx = 500; camera->fy = 500;
+        camera->cx = 320; camera->cy = 240;
+        camera->img_width = 640; camera->img_height = 480;
+        LOG_WARN("Camera mode: using DEFAULT intrinsics (500/500/320/240). "
+                 "Calibrate your camera and pass config.yaml.");
+    }
+
+    // ---- 初始化 SLAM（回环强制开启；run_vo 强制关闭，A/B 对比）----
+    vslam::VOConfig vo_cfg = vslam::VOConfig::fromYaml(config_path);
+    vo_cfg.enable_loop_closure = true;
+    vslam::VisualOdometry vo(camera, vo_cfg);
+    if (!vo.loopClosureEnabled()) {
+        LOG_WARN("Loop closure NOT enabled (vocab missing? run scripts/fetch_vocab.sh)");
+    }
+
+    // ---- 初始化可视化 ----
+    vslam::Viewer viewer;
+    if (!headless) viewer.start();
+
+    // ---- 主循环 ----
+    cv::Mat image, image_right;
+    double timestamp;
+    int frame_count = 0;
+    auto start_time = std::chrono::steady_clock::now();
+
+    struct TrajectoryRecord {
+        double timestamp;
+        vslam::SE3 pose_cw;
+        vslam::VisualOdometry::Status status;
+    };
+    std::vector<TrajectoryRecord> traj_saved;
+
+    LOG_INFO("Starting SLAM pipeline (loop closure "
+             << (vo.loopClosureEnabled() ? "ON" : "OFF")
+             << ")... Press Ctrl+C or close window to exit.");
+
+    while (dataset.nextFrame(image, image_right, timestamp) && (headless || !viewer.shouldQuit())) {
+        frame_count++;
+
+        // 运行一帧 SLAM（双目：左右目；单目：仅左目）
+        vslam::SE3 pose = image_right.empty()
+            ? vo.addFrame(image, timestamp)
+            : vo.addFrame(image, image_right, timestamp);
+
+        auto st = vo.getStatus();
+        traj_saved.push_back({timestamp, pose, st});
+
+        std::string state_str;
+        switch (st.state) {
+            case vslam::VisualOdometry::State::INITIALIZING: state_str = "INIT"; break;
+            case vslam::VisualOdometry::State::TRACKING:     state_str = "TRACKING"; break;
+            case vslam::VisualOdometry::State::RECOVERING:   state_str = "RECOVERING"; break;
+            case vslam::VisualOdometry::State::LOST:         state_str = "LOST"; break;
+        }
+        std::string status = std::format("{} | {}{} | Stereo:{} d:{:.1f}px z:{:.1f}m | Matches:{} Inl:{} RMSE:{:.2f} | MP:{} KF:{} SM:{} Lost:{} | Loop:{}",
+                                         state_str, st.pose_method,
+                                         st.pose_valid ? "" : " INVALID",
+                                         st.stereo_points, st.median_disparity, st.median_depth,
+                                         st.matches, st.inliers, st.pose_rmse,
+                                         st.map_points, st.keyframes, st.submap_id, st.lost_frames,
+                                         vo.loopClosureCount());
+        if (!headless) {
+            viewer.setStatus(status);
+            auto cf = vo.currentFrame();
+            viewer.updateFrame(cf->image, cf->keypoints, vo.getTrajectory(),
+                               pose, cf->image_right);
+        }
+
+        if (frame_count % 30 == 0) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time).count();
+            double fps = frame_count * 1000.0 / elapsed;
+            LOG_INFO("Frame " << frame_count << " | FPS: " << fps
+                     << " | MP: " << st.map_points << " KF: " << st.keyframes
+                     << " Loops: " << vo.loopClosureCount());
+        }
+    }
+
+    // ---- 清理 ----
+    if (!headless) viewer.stop();
+
+    // ---- 保存轨迹（TUM 格式，回环校正后的全局位姿）----
+    if (!traj_saved.empty()) {
+        std::ofstream ofs(traj_path);
+        if (ofs.is_open()) {
+            ofs << std::fixed << std::setprecision(6);
+            size_t valid_count = 0;
+            for (const auto& record : traj_saved) {
+                if (!record.status.pose_valid) continue;
+                vslam::SE3 Twc = record.pose_cw.inverse();
+                ofs << record.timestamp << " "
+                    << Twc.t.x() << " " << Twc.t.y() << " " << Twc.t.z() << " "
+                    << Twc.q.x() << " " << Twc.q.y() << " " << Twc.q.z() << " "
+                    << Twc.q.w() << "\n";
+                valid_count++;
+            }
+            LOG_INFO("Trajectory saved to " << traj_path
+                     << " (" << valid_count << "/" << traj_saved.size()
+                     << " globally valid poses, TUM format)");
+        } else {
+            LOG_ERROR("Cannot write trajectory to " << traj_path);
+        }
+    }
+
+    auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time).count();
+    LOG_INFO("Done. Processed " << frame_count << " frames in "
+             << total_time / 1000.0 << " seconds ("
+             << frame_count * 1000.0 / total_time << " FPS)");
+    LOG_INFO("Loop closures: " << vo.loopClosureCount()
+             << " | Final map: " << vo.getMap()->mapPointCount() << " points, "
+             << vo.getMap()->keyFrameCount() << " keyframes");
+
+    return 0;
+}

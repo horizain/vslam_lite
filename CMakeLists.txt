@@ -12,7 +12,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+# 注意：不能用 -march=native（AVX/32字节对齐）——apt 版 g2o 库按 SSE/16 字节
+# 对齐编译，跨 DSO 传递 Eigen Isometry3d 等固定大小类型时对齐假设不一致，
+# 会导致 EdgeSE3 测量值静默损坏、位姿图优化发散（实测）。用 SSE2 保持
+# 16 字节对齐，与系统 g2o 一致（Eigen 向量化收益几乎不受影响）。
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -msse2 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG   "-O0 -g -DDEBUG")
 
 # ============================================================
@@ -55,6 +59,12 @@ endif()
 
 # --- DBoW3 (可选，Phase 2 回环检测) ---
 find_package(DBoW3 QUIET)
+# install_deps.sh / fetch_vocab.sh 将 DBoW3 安装到 ~/.local（无需 sudo），
+# 此处补一次用户前缀查找，避免手工传 -DDBoW3_DIR。
+if(NOT DBoW3_FOUND AND DEFINED ENV{HOME})
+    set(DBoW3_DIR "$ENV{HOME}/.local/lib/cmake/DBoW3")
+    find_package(DBoW3 QUIET)
+endif()
 if(DBoW3_FOUND)
     message(STATUS "DBoW3 found - loop closure enabled")
     add_definitions(-DHAS_DBOW3)
@@ -113,24 +123,27 @@ if(g2o_FOUND)
 endif()
 
 if(DBoW3_FOUND)
-    target_link_libraries(vslam PUBLIC DBoW3::DBoW3)
+    # DBoW3 的 DBoW3Config.cmake 只导出变量（DBoW3_LIBS/DBoW3_INCLUDE_DIRS），
+    # 不导出 imported target，因此用变量链接而非 DBoW3::DBoW3。
+    target_link_libraries(vslam PUBLIC ${DBoW3_LIBS})
+    target_include_directories(vslam PUBLIC ${DBoW3_INCLUDE_DIRS})
 endif()
 
 # ============================================================
 # 可执行文件
 # ============================================================
 
-# --- run_vo: 视觉里程计演示 ---
+# --- run_vo: 视觉里程计演示（回环固定关闭，A/B 对比基线）---
 add_executable(run_vo app/run_vo.cpp)
 target_link_libraries(run_vo vslam)
 set_target_properties(run_vo PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
-# --- run_slam: 完整 SLAM 演示 (Phase 2) ---
-# add_executable(run_slam app/run_slam.cpp)
-# target_link_libraries(run_slam vslam)
-# set_target_properties(run_slam PROPERTIES
-#     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+# --- run_slam: 完整 SLAM 演示 (Phase 2，回环默认开启) ---
+add_executable(run_slam app/run_slam.cpp)
+target_link_libraries(run_slam vslam)
+set_target_properties(run_slam PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # ============================================================
 # 测试

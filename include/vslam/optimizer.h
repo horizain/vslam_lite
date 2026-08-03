@@ -6,6 +6,14 @@
 
 namespace vslam {
 
+/// (Phase 2) 位姿图回环边：关键帧 a ↔ b 的相对位姿约束
+struct LoopEdge {
+    unsigned long a = 0;      // 回环帧关键帧 id
+    unsigned long b = 0;      // 当前帧关键帧 id
+    SE3 T_rel;                // 相对位姿（a 相机系 → b 相机系）
+    double weight = 1.0;      // 信息权重（共视多 → 置信高）
+};
+
 /// 图优化后端（基于 g2o）
 /// Phase 1: 提供局部 Bundle Adjustment
 /// Phase 2: 增加 Pose Graph Optimization 和 Global BA
@@ -25,8 +33,13 @@ public:
     /// 全局 Bundle Adjustment：优化所有关键帧和地图点
     static void globalBundleAdjustment(const Camera& camera, Map::Ptr map);
 
-    /// (Phase 2) 位姿图优化：回环检测后校正漂移
-    static void poseGraphOptimization(Map::Ptr map);
+    /// (Phase 2) 位姿图优化：相邻边（里程计约束）+ 回环边校正全局漂移。
+    /// 顶点为所有关键帧（T_wc 语义，与 g2o EdgeSE3 群运算一致）；
+    /// 第一个关键帧固定锚定坐标系；地图点坐标不动（全局 BA 紧接着做精细修正）。
+    /// @param loop_edges  回环边列表：{kf_id_a, kf_id_b, 相对 SE3, 权重}
+    static void poseGraphOptimization(
+        Map::Ptr map,
+        const std::vector<LoopEdge>& loop_edges = {});
 };
 
 } // namespace vslam
