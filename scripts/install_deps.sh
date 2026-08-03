@@ -41,7 +41,14 @@ else
     fi
     cd "$PANGOLIN_SRC"
     mkdir -p build && cd build
-    cmake -DCMAKE_BUILD_TYPE=Release ..
+    # v0.6 在 GCC 13 下有若干头文件漏显式包含 <cstdint>，并且其旧 FFmpeg
+    # 接口无法兼容 Ubuntu 24.04 的新版 FFmpeg。Viewer 不依赖 Pangolin Video，
+    # 因此关闭该组件，并通过编译器统一预包含 cstdint。
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_PANGOLIN_PYTHON=OFF \
+          -DBUILD_PANGOLIN_VIDEO=OFF \
+          -DCMAKE_CXX_FLAGS="-include cstdint" \
+          ..
     make -j"$(nproc)"
     sudo make install
     sudo ldconfig

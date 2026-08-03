@@ -1,6 +1,6 @@
 #include "vslam/optimizer.h"
 
-// g2o
+#ifdef HAS_G2O
 #include <g2o/core/base_unary_edge.h>
 #include <g2o/core/base_binary_edge.h>
 #include <g2o/core/block_solver.h>
@@ -12,12 +12,15 @@
 
 #include <set>
 #include <unordered_map>
+#endif
 
 namespace vslam {
 
+#ifdef HAS_G2O
 // ---- 类型别名 ----
 using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
 using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
+#endif
 
 void Optimizer::localBundleAdjustment(
     const Camera& camera,
@@ -25,6 +28,14 @@ void Optimizer::localBundleAdjustment(
     const std::vector<Frame::Ptr>& active_kfs,
     int max_iterations) {
 
+#ifndef HAS_G2O
+    (void)camera;
+    (void)map;
+    (void)active_kfs;
+    (void)max_iterations;
+    LOG_WARN("Local BA skipped: vslam was built without g2o");
+    return;
+#else
     if (active_kfs.size() < 2) {
         LOG_INFO("Local BA: not enough keyframes (" << active_kfs.size() << ")");
         return;
@@ -203,6 +214,7 @@ void Optimizer::localBundleAdjustment(
     LOG_INFO("Local BA: optimized " << active_kfs.size() << " keyframes, "
              << mp_id_to_vertex.size() << " points, "
              << edge_count << " edges");
+#endif
 }
 
 void Optimizer::globalBundleAdjustment(const Camera& camera, Map::Ptr map) {

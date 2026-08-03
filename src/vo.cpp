@@ -144,7 +144,9 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     }
 
     prev_frame_ = curr_frame_;
-    trajectory_.push_back(curr_frame_->pose_cw.t);
+    // pose_cw.t 是世界原点在相机系中的坐标，不是相机位置。
+    // 原地旋转时它会随 R_cw 绕圈；轨迹必须记录相机光心 C_w = -R_cw^T t_cw。
+    trajectory_.push_back(curr_frame_->pose_cw.camera_position());
     return curr_frame_->pose_cw;
 }
 
@@ -437,16 +439,39 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
     bool ok = cv::estimateAffine3D(pts_w, pts_c, affine, inliers, 1.0, 0.99);
     if (!ok) return false;
 
-    // affine 允许缩放/剪切，把 R 投影回 SO(3)（SVD 正交化）
-    Eigen::Matrix3d Rm;
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-            Rm(i, j) = affine.at<double>(i, j);
-    Eigen::JacobiSVD<Eigen::Matrix3d> svd(Rm, Eigen::ComputeFullU | Eigen::ComputeFullV);
-    Eigen::Matrix3d R_orth = svd.matrixU() * svd.matrixV().transpose();
-    if (R_orth.determinant() < 0) R_orth.col(2) *= -1;
-    Vec3 t(affine.at<double>(0, 3), affine.at<double>(1, 3), affine.at<double>(2, 3));
-    SE3 pose_cw(Eigen::Quaterniond(R_orth), t);
+    // estimateAffine3D 只用于 RANSAC 选内点。不能把其旋转投影回 SO(3) 后仍沿用
+    // 原仿射平移：旋转、缩放和剪切被改变后，原 t 已不属于同一个变换。
+    // 在内点上重新做 Kabsch 刚体拟合，统一求解 R、t（dst = R * src + t）。
+    Vec3 mean_w = Vec3::Zero();
+    Vec3 mean_c = Vec3::Zero();
+    int rigid_inliers = 0;
+    for (size_t i = 0; i < inliers.total(); i++) {
+        if (!inliers.at<uchar>((int)i)) continue;
+        mean_w += Vec3(pts_w[i].x, pts_w[i].y, pts_w[i].z);
+        mean_c += Vec3(pts_c[i].x, pts_c[i].y, pts_c[i].z);
+        rigid_inliers++;
+    }
+    if (rigid_inliers < 3) return false;
+    mean_w /= rigid_inliers;
+    mean_c /= rigid_inliers;
+
+    Mat33 covariance = Mat33::Zero();
+    for (size_t i = 0; i < inliers.total(); i++) {
+        if (!inliers.at<uchar>((int)i)) continue;
+        Vec3 pw(pts_w[i].x, pts_w[i].y, pts_w[i].z);
+        Vec3 pc(pts_c[i].x, pts_c[i].y, pts_c[i].z);
+        covariance += (pc - mean_c) * (pw - mean_w).transpose();
+    }
+    Eigen::JacobiSVD<Mat33> svd(covariance, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Mat33 U = svd.matrixU();
+    const Mat33 V = svd.matrixV();
+    Mat33 R_rigid = U * V.transpose();
+    if (R_rigid.determinant() < 0) {
+        U.col(2) *= -1;
+        R_rigid = U * V.transpose();
+    }
+    Vec3 t_rigid = mean_c - R_rigid * mean_w;
+    SE3 pose_cw(Eigen::Quaterniond(R_rigid), t_rigid);
 
     // 跳变保护（运动先验）：3D-3D 用真实深度，异常解概率低，但兜底拒绝
     SE3 Twc_new = pose_cw.inverse();

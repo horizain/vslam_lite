@@ -46,6 +46,11 @@ struct SE3 {
         return SE3(q_inv, -(q_inv * t));
     }
 
+    /// 相机光心在世界系中的位置（仅当本变换语义为 T_cw 时使用）
+    [[nodiscard]] Vec3 camera_position() const {
+        return -(q.inverse() * t);
+    }
+
     /// 组合变换：this * other
     [[nodiscard]] SE3 operator*(const SE3& other) const {
         return SE3(q * other.q, q * other.t + t);

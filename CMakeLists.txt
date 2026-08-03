@@ -27,6 +27,18 @@ find_package(Eigen3 REQUIRED)
 
 # --- Pangolin (必需，可视化) ---
 find_package(Pangolin REQUIRED)
+if(TARGET pango_core)
+    # Pangolin 新版使用拆分组件目标。
+    set(VSLAM_PANGOLIN_LIBS pango_core pango_display pango_opengl pango_plot)
+elseif(TARGET pangolin)
+    # scripts/install_deps.sh 安装的 Pangolin v0.6 只导出单一目标。
+    set(VSLAM_PANGOLIN_LIBS pangolin)
+elseif(Pangolin_LIBRARIES)
+    # 兼容仅导出旧式变量的 Pangolin 包。
+    set(VSLAM_PANGOLIN_LIBS ${Pangolin_LIBRARIES})
+else()
+    message(FATAL_ERROR "Pangolin found, but no supported library target was exported")
+endif()
 
 # --- yaml-cpp (必需，配置) ---
 find_package(yaml-cpp REQUIRED)
@@ -82,6 +94,7 @@ target_include_directories(vslam
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+        ${Pangolin_INCLUDE_DIRS}
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src)
 
@@ -89,7 +102,7 @@ target_link_libraries(vslam
     PUBLIC
         ${OpenCV_LIBS}
         Eigen3::Eigen
-        pango_core pango_display pango_opengl pango_plot
+        ${VSLAM_PANGOLIN_LIBS}
         yaml-cpp)
 
 if(g2o_FOUND)
@@ -125,6 +138,10 @@ if(BUILD_TESTS)
     enable_testing()
     add_executable(test_vo test/test_vo.cpp)
     target_link_libraries(test_vo vslam)
+    # 测试使用 assert；Release 全局定义了 NDEBUG，必须为测试目标显式恢复断言。
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_vo PRIVATE -UNDEBUG)
+    endif()
     add_test(NAME test_vo COMMAND test_vo)
 endif()
 

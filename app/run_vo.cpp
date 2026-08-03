@@ -132,10 +132,6 @@ int main(int argc, char** argv) {
             : vo.addFrame(image, image_right, timestamp);
         traj_saved.emplace_back(timestamp, pose);
 
-        // 更新可视化（双目：左右目并排；单目：单视频流 + 绿色特征点 + 轨迹）
-        auto cf = vo.currentFrame();
-        viewer.updateFrame(cf->image, cf->keypoints, vo.getTrajectory(), cf->image_right);
-
         // 更新状态栏（格式化后传给 viewer）
         auto st = vo.getStatus();
         std::string state_str;
@@ -148,7 +144,13 @@ int main(int argc, char** argv) {
         std::string status = std::format("{} | Matches:{} Inl:{} Parallax:{:.2f} | MP:{} KF:{}",
                                          state_str, st.matches, st.inliers,
                                          st.parallax, st.map_points, st.keyframes);
-        viewer.setStatus(status);
+        if (!headless) {
+            viewer.setStatus(status);
+            // 双目上下排列，避免超宽画面被压缩；单目显示视频流、特征点和世界系轨迹。
+            auto cf = vo.currentFrame();
+            viewer.updateFrame(cf->image, cf->keypoints, vo.getTrajectory(),
+                               pose, cf->image_right);
+        }
 
         // 打印状态
         if (frame_count % 30 == 0) {

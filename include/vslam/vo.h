@@ -74,7 +74,7 @@ public:
     /// 获取详细状态信息（用于 UI 反馈）
     Status getStatus() const { return status_; }
 
-    /// 获取估计的轨迹（所有帧的位姿）
+    /// 获取估计轨迹中的相机位置（世界系 C_w）
     std::vector<Vec3> getTrajectory() const;
 
     /// 是否应该创建新的关键帧
@@ -119,7 +119,7 @@ private:
 
     FeatureMatcher feature_matcher_;
 
-    // 轨迹记录
+    // 轨迹记录：相机光心在世界系中的位置 C_w（不是 T_cw.t）
     std::vector<Vec3> trajectory_;
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）

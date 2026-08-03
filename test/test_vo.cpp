@@ -8,6 +8,7 @@
  *   4. VisualOdometry 两帧初始化
  *   5. recoverPose → T_cw 位姿语义（关键回归测试：修复前的取逆方向会使三角化全部失效）
  *   6. LK 光流模式多帧跟踪
+ *   7. T_cw 平移与世界系相机轨迹的语义
  *
  * 编译: cmake -DBUILD_TESTS=ON .. && make test_vo && ./test_vo
  */
@@ -65,6 +66,19 @@ void test_se3_basics() {
         assert(std::abs(result.x() - 2.0) < 1e-10);
         assert(std::abs(result.y() - 3.0) < 1e-10);
         assert(std::abs(result.z() - 4.0) < 1e-10);
+    } TEST_PASS();
+
+    TEST("T_cw 原地旋转时相机世界位置不绕圈") {
+        const vslam::Vec3 fixed_camera_position(3.0, 0.5, 8.0);
+        for (int degree = 0; degree <= 180; degree += 15) {
+            Eigen::Quaterniond q_wc(
+                Eigen::AngleAxisd(degree * M_PI / 180.0, vslam::Vec3::UnitY()));
+            vslam::SE3 T_wc(q_wc, fixed_camera_position);
+            vslam::SE3 T_cw = T_wc.inverse();
+
+            // T_cw.t 会随旋转变化，camera_position() 必须始终返回固定光心 C_w。
+            assert((T_cw.camera_position() - fixed_camera_position).norm() < 1e-10);
+        }
     } TEST_PASS();
 }
 
