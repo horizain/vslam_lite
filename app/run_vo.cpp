@@ -5,7 +5,8 @@
  *   ./run_vo [dataset_path] [config.yaml] [trajectory.txt]
  *
  * 示例：
- *   ./run_vo /data/kitti/sequences/00/image_0 config/default.yaml
+ *   ./run_vo /data/kitti/sequences/00 config/default.yaml    # 双目（自动检测 image_1）
+ *   ./run_vo /data/kitti/sequences/00/image_0 config/default.yaml   # 单目（仅左目）
  *   ./run_vo /data/kitti/sequences/00/image_0 config/default.yaml traj.txt
  *   ./run_vo 0                          # 使用摄像头 0
  *
@@ -78,18 +79,26 @@ int main(int argc, char** argv) {
     if (dataset_type != vslam::Dataset::Type::CAMERA && dataset.hasCalibration()) {
         camera = dataset.getCamera();
         LOG_INFO("Using camera intrinsics from dataset calib.txt"
-                 << " (fx=" << camera.fx << " cx=" << camera.cx
-                 << " cy=" << camera.cy << " img=" << camera.img_width
-                 << "x" << camera.img_height << ")");
+                 << " (type=" << (int)camera->type()
+                 << " fx=" << camera->fx << " cx=" << camera->cx
+                 << " cy=" << camera->cy << " img=" << camera->img_width
+                 << "x" << camera->img_height << ")");
     } else if (dataset_type != vslam::Dataset::Type::CAMERA) {
-        camera = vslam::Camera::fromYaml(config_path);
-        LOG_INFO("Using camera intrinsics from " << config_path
-                 << " (no dataset calibration found)");
+        if (dataset.isStereo()) {
+            camera = vslam::StereoCamera::fromYaml(config_path);
+            LOG_INFO("Using stereo camera from " << config_path
+                     << " (no dataset calibration found)");
+        } else {
+            camera = vslam::MonocularCamera::fromYaml(config_path);
+            LOG_INFO("Using camera intrinsics from " << config_path
+                     << " (no dataset calibration found)");
+        }
     } else {
         // 摄像头模式使用默认参数（建议先用标定工具获取真实内参）
-        camera.fx = 500; camera.fy = 500;
-        camera.cx = 320; camera.cy = 240;
-        camera.img_width = 640; camera.img_height = 480;
+        camera = std::make_shared<vslam::MonocularCamera>();
+        camera->fx = 500; camera->fy = 500;
+        camera->cx = 320; camera->cy = 240;
+        camera->img_width = 640; camera->img_height = 480;
         LOG_WARN("Camera mode: using DEFAULT intrinsics (500/500/320/240). "
                  "For accurate rotation/scale, calibrate your camera "
                  "(e.g. OpenCV chessboard calibration) and pass config.yaml.");
@@ -104,7 +113,7 @@ int main(int argc, char** argv) {
     if (!headless) viewer.start();
 
     // ---- 主循环 ----
-    cv::Mat image;
+    cv::Mat image, image_right;
     double timestamp;
     int frame_count = 0;
     auto start_time = std::chrono::steady_clock::now();
@@ -114,16 +123,18 @@ int main(int argc, char** argv) {
 
     LOG_INFO("Starting VO pipeline... Press Ctrl+C or close window to exit.");
 
-    while (dataset.nextFrame(image, timestamp) && (headless || !viewer.shouldQuit())) {
+    while (dataset.nextFrame(image, image_right, timestamp) && (headless || !viewer.shouldQuit())) {
         frame_count++;
 
-        // 运行一帧 VO
-        vslam::SE3 pose = vo.addFrame(image, timestamp);
+        // 运行一帧 VO（双目：左右目；单目：仅左目）
+        vslam::SE3 pose = image_right.empty()
+            ? vo.addFrame(image, timestamp)
+            : vo.addFrame(image, image_right, timestamp);
         traj_saved.emplace_back(timestamp, pose);
 
-        // 更新可视化（彩色视频帧 + 绿色特征点 + 轨迹）
+        // 更新可视化（双目：左右目并排；单目：单视频流 + 绿色特征点 + 轨迹）
         auto cf = vo.currentFrame();
-        viewer.updateFrame(cf->image, cf->keypoints, vo.getTrajectory());
+        viewer.updateFrame(cf->image, cf->keypoints, vo.getTrajectory(), cf->image_right);
 
         // 更新状态栏（格式化后传给 viewer）
         auto st = vo.getStatus();
