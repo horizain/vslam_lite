@@ -31,6 +31,7 @@
 #include <random>
 #include <chrono>
 #include <numeric>
+#include <algorithm>
 
 // 简单的测试辅助宏
 #define TEST(name) \
@@ -559,6 +560,71 @@ void test_stereo_camera() {
     } TEST_PASS();
 }
 
+void test_stereo_match_quality() {
+    TEST("双目 LK：水平视差通过，纵向错位被拒绝") {
+        cv::Mat left(240, 320, CV_8UC1);
+        cv::RNG rng(42);
+        rng.fill(left, cv::RNG::UNIFORM, 0, 255);
+
+        vslam::FeatureMatcher matcher;
+        auto frame = std::make_shared<vslam::Frame>(0, 0.0);
+        frame->image_gray = left;
+        matcher.extract(frame);
+
+        auto shifted = [&](double dy) {
+            cv::Mat right;
+            cv::Mat affine = (cv::Mat_<double>(2, 3) << 1, 0, -8, 0, 1, dy);
+            cv::warpAffine(left, right, affine, left.size(), cv::INTER_LINEAR,
+                           cv::BORDER_CONSTANT, cv::Scalar(0));
+            return right;
+        };
+
+        std::vector<cv::Point2f> right_pts;
+        auto horizontal_status = matcher.matchStereo(
+            left, shifted(0.0), frame->keypoints, right_pts);
+        std::vector<double> disparities;
+        for (size_t i = 0; i < horizontal_status.size(); i++) {
+            if (horizontal_status[i])
+                disparities.push_back(frame->keypoints[i].pt.x - right_pts[i].x);
+        }
+        assert(disparities.size() > 100);
+        std::ranges::sort(disparities);
+        const double median_disparity = disparities[disparities.size() / 2];
+        assert(std::abs(median_disparity - 8.0) < 0.5);
+
+        auto vertical_status = matcher.matchStereo(
+            left, shifted(3.0), frame->keypoints, right_pts);
+        const int vertical_valid = std::count(vertical_status.begin(), vertical_status.end(), 1);
+        assert(vertical_valid < (int)disparities.size() / 10);
+    } TEST_PASS();
+}
+
+void test_invalid_stereo_initialization() {
+    TEST("双目初始化：错误左右目不能创建空地图") {
+        auto cam = std::make_shared<vslam::StereoCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 160; cam->cy = 120;
+        cam->img_width = 320; cam->img_height = 240;
+        cam->fx_r = 500; cam->fy_r = 500; cam->cx_r = 160; cam->cy_r = 120;
+        cam->baseline_m = 0.5;
+
+        cv::Mat left(240, 320, CV_8UC1);
+        cv::RNG rng(7);
+        rng.fill(left, cv::RNG::UNIFORM, 0, 255);
+        cv::Mat right;
+        cv::Mat affine = (cv::Mat_<double>(2, 3) << 1, 0, -8, 0, 1, 3);
+        cv::warpAffine(left, right, affine, left.size(), cv::INTER_LINEAR,
+                       cv::BORDER_CONSTANT, cv::Scalar(0));
+
+        vslam::VOConfig cfg;
+        cfg.stereo_min_points = 40;
+        vslam::VisualOdometry vo(cam, cfg);
+        vo.addFrame(left, right, 0.0);
+        assert(vo.state() == vslam::VisualOdometry::State::INITIALIZING);
+        assert(!vo.getStatus().pose_valid);
+        assert(vo.getMap()->mapPointCount() == 0);
+    } TEST_PASS();
+}
+
 // ============================================================
 // 双目 VO 测试：合成方块场景精确渲染左右目
 // 验证：1) 首帧即 TRACKING（绝对尺度，无需对极初始化）
@@ -614,6 +680,8 @@ void test_stereo_vo() {
         render(vslam::SE3(), l1, r1);
         vo.addFrame(l1, r1, 0.0);
         assert(vo.state() == vslam::VisualOdometry::State::TRACKING);
+        assert(vo.getStatus().pose_valid);
+        assert(vo.getStatus().stereo_points >= cfg.stereo_min_points);
         assert(vo.getMap()->mapPointCount() > 50);
 
         // 帧 2：相机沿 +z 前进 1m，位移尺度应 ≈1m（绝对尺度）
@@ -624,6 +692,7 @@ void test_stereo_vo() {
         double disp = pose2.inverse().t.norm();   // T_cw → T_wc 位移
         std::cout << " (disp=" << disp << "m mp=" << vo.getMap()->mapPointCount() << ")";
         assert(std::abs(disp - 1.0) < 0.3);
+        assert(vo.getStatus().pose_valid);
     } TEST_PASS();
 }
 
@@ -645,6 +714,10 @@ void test_mini_atlas() {
         assert(atlas.activeMap() == second.map);
         assert(atlas.submapCount() == 2);
 
+        auto& disconnected = atlas.createSubmap(anchor, false);
+        assert(!disconnected.connected);
+        assert(atlas.submapCount() == 3);
+
         assert(atlas.activate(first_id));
         assert(atlas.activeMap() == first_map);
     } TEST_PASS();
@@ -664,6 +737,8 @@ int main() {
 
     std::cout << "\n[Stereo Camera]\n";
     test_stereo_camera();
+    test_stereo_match_quality();
+    test_invalid_stereo_initialization();
 
     std::cout << "\n[Stereo VO]\n";
     test_stereo_vo();

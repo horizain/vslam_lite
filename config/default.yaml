@@ -30,11 +30,18 @@ VO:
   min_parallax: 0.1        # 初始化的最小视差
   min_matches_init: 100    # 初始化的最小匹配数
   min_matches_track: 20    # 跟踪的最小匹配数
+  pnp_min_inliers: 15      # PnP 最小内点数
+  pnp_min_inlier_ratio: 0.3 # PnP 最小内点比例
+  pnp_max_rmse: 2.5        # PnP 内点最大重投影 RMSE（像素）
   max_tracking_failures: 5 # 连续跟踪失败多少帧后进入重定位
   max_relocalize_frames: 20 # 重定位持续失败多少帧后建立新子地图
-  pnp_min_inliers: 6       # PnP 的最小内点数
+  max_frame_translation: 3.0 # 双目相邻有效帧最大平移（米）
+  max_frame_rotation: 0.35 # 双目相邻有效帧最大旋转（弧度）
   keyframe_translation: 0.5  # 关键帧选择：最小平移距离（米）
   keyframe_rotation: 0.2   # 关键帧选择：最小旋转角度（弧度）
+  keyframe_min_inliers: 15 # 内点不足时补关键帧
+  min_keyframe_interval: 10 # 弱匹配触发关键帧的最小间隔
+  max_keyframe_interval: 15 # 最长关键帧间隔，防止参考帧过旧
 
 # ---- 优化参数 (Phase 1) ----
 Optimizer:
@@ -60,7 +67,12 @@ Viewer:
 Stereo:
   baseline: 0.54          # 基线（米）。KITTI 序列 ≈ 0.54m（由 calib.txt P1[0][3] = -fx*baseline 反推）
   min_depth: 0.5          # 有效深度下限（米），过近视差噪声大
-  max_depth: 50.0         # 有效深度上限（米），过远视差分辨率不足
-  keyframe_translation: 1.5  # 双目关键帧最小平移（米）。双目有绝对尺度，单帧即可建点；
+  max_depth: 35.0         # 位姿估计深度上限（米），远点视差误差会放大为米级深度误差
+  min_points: 40          # 初始化/3D-3D 所需最少有效双目点
+  rigid_min_inliers: 15   # 3D-3D 最少 RANSAC 内点
+  rigid_min_inlier_ratio: 0.5 # 3D-3D 最小内点比例
+  rigid_ransac_threshold: 0.25 # 3D-3D RANSAC 距离阈值（米）
+  rigid_max_rmse: 0.25    # Kabsch 刚体拟合最大 RMSE（米）
+  keyframe_translation: 0.9  # 双目关键帧最小平移（米）。双目有绝对尺度，单帧即可建点；
                              # 阈值过大 → ref 间隔远 → 高速段 ORB 匹配骤减会 LOST；
                              # 阈值过小 → 每帧插 KF → 地图膨胀 + BA 空转

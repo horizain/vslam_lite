@@ -118,8 +118,13 @@ int main(int argc, char** argv) {
     int frame_count = 0;
     auto start_time = std::chrono::steady_clock::now();
 
-    // 记录完整位姿（TUM 格式输出用）
-    std::vector<std::pair<double, vslam::SE3>> traj_saved;
+    struct TrajectoryRecord {
+        double timestamp;
+        vslam::SE3 pose_cw;
+        vslam::VisualOdometry::Status status;
+    };
+    // 主 TUM 只写全局有效位姿；完整帧状态另存 debug CSV。
+    std::vector<TrajectoryRecord> traj_saved;
 
     LOG_INFO("Starting VO pipeline... Press Ctrl+C or close window to exit.");
 
@@ -130,10 +135,10 @@ int main(int argc, char** argv) {
         vslam::SE3 pose = image_right.empty()
             ? vo.addFrame(image, timestamp)
             : vo.addFrame(image, image_right, timestamp);
-        traj_saved.emplace_back(timestamp, pose);
 
         // 更新状态栏（格式化后传给 viewer）
         auto st = vo.getStatus();
+        traj_saved.push_back({timestamp, pose, st});
         std::string state_str;
         switch (st.state) {
             case vslam::VisualOdometry::State::INITIALIZING: state_str = "INIT"; break;
@@ -142,10 +147,12 @@ int main(int argc, char** argv) {
             case vslam::VisualOdometry::State::LOST:         state_str = "LOST"; break;
         }
         // 更新状态栏（std::format 类型安全，替代 snprintf）
-        std::string status = std::format("{} | Matches:{} Inl:{} Parallax:{:.2f} | MP:{} KF:{} SM:{} Lost:{}",
-                                         state_str, st.matches, st.inliers,
-                                         st.parallax, st.map_points, st.keyframes,
-                                         st.submap_id, st.lost_frames);
+        std::string status = std::format("{} | {}{} | Stereo:{} d:{:.1f}px z:{:.1f}m | Matches:{} Inl:{} RMSE:{:.2f} | MP:{} KF:{} SM:{} Lost:{}",
+                                         state_str, st.pose_method,
+                                         st.pose_valid ? "" : " INVALID",
+                                         st.stereo_points, st.median_disparity, st.median_depth,
+                                         st.matches, st.inliers, st.pose_rmse,
+                                         st.map_points, st.keyframes, st.submap_id, st.lost_frames);
         if (!headless) {
             viewer.setStatus(status);
             // 双目上下排列，避免超宽画面被压缩；单目显示视频流、特征点和世界系轨迹。
@@ -174,17 +181,47 @@ int main(int argc, char** argv) {
         std::ofstream ofs(traj_path);
         if (ofs.is_open()) {
             ofs << std::fixed << std::setprecision(6);
-            for (auto& [ts, pose_cw] : traj_saved) {
-                vslam::SE3 Twc = pose_cw.inverse();  // T_cw → T_wc
-                ofs << ts << " "
+            size_t valid_count = 0;
+            for (const auto& record : traj_saved) {
+                if (!record.status.pose_valid) continue;
+                vslam::SE3 Twc = record.pose_cw.inverse();  // T_cw → T_wc
+                ofs << record.timestamp << " "
                     << Twc.t.x() << " " << Twc.t.y() << " " << Twc.t.z() << " "
                     << Twc.q.x() << " " << Twc.q.y() << " " << Twc.q.z() << " "
                     << Twc.q.w() << "\n";
+                valid_count++;
             }
             LOG_INFO("Trajectory saved to " << traj_path
-                     << " (" << traj_saved.size() << " poses, TUM format)");
+                     << " (" << valid_count << "/" << traj_saved.size()
+                     << " globally valid poses, TUM format)");
         } else {
             LOG_ERROR("Cannot write trajectory to " << traj_path);
+        }
+
+        const std::string debug_path = traj_path + ".debug.csv";
+        std::ofstream debug_ofs(debug_path);
+        if (debug_ofs.is_open()) {
+            debug_ofs << "timestamp,state,tracking_valid,map_connected,pose_valid,pose_method,"
+                         "submap_id,lost_frames,stereo_points,median_disparity,median_depth,"
+                         "matches,inliers,inlier_ratio,pose_rmse,translation_delta,rotation_delta,"
+                         "tx,ty,tz,qx,qy,qz,qw\n";
+            debug_ofs << std::fixed << std::setprecision(6);
+            for (const auto& record : traj_saved) {
+                const auto& st = record.status;
+                const vslam::SE3 Twc = record.pose_cw.inverse();
+                debug_ofs << record.timestamp << "," << static_cast<int>(st.state) << ","
+                          << st.tracking_valid << "," << st.map_connected << ","
+                          << st.pose_valid << "," << st.pose_method << ","
+                          << st.submap_id << "," << st.lost_frames << ","
+                          << st.stereo_points << "," << st.median_disparity << ","
+                          << st.median_depth << "," << st.matches << "," << st.inliers << ","
+                          << st.inlier_ratio << "," << st.pose_rmse << ","
+                          << st.translation_delta << "," << st.rotation_delta << ","
+                          << Twc.t.x() << "," << Twc.t.y() << "," << Twc.t.z() << ","
+                          << Twc.q.x() << "," << Twc.q.y() << "," << Twc.q.z() << ","
+                          << Twc.q.w() << "\n";
+            }
+            LOG_INFO("Trajectory diagnostics saved to " << debug_path);
         }
     }
 

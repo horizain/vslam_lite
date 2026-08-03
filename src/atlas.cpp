@@ -2,24 +2,27 @@
 
 namespace vslam {
 
-Submap& Atlas::createSubmap(const SE3& origin_Twc) {
+Submap& Atlas::createSubmap(const SE3& origin_Twc, bool connected) {
     if (auto* active = activeSubmap()) active->frozen = true;
 
     Submap submap;
     submap.id = next_id_++;
     submap.map = std::make_shared<Map>();
     submap.origin_Twc = origin_Twc;
+    submap.connected = connected;
     submaps_.push_back(std::move(submap));
     active_id_ = submaps_.back().id;
     LOG_INFO("Atlas: created submap " << active_id_
-             << " at " << origin_Twc.t.transpose());
+             << " at " << origin_Twc.t.transpose()
+             << (connected ? " (connected)" : " (disconnected)"));
     return submaps_.back();
 }
 
 bool Atlas::activate(unsigned long id) {
-    for (const auto& submap : submaps_) {
+    for (auto& submap : submaps_) {
         if (submap.id == id) {
             active_id_ = id;
+            submap.frozen = false;
             return true;
         }
     }

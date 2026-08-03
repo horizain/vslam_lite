@@ -2,6 +2,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/video/tracking.hpp>
+#include <cmath>
 
 namespace vslam {
 
@@ -139,6 +140,38 @@ std::vector<unsigned char> FeatureMatcher::matchStereo(
         left_gray, right_gray,
         left_pts, right_pts, status, err,
         cv::Size(31, 31), 5);
+
+    // 右目→左目反向跟踪：仅使用单向 LK 的 status 会把重复纹理上的错误点
+    // 当成有效深度。前后向一致性是稀疏双目最便于理解、也最关键的质量门槛。
+    std::vector<cv::Point2f> back_pts;
+    std::vector<unsigned char> back_status;
+    std::vector<float> back_err;
+    cv::calcOpticalFlowPyrLK(
+        right_gray, left_gray,
+        right_pts, back_pts, back_status, back_err,
+        cv::Size(31, 31), 5);
+
+    constexpr float kMaxEpipolarError = 1.5f;
+    constexpr float kMaxForwardBackwardError = 1.0f;
+    constexpr float kMaxLkError = 25.0f;
+    for (size_t i = 0; i < status.size(); i++) {
+        if (!status[i] || i >= back_status.size() || !back_status[i]) {
+            status[i] = 0;
+            continue;
+        }
+        const auto& pl = left_pts[i];
+        const auto& pr = right_pts[i];
+        const bool in_image = pr.x >= 1.0f && pr.y >= 1.0f
+            && pr.x < right_gray.cols - 1.0f && pr.y < right_gray.rows - 1.0f;
+        const float fb_error = cv::norm(back_pts[i] - pl);
+        const float stereo_error = i < err.size() ? err[i] : kMaxLkError + 1.0f;
+        const float reverse_error = i < back_err.size() ? back_err[i] : kMaxLkError + 1.0f;
+        if (!in_image || std::abs(pl.y - pr.y) > kMaxEpipolarError
+            || fb_error > kMaxForwardBackwardError
+            || stereo_error > kMaxLkError || reverse_error > kMaxLkError) {
+            status[i] = 0;
+        }
+    }
 
     return status;
 }

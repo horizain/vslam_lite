@@ -6,6 +6,7 @@
 #include "vslam/map.h"
 #include "vslam/atlas.h"
 #include "vslam/feature.h"
+#include <string>
 
 namespace vslam {
 
@@ -18,22 +19,33 @@ struct VOConfig {
     double ransac_pixel_threshold = 3.0;    // PnP RANSAC 重投影误差阈值(px)
     int    min_matches_init       = 100;    // 初始化最小匹配数
     int    min_matches_track      = 20;     // 跟踪/对极回退最小匹配数
+    int    pnp_min_inliers        = 15;     // PnP 最小内点数
+    double pnp_min_inlier_ratio   = 0.3;    // PnP 最小内点比例
+    double pnp_max_rmse           = 2.5;    // PnP 最大内点重投影 RMSE(px)
     int    max_tracking_failures  = 5;      // 连续失败多少帧后进入重定位
     int    max_relocalize_frames  = 20;     // 重定位失败多少帧后创建新子地图
+    double max_frame_translation  = 3.0;    // 双目相邻有效帧最大平移(m)
+    double max_frame_rotation     = 0.35;   // 双目相邻有效帧最大旋转(rad)
     double keyframe_translation   = 0.5;    // 关键帧最小平移(m)，单目（尺度归一化后位移小）
-    double keyframe_translation_stereo = 1.5;  // 双目/RGB-D 关键帧最小平移(m)：
+    double keyframe_translation_stereo = 0.9;  // 双目/RGB-D 关键帧最小平移(m)：
                                              // 单帧即可建点（绝对尺度），KF 只需服务 BA 稀疏化；
                                              // 阈值过大 → ref 间隔远 → 高速段匹配骤减会 LOST，
                                              // 过小 → 每帧插 KF → 地图膨胀 + BA 空转
     double keyframe_rotation      = 0.2;    // 关键帧最小旋转(rad)
     int    keyframe_min_inliers   = 15;     // 跟踪内点低于该值 → 强制插入关键帧
     int    min_keyframe_interval  = 10;     // 关键帧最小帧间隔（防 weak_match 风暴）
+    int    max_keyframe_interval  = 15;     // 最长关键帧间隔（防尺度低估导致参考帧过旧）
     int    local_window_size      = 10;     // 局部 BA 滑动窗口
     int    local_ba_iterations    = 10;     // 局部 BA 迭代次数
     bool   enable_local_ba        = true;   // 局部 BA 开关（诊断/教学对比用）
     int    feature_method         = 0;      // 0: ORB匹配, 1: LK光流
-    double stereo_min_depth      = 0.5;    // 双目/RGB-D 有效深度下限(m)
-    double stereo_max_depth      = 50.0;   // 双目/RGB-D 有效深度上限(m)
+    double stereo_min_depth       = 0.5;    // 双目/RGB-D 有效深度下限(m)
+    double stereo_max_depth       = 35.0;   // 双目/RGB-D 位姿估计深度上限(m)
+    int    stereo_min_points      = 40;     // 建图所需最少有效双目点
+    int    rigid_min_inliers      = 15;     // 3D-3D 最少 RANSAC 内点
+    double rigid_min_inlier_ratio = 0.5;    // 3D-3D 最小内点比例
+    double rigid_ransac_threshold = 0.25;   // 3D-3D RANSAC 距离阈值(m)
+    double rigid_max_rmse         = 0.25;   // 3D-3D 刚体拟合最大 RMSE(m)
 
     /// 从 yaml 配置加载（缺省字段保持默认值）
     static VOConfig fromYaml(const std::string& path);
@@ -58,6 +70,17 @@ public:
         unsigned long keyframes    = 0;
         unsigned long submap_id    = 0;
         int           lost_frames  = 0;
+        bool          tracking_valid = false;
+        bool          map_connected = true;
+        bool          pose_valid   = false;
+        std::string   pose_method  = "NONE";
+        int           stereo_points = 0;
+        double        median_disparity = 0.0;
+        double        median_depth = 0.0;
+        double        inlier_ratio = 0.0;
+        double        pose_rmse    = 0.0;
+        double        translation_delta = 0.0;
+        double        rotation_delta = 0.0;
     };
 
     VisualOdometry(const Camera& camera, const VOConfig& cfg = VOConfig());
@@ -106,8 +129,13 @@ private:
     /// 双目/RGB-D：3D-3D 位姿估计（ref 世界系点 vs 当前帧 pts_c，绝对尺度、旋转鲁棒）。
     /// PnP 失败或旋转-平移歧义（假平移跳变）时使用；成功返回 true 并写入 pose_cw
     bool tryTrack3D3D(const std::vector<cv::DMatch>& matches);
-    /// 运动先验：ref→上一帧 位移（跳变保护阈值基准）
-    double motionPrior() const;
+    /// 检查双目相邻有效帧运动是否合理，并返回平移/旋转增量。
+    bool validateMotion(const SE3& pose_cw, double& translation, double& rotation) const;
+    /// 计算 PnP 内点的重投影 RMSE。
+    double pnpReprojectionRmse(const std::vector<cv::Point3f>& pts3d,
+                               const std::vector<cv::Point2f>& pts2d,
+                               const cv::Mat& rvec, const cv::Mat& tvec,
+                               const std::vector<int>& inliers) const;
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
     void insertKeyFrame();              // 关键帧插入 + 三角化 + BA

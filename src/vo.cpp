@@ -9,6 +9,7 @@
 #include <set>
 #include <algorithm>
 #include <ranges>
+#include <limits>
 
 namespace vslam {
 
@@ -27,10 +28,18 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (v["method"])              cfg.feature_method       = v["method"].as<int>();
             if (v["min_matches_init"])    cfg.min_matches_init     = v["min_matches_init"].as<int>();
             if (v["min_matches_track"])   cfg.min_matches_track    = v["min_matches_track"].as<int>();
+            if (v["pnp_min_inliers"])     cfg.pnp_min_inliers      = v["pnp_min_inliers"].as<int>();
+            if (v["pnp_min_inlier_ratio"]) cfg.pnp_min_inlier_ratio = v["pnp_min_inlier_ratio"].as<double>();
+            if (v["pnp_max_rmse"])        cfg.pnp_max_rmse         = v["pnp_max_rmse"].as<double>();
             if (v["max_tracking_failures"]) cfg.max_tracking_failures = v["max_tracking_failures"].as<int>();
             if (v["max_relocalize_frames"]) cfg.max_relocalize_frames = v["max_relocalize_frames"].as<int>();
+            if (v["max_frame_translation"]) cfg.max_frame_translation = v["max_frame_translation"].as<double>();
+            if (v["max_frame_rotation"]) cfg.max_frame_rotation = v["max_frame_rotation"].as<double>();
             if (v["keyframe_translation"]) cfg.keyframe_translation = v["keyframe_translation"].as<double>();
             if (v["keyframe_rotation"])   cfg.keyframe_rotation    = v["keyframe_rotation"].as<double>();
+            if (v["keyframe_min_inliers"]) cfg.keyframe_min_inliers = v["keyframe_min_inliers"].as<int>();
+            if (v["min_keyframe_interval"]) cfg.min_keyframe_interval = v["min_keyframe_interval"].as<int>();
+            if (v["max_keyframe_interval"]) cfg.max_keyframe_interval = v["max_keyframe_interval"].as<int>();
         }
         if (auto o = root["Optimizer"]) {
             if (o["local_window_size"])   cfg.local_window_size   = o["local_window_size"].as<int>();
@@ -40,6 +49,11 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
         if (auto s = root["Stereo"]) {
             if (s["min_depth"]) cfg.stereo_min_depth = s["min_depth"].as<double>();
             if (s["max_depth"]) cfg.stereo_max_depth = s["max_depth"].as<double>();
+            if (s["min_points"]) cfg.stereo_min_points = s["min_points"].as<int>();
+            if (s["rigid_min_inliers"]) cfg.rigid_min_inliers = s["rigid_min_inliers"].as<int>();
+            if (s["rigid_min_inlier_ratio"]) cfg.rigid_min_inlier_ratio = s["rigid_min_inlier_ratio"].as<double>();
+            if (s["rigid_ransac_threshold"]) cfg.rigid_ransac_threshold = s["rigid_ransac_threshold"].as<double>();
+            if (s["rigid_max_rmse"]) cfg.rigid_max_rmse = s["rigid_max_rmse"].as<double>();
             if (s["keyframe_translation"])
                 cfg.keyframe_translation_stereo = s["keyframe_translation"].as<double>();
         }
@@ -73,6 +87,16 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
 
     // 1. 创建当前帧 + CLAHE 增强
     curr_frame_ = std::make_shared<Frame>(frame_id, timestamp);
+    status_.tracking_valid = false;
+    status_.pose_valid = false;
+    status_.pose_method = "NONE";
+    status_.stereo_points = 0;
+    status_.median_disparity = 0.0;
+    status_.median_depth = 0.0;
+    status_.inlier_ratio = 0.0;
+    status_.pose_rmse = 0.0;
+    status_.translation_delta = 0.0;
+    status_.rotation_delta = 0.0;
     if (left.channels() == 3)
         cv::cvtColor(left, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
     else
@@ -109,8 +133,10 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     if (curr_frame_->keypoints.empty()) {
         LOG_WARN("No features extracted, skipping frame");
         if (state_ != State::INITIALIZING && ref_frame_) {
-            state_ = State::RECOVERING;
             tracking_failures_++;
+            state_ = tracking_failures_ >= cfg_.max_tracking_failures
+                ? State::LOST : State::RECOVERING;
+            if (state_ == State::LOST) relocalization_frames_++;
             curr_frame_->pose_cw = has_last_valid_pose_ ? last_valid_pose_cw_
                                                         : ref_frame_->pose_cw;
         }
@@ -128,6 +154,8 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
             state_ = State::TRACKING;
             tracking_failures_ = 0;
             relocalization_frames_ = 0;
+            status_.tracking_valid = true;
+            status_.pose_method = "INIT";
         }
     } else if (state_ == State::TRACKING) {
         // LK 模式：描述子为空说明走的是光流路径，用索引对齐的 PnP 跟踪
@@ -150,6 +178,8 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
             state_ = State::TRACKING;
             tracking_failures_ = 0;
             relocalization_frames_ = 0;
+            status_.tracking_valid = true;
+            status_.pose_method = "RELOCALIZE";
         } else {
             ++relocalization_frames_;
             if (relocalization_frames_ >= cfg_.max_relocalize_frames) {
@@ -161,20 +191,25 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
                     state_ = State::TRACKING;
                     tracking_failures_ = 0;
                     relocalization_frames_ = 0;
+                    status_.tracking_valid = true;
+                    status_.pose_method = "SUBMAP_INIT";
                 }
             }
         }
     }
 
     prev_frame_ = curr_frame_;
-    if (state_ == State::TRACKING) {
+    if (state_ == State::TRACKING && status_.tracking_valid) {
         last_valid_pose_cw_ = curr_frame_->pose_cw;
         has_last_valid_pose_ = true;
         tracking_failures_ = 0;
     }
+    updateStatus(status_.matches, status_.inliers, status_.parallax);
+    status_.pose_valid = status_.tracking_valid && status_.map_connected;
     // pose_cw.t 是世界原点在相机系中的坐标，不是相机位置。
     // 原地旋转时它会随 R_cw 绕圈；轨迹必须记录相机光心 C_w = -R_cw^T t_cw。
-    trajectory_.push_back(curr_frame_->pose_cw.camera_position());
+    if (status_.pose_valid)
+        trajectory_.push_back(curr_frame_->pose_cw.camera_position());
     return curr_frame_->pose_cw;
 }
 
@@ -205,14 +240,30 @@ void VisualOdometry::computeStereoDepths() {
         left_raw, right_raw,
         curr_frame_->keypoints, right_pts);
 
+    std::vector<double> disparities;
+    std::vector<double> depths;
+    disparities.reserve(status.size());
+    depths.reserve(status.size());
     for (size_t i = 0; i < status.size() && i < curr_frame_->keypoints.size(); i++) {
         if (!status[i]) continue;
         double disparity = curr_frame_->keypoints[i].pt.x - right_pts[i].x;
-        if (disparity <= 0) continue;
+        const double min_disparity = camera_->fx * camera_->baseline() / cfg_.stereo_max_depth;
+        const double max_disparity = camera_->fx * camera_->baseline() / cfg_.stereo_min_depth;
+        if (disparity < min_disparity || disparity > max_disparity) continue;
         double depth = camera_->fx * camera_->baseline() / disparity;  // z = fx*b/d
         if (depth < cfg_.stereo_min_depth || depth > cfg_.stereo_max_depth) continue;
         curr_frame_->pts_c[i] = camera_->pixel2camera(
             Vec2(curr_frame_->keypoints[i].pt.x, curr_frame_->keypoints[i].pt.y), depth);
+        disparities.push_back(disparity);
+        depths.push_back(depth);
+    }
+
+    status_.stereo_points = (int)depths.size();
+    if (!depths.empty()) {
+        std::ranges::sort(disparities);
+        std::ranges::sort(depths);
+        status_.median_disparity = disparities[disparities.size() / 2];
+        status_.median_depth = depths[depths.size() / 2];
     }
 }
 
@@ -250,7 +301,9 @@ void VisualOdometry::updateStatus(int matches, int inliers, double parallax) {
     status_.parallax   = parallax;
     status_.map_points = map_->mapPointCount();
     status_.keyframes  = map_->keyFrameCount();
-    status_.submap_id  = atlas_->activeSubmap() ? atlas_->activeSubmap()->id : 0;
+    const auto* active_submap = atlas_->activeSubmap();
+    status_.submap_id  = active_submap ? active_submap->id : 0;
+    status_.map_connected = active_submap ? active_submap->connected : false;
     status_.lost_frames = tracking_failures_ + relocalization_frames_;
 }
 
@@ -261,7 +314,9 @@ void VisualOdometry::createSubmap() {
         ? last_valid_pose_cw_.inverse()
         : (ref_frame_ ? ref_frame_->pose_cw.inverse() : SE3());
 
-    auto& submap = atlas_->createSubmap(anchor_Twc);
+    // 丢失期间的真实位移未知，anchor 只用于 Viewer 连续显示，不能声称
+    // 新子地图已经连接到全局世界系。后续重定位到旧地图后才恢复全局有效轨迹。
+    auto& submap = atlas_->createSubmap(anchor_Twc, false);
     map_ = submap.map;
     ref_frame_.reset();
     prev_frame_.reset();
@@ -281,6 +336,12 @@ bool VisualOdometry::tryInitialize() {
     // （无需对极初始化——这是双目相对单目的本质区别：尺度可观测）
     if (camera_->hasPerFrameDepth()) {
         if (!ref_frame_) {
+            if (status_.stereo_points < cfg_.stereo_min_points) {
+                LOG_WARN("Stereo init postponed: only " << status_.stereo_points
+                         << " valid depth points");
+                updateStatus(0, 0, 0.0);
+                return false;
+            }
             ref_frame_ = curr_frame_;
             createMapPointsFromStereo(ref_frame_);
             map_->insertKeyFrame(ref_frame_);
@@ -351,6 +412,41 @@ bool VisualOdometry::tryInitialize() {
 // ============================================================
 // 跟踪
 // ============================================================
+double VisualOdometry::pnpReprojectionRmse(
+    const std::vector<cv::Point3f>& pts3d,
+    const std::vector<cv::Point2f>& pts2d,
+    const cv::Mat& rvec, const cv::Mat& tvec,
+    const std::vector<int>& inliers) const {
+    if (inliers.empty()) return std::numeric_limits<double>::infinity();
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(pts3d, rvec, tvec, camera_->K(), cv::Mat(), projected);
+    double squared_error = 0.0;
+    int count = 0;
+    for (int idx : inliers) {
+        if (idx < 0 || idx >= (int)projected.size() || idx >= (int)pts2d.size()) continue;
+        const cv::Point2f error = projected[idx] - pts2d[idx];
+        squared_error += error.dot(error);
+        count++;
+    }
+    return count > 0 ? std::sqrt(squared_error / count)
+                     : std::numeric_limits<double>::infinity();
+}
+
+bool VisualOdometry::validateMotion(
+    const SE3& pose_cw, double& translation, double& rotation) const {
+    translation = 0.0;
+    rotation = 0.0;
+    if (!camera_->hasPerFrameDepth() || !has_last_valid_pose_) return true;
+
+    const SE3 Twc_new = pose_cw.inverse();
+    const SE3 Twc_last = last_valid_pose_cw_.inverse();
+    translation = (Twc_new.t - Twc_last.t).norm();
+    const Eigen::Quaterniond q_rel = Twc_new.q * Twc_last.q.inverse();
+    rotation = 2.0 * std::acos(std::clamp(std::abs(q_rel.w()), 0.0, 1.0));
+    return translation <= cfg_.max_frame_translation
+        && rotation <= cfg_.max_frame_rotation;
+}
+
 SE3 VisualOdometry::trackFrame() {
     if (!ref_frame_ || !curr_frame_) return SE3();
 
@@ -381,40 +477,43 @@ SE3 VisualOdometry::trackFrame() {
         bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
                                      cv::Mat(), rvec, tvec,
                                      false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
-        if (ok && inliers.size() >= 10) {
+        if (ok) {
             cv::Mat R;
             cv::Rodrigues(rvec, R);
-            curr_frame_->pose_cw = matToSE3(R, tvec);
-            inliers_cnt = (int)inliers.size();
-            // 把内点对应的地图点关联到当前帧（这是关键帧共视统计的基础：
-            // 若不关联，关键帧只与紧邻帧共视，Local BA 窗口永远只有 2 帧）
-            for (int idx : inliers) {
-                if (idx < 0 || idx >= (int)match_idx.size()) continue;
-                auto& mp = ref_frame_->map_points[matches[match_idx[idx]].queryIdx];
-                if (mp) {
-                    mp->observed_count++;
-                    curr_frame_->map_points[matches[match_idx[idx]].trainIdx] = mp;
-                }
-            }
-            updateStatus((int)matches.size(), inliers_cnt, 0.0);
+            const SE3 candidate_pose = matToSE3(R, tvec);
+            const double inlier_ratio = (double)inliers.size() / pts3d.size();
+            const double rmse = pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers);
+            double translation = 0.0;
+            double rotation = 0.0;
+            const bool motion_ok = validateMotion(candidate_pose, translation, rotation);
+            const bool quality_ok = (int)inliers.size() >= cfg_.pnp_min_inliers
+                && inlier_ratio >= cfg_.pnp_min_inlier_ratio
+                && rmse <= cfg_.pnp_max_rmse && motion_ok;
 
-            // 位姿跳变保护：单帧位移异常说明数值发散（如旋转-平移歧义的假平移）。
-            // 阈值按传感器分派：双目有绝对尺度（真实帧间位移小），用运动先验相对阈值；
-            // 单目尺度不定（recoverPose 归一化），保留宽松的固定阈值。
-            SE3 Twc_new  = curr_frame_->pose_cw.inverse();
-            SE3 Twc_ref  = ref_frame_->pose_cw.inverse();
-            double jump_thresh = camera_->hasPerFrameDepth()
-                ? motionPrior() * 6.0 + 2.0 : 30.0;
-            if ((Twc_new.t - Twc_ref.t).norm() > jump_thresh) {
-                LOG_WARN("Pose jump detected (" << (Twc_new.t - Twc_ref.t).norm()
-                         << "m), retry stereo 3D-3D");
-                // 旋转-平移歧义时 PnP 的假平移不可信，改用双目真实深度重新估计
-                if (tryTrack3D3D(matches)) return curr_frame_->pose_cw;
-                state_ = State::RECOVERING;
-                updateStatus(0, 0, 0.0);
-                return ref_frame_->pose_cw;
+            status_.inlier_ratio = inlier_ratio;
+            status_.pose_rmse = rmse;
+            status_.translation_delta = translation;
+            status_.rotation_delta = rotation;
+            if (quality_ok) {
+                curr_frame_->pose_cw = candidate_pose;
+                inliers_cnt = (int)inliers.size();
+                status_.tracking_valid = true;
+                status_.pose_method = "PNP";
+                // 位姿通过全部质量检查后才关联地图点，避免被拒绝的解污染共视统计。
+                for (int idx : inliers) {
+                    if (idx < 0 || idx >= (int)match_idx.size()) continue;
+                    auto& mp = ref_frame_->map_points[matches[match_idx[idx]].queryIdx];
+                    if (mp) {
+                        mp->observed_count++;
+                        curr_frame_->map_points[matches[match_idx[idx]].trainIdx] = mp;
+                    }
+                }
+                updateStatus((int)matches.size(), inliers_cnt, 0.0);
+                return curr_frame_->pose_cw;
             }
-            return curr_frame_->pose_cw;
+            LOG_WARN("PnP rejected: inliers=" << inliers.size()
+                     << " ratio=" << inlier_ratio << " rmse=" << rmse
+                     << " dtrans=" << translation << " drot=" << rotation);
         }
     }
 
@@ -445,6 +544,8 @@ SE3 VisualOdometry::trackFrame() {
             updateStatus((int)matches.size(), 0, 0.0);
             return ref_frame_->pose_cw;
         }
+        status_.tracking_valid = true;
+        status_.pose_method = "EPIPOLAR";
     } else {
         // 匹配太少 → LOST
         curr_frame_->pose_cw = ref_frame_->pose_cw;
@@ -466,7 +567,8 @@ SE3 VisualOdometry::trackFrame() {
 // （对极几何的 t 归一化 + 旋转主导退化在双目下不可用）。
 // ============================================================
 bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
-    if (!camera_->hasPerFrameDepth() || matches.size() < 10) return false;
+    if (!camera_->hasPerFrameDepth() || matches.size() < 20
+        || status_.stereo_points < cfg_.stereo_min_points) return false;
 
     std::vector<cv::Point3f> pts_w;   // ref 帧世界系 3D 点
     std::vector<cv::Point3f> pts_c;   // 当前帧相机系 3D 点（双目视差）
@@ -481,11 +583,12 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
             idx3.push_back((int)k);
         }
     }
-    if ((int)pts_w.size() < 6) return false;
+    if ((int)pts_w.size() < std::max(20, cfg_.rigid_min_inliers)) return false;
 
     cv::Mat affine, inliers;
     // RANSAC 3D-3D：返回 3x4 [R|t] 满足 dst = R*src + t → 即 T_cw（世界→相机）
-    bool ok = cv::estimateAffine3D(pts_w, pts_c, affine, inliers, 1.0, 0.99);
+    bool ok = cv::estimateAffine3D(pts_w, pts_c, affine, inliers,
+                                   cfg_.rigid_ransac_threshold, 0.99);
     if (!ok) return false;
 
     // estimateAffine3D 只用于 RANSAC 选内点。不能把其旋转投影回 SO(3) 后仍沿用
@@ -500,7 +603,13 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
         mean_c += Vec3(pts_c[i].x, pts_c[i].y, pts_c[i].z);
         rigid_inliers++;
     }
-    if (rigid_inliers < 3) return false;
+    const double inlier_ratio = (double)rigid_inliers / pts_w.size();
+    if (rigid_inliers < cfg_.rigid_min_inliers
+        || inlier_ratio < cfg_.rigid_min_inlier_ratio) {
+        LOG_WARN("3D-3D rejected: inliers=" << rigid_inliers
+                 << " ratio=" << inlier_ratio);
+        return false;
+    }
     mean_w /= rigid_inliers;
     mean_c /= rigid_inliers;
 
@@ -512,6 +621,11 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
         covariance += (pc - mean_c) * (pw - mean_w).transpose();
     }
     Eigen::JacobiSVD<Mat33> svd(covariance, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    const Vec3 singular = svd.singularValues();
+    if (singular.x() <= 1e-9 || singular.y() / singular.x() < 1e-3) {
+        LOG_WARN("3D-3D rejected: degenerate point distribution");
+        return false;
+    }
     Mat33 U = svd.matrixU();
     const Mat33 V = svd.matrixV();
     Mat33 R_rigid = U * V.transpose();
@@ -522,15 +636,30 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
     Vec3 t_rigid = mean_c - R_rigid * mean_w;
     SE3 pose_cw(Eigen::Quaterniond(R_rigid), t_rigid);
 
-    // 跳变保护（运动先验）：3D-3D 用真实深度，异常解概率低，但兜底拒绝
-    SE3 Twc_new = pose_cw.inverse();
-    SE3 Twc_ref = ref_frame_->pose_cw.inverse();
-    if ((Twc_new.t - Twc_ref.t).norm() > motionPrior() * 6.0 + 2.0) {
-        LOG_WARN("3D-3D pose jump (" << (Twc_new.t - Twc_ref.t).norm() << "m), rejected");
+    double squared_error = 0.0;
+    for (size_t i = 0; i < inliers.total(); i++) {
+        if (!inliers.at<uchar>((int)i)) continue;
+        const Vec3 pw(pts_w[i].x, pts_w[i].y, pts_w[i].z);
+        const Vec3 pc(pts_c[i].x, pts_c[i].y, pts_c[i].z);
+        squared_error += (R_rigid * pw + t_rigid - pc).squaredNorm();
+    }
+    const double rmse = std::sqrt(squared_error / rigid_inliers);
+    double translation = 0.0;
+    double rotation = 0.0;
+    const bool motion_ok = validateMotion(pose_cw, translation, rotation);
+    if (rmse > cfg_.rigid_max_rmse || !motion_ok) {
+        LOG_WARN("3D-3D rejected: rmse=" << rmse
+                 << " dtrans=" << translation << " drot=" << rotation);
         return false;
     }
 
     curr_frame_->pose_cw = pose_cw;
+    status_.tracking_valid = true;
+    status_.pose_method = "3D3D";
+    status_.inlier_ratio = inlier_ratio;
+    status_.pose_rmse = rmse;
+    status_.translation_delta = translation;
+    status_.rotation_delta = rotation;
     // 关联内点（共视统计 + observed_count）
     int inl_cnt = 0;
     for (size_t i = 0; i < inliers.total() && i < idx3.size(); i++) {
@@ -545,18 +674,6 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
     }
     updateStatus((int)matches.size(), inl_cnt, 0.0);
     return true;
-}
-
-// ============================================================
-// 运动先验：ref→上一帧 位移（跳变保护阈值基准）
-// ============================================================
-double VisualOdometry::motionPrior() const {
-    if (prev_frame_ && ref_frame_ && prev_frame_->id != ref_frame_->id) {
-        SE3 Twc_prev = prev_frame_->pose_cw.inverse();
-        SE3 Twc_ref  = ref_frame_->pose_cw.inverse();
-        return std::max((Twc_prev.t - Twc_ref.t).norm(), 0.3);
-    }
-    return cfg_.keyframe_translation;
 }
 
 // ============================================================
@@ -585,19 +702,35 @@ SE3 VisualOdometry::trackFrameLK() {
         bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
                                      cv::Mat(), rvec, tvec,
                                      false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
-        if (ok && inliers.size() >= 10) {
+        if (ok) {
             cv::Mat R;
             cv::Rodrigues(rvec, R);
-            curr_frame_->pose_cw = matToSE3(R, tvec);
-            inliers_cnt = (int)inliers.size();
-            for (int idx : inliers) {
-                if (idx >= 0 && idx < (int)kp_idx.size()) {
-                    auto& mp = curr_frame_->map_points[kp_idx[idx]];
-                    if (mp) mp->observed_count++;
+            const SE3 candidate_pose = matToSE3(R, tvec);
+            const double ratio = (double)inliers.size() / pts3d.size();
+            const double rmse = pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers);
+            double translation = 0.0;
+            double rotation = 0.0;
+            const bool motion_ok = validateMotion(candidate_pose, translation, rotation);
+            if ((int)inliers.size() >= cfg_.pnp_min_inliers
+                && ratio >= cfg_.pnp_min_inlier_ratio
+                && rmse <= cfg_.pnp_max_rmse && motion_ok) {
+                curr_frame_->pose_cw = candidate_pose;
+                inliers_cnt = (int)inliers.size();
+                status_.tracking_valid = true;
+                status_.pose_method = "LK_PNP";
+                status_.inlier_ratio = ratio;
+                status_.pose_rmse = rmse;
+                status_.translation_delta = translation;
+                status_.rotation_delta = rotation;
+                for (int idx : inliers) {
+                    if (idx >= 0 && idx < (int)kp_idx.size()) {
+                        auto& mp = curr_frame_->map_points[kp_idx[idx]];
+                        if (mp) mp->observed_count++;
+                    }
                 }
+                updateStatus((int)pts3d.size(), inliers_cnt, 0.0);
+                return curr_frame_->pose_cw;
             }
-            updateStatus((int)pts3d.size(), inliers_cnt, 0.0);
-            return curr_frame_->pose_cw;
         }
     }
 
@@ -615,15 +748,24 @@ bool VisualOdometry::tryRelocalize() {
     // 防止连续丢失时 Atlas 越大、单帧重定位开销越高。
     std::vector<std::pair<unsigned long, Frame::Ptr>> candidates;
     constexpr int kMaxRelocTries = 60;
-    for (auto it = atlas_->submaps().rbegin();
-         it != atlas_->submaps().rend() && (int)candidates.size() < kMaxRelocTries; ++it) {
-        auto kfs = it->map->getAllKeyFrames();
+    auto append_submap = [&](const Submap& submap) {
+        if ((int)candidates.size() >= kMaxRelocTries) return;
+        auto kfs = submap.map->getAllKeyFrames();
         int per_map = 0;
         for (auto kf_it = kfs.rbegin();
              kf_it != kfs.rend() && per_map < 30 && (int)candidates.size() < kMaxRelocTries;
              ++kf_it, ++per_map) {
-            candidates.emplace_back(it->id, *kf_it);
+            candidates.emplace_back(submap.id, *kf_it);
         }
+    };
+    const auto* active = atlas_->activeSubmap();
+    if (active) append_submap(*active);
+    // 断开的子地图优先尝试回到已有全局地图，恢复可用于 ATE 的全局位姿。
+    for (auto it = atlas_->submaps().rbegin(); it != atlas_->submaps().rend(); ++it) {
+        if ((!active || it->id != active->id) && it->connected) append_submap(*it);
+    }
+    for (auto it = atlas_->submaps().rbegin(); it != atlas_->submaps().rend(); ++it) {
+        if ((!active || it->id != active->id) && !it->connected) append_submap(*it);
     }
     if (candidates.empty()) return false;
 
@@ -637,7 +779,9 @@ bool VisualOdometry::tryRelocalize() {
     unsigned long best_submap_id = 0;
 
     // 对单个关键帧做 PnP 匹配，内点达标(20)即返回 true
-    auto try_kf = [&](const Frame::Ptr& kf) -> bool {
+    double best_ratio = 0.0;
+    double best_rmse = std::numeric_limits<double>::infinity();
+    auto try_kf = [&](unsigned long submap_id, const Frame::Ptr& kf) -> bool {
         auto matches = feature_matcher_.match(kf, curr_frame_, cfg_.match_ratio, true);
         // 重定位用较低门槛（min_matches_init=100 是初始化专用，RANSAC 后常达不到）
         if ((int)matches.size() < 30) return false;
@@ -658,20 +802,28 @@ bool VisualOdometry::tryRelocalize() {
         bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
                                      cv::Mat(), rvec, tvec,
                                      false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
-        if (ok && (int)inliers.size() > best_inliers) {
+        const double ratio = pts3d.empty() ? 0.0 : (double)inliers.size() / pts3d.size();
+        const double rmse = ok
+            ? pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers)
+            : std::numeric_limits<double>::infinity();
+        const int reloc_min_inliers = std::max(20, cfg_.pnp_min_inliers);
+        if (ok && (int)inliers.size() >= reloc_min_inliers
+            && ratio >= std::max(0.4, cfg_.pnp_min_inlier_ratio)
+            && rmse <= cfg_.pnp_max_rmse
+            && (int)inliers.size() > best_inliers) {
             best_inliers = (int)inliers.size();
             best_pose = matToSE3(cv::Mat(rvec), tvec);
             best_kf = kf;
+            best_submap_id = submap_id;
+            best_ratio = ratio;
+            best_rmse = rmse;
         }
-        return best_inliers >= 20;
+        return best_inliers >= reloc_min_inliers;
     };
 
     // 最近关键帧优先；如果当前子地图失效，继续尝试历史子地图。
     for (const auto& [submap_id, kf] : candidates) {
-        if (try_kf(kf)) {
-            best_submap_id = submap_id;
-            break;
-        }
+        if (try_kf(submap_id, kf)) break;
     }
 
     if (best_inliers >= 20) {
@@ -679,6 +831,10 @@ bool VisualOdometry::tryRelocalize() {
         map_ = atlas_->activeMap();
         curr_frame_->pose_cw = best_pose;
         ref_frame_ = best_kf;
+        status_.tracking_valid = true;
+        status_.pose_method = "RELOCALIZE";
+        status_.inlier_ratio = best_ratio;
+        status_.pose_rmse = best_rmse;
         LOG_INFO("Relocalized in submap " << best_submap_id
                  << "! inliers=" << best_inliers);
         updateStatus(0, best_inliers, 0.0);
@@ -838,7 +994,10 @@ bool VisualOdometry::needNewKeyFrame() const {
     // 单目尺度归一化后位移小——共用阈值会导致双目每帧插 KF
     double kf_trans = camera_->hasPerFrameDepth()
         ? cfg_.keyframe_translation_stereo : cfg_.keyframe_translation;
-    return dtrans > kf_trans || drot > cfg_.keyframe_rotation || weak_match;
+    const bool max_interval = curr_frame_->id - last_kf_frame_id_
+        >= (unsigned long)cfg_.max_keyframe_interval;
+    return dtrans > kf_trans || drot > cfg_.keyframe_rotation
+        || weak_match || max_interval;
 }
 
 std::vector<Vec3> VisualOdometry::getTrajectory() const {

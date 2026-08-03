@@ -15,6 +15,7 @@ struct Submap {
     Map::Ptr map;
     SE3 origin_Twc;
     bool frozen = false;
+    bool connected = true;  // 是否已通过重定位/约束连接到全局世界系
 };
 
 class Atlas {
@@ -24,7 +25,7 @@ public:
     Atlas() = default;
 
     /// 创建并激活一个子地图。origin_Twc 是新子地图原点在全局系中的位姿。
-    Submap& createSubmap(const SE3& origin_Twc);
+    Submap& createSubmap(const SE3& origin_Twc, bool connected = true);
 
     /// 激活已有子地图，用于后续重定位回旧地图。
     bool activate(unsigned long id);
