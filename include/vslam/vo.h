@@ -7,6 +7,7 @@
 #include "vslam/atlas.h"
 #include "vslam/feature.h"
 #include "vslam/loop_closure.h"
+#include "vslam/optimizer.h"
 #include <string>
 
 namespace vslam {
@@ -121,6 +122,9 @@ public:
     /// 获取估计轨迹中的相机位置（世界系 C_w）
     std::vector<Vec3> getTrajectory() const;
 
+    /// 获取有效帧的完整位姿轨迹（T_cw，与 getTrajectory 顺序一致）
+    std::vector<SE3> getPoseTrajectory() const { return pose_trajectory_; }
+
     /// 是否应该创建新的关键帧
     bool needNewKeyFrame() const;
 
@@ -161,8 +165,8 @@ private:
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
     void insertKeyFrame();              // 关键帧插入 + 三角化 + BA
-    /// (Phase 2) 回环校正：Sim3 传播 + 位姿图优化 + 全局 BA + 轨迹更新
-    void handleLoopCorrection(const Sim3& sim3_loop_to_curr,
+    /// (Phase 2) 回环校正：位姿图优化 + 地图点/逐帧轨迹同步 + 全局 BA
+    void handleLoopCorrection(const SE3& T_loop_curr,
                               const Frame::Ptr& kf_curr, const Frame::Ptr& kf_loop);
     /// 按共视地图点数选取 Local BA 窗口（含当前关键帧，最早帧锚定）
     std::vector<Frame::Ptr> selectLocalWindow(int n) const;
@@ -183,9 +187,11 @@ private:
 
     FeatureMatcher feature_matcher_;
 
-    // 轨迹记录：相机光心在世界系中的位置 C_w（不是 T_cw.t）
-    std::vector<Vec3> trajectory_;
+    // 轨迹记录：保存完整 T_cw，Viewer 需要时再提取相机光心 C_w
+    std::vector<SE3> pose_trajectory_;       // 有效帧 T_cw（回环后同步修正）
     std::vector<unsigned long> traj_frame_ids_;  // 轨迹点对应帧号（回环校正用）
+    std::vector<LoopEdge> odometry_edges_;   // KF 插入时冻结，不能从优化后位姿重算
+    std::vector<LoopEdge> loop_edges_;       // 累积保留历史回环约束
 
     // ---- Phase 2 回环状态 ----
     std::unique_ptr<LoopClosure> loop_closure_;

@@ -824,6 +824,7 @@ void test_sim3() {
 // Phase 2: 位姿图优化（回环约束校正累积漂移）
 // ============================================================
 void test_pose_graph() {
+#ifdef HAS_G2O
     TEST("位姿图优化：回环约束校正累积漂移") {
         const int N = 10;
         std::mt19937 rng(7);
@@ -859,13 +860,21 @@ void test_pose_graph() {
         double err_before = (est[N - 1].t - gt[N - 1].t).norm();
         assert(err_before > 1.0);
 
+        // 冻结每个 KF 插入时得到的里程计相对测量。
+        std::vector<vslam::LoopEdge> odometry_edges;
+        for (int i = 1; i < N; i++) {
+            odometry_edges.push_back({
+                (unsigned long)(i - 1), (unsigned long)i,
+                est[i - 1].inverse() * est[i], 1.0});
+        }
+
         // 回环边：末帧 → 首帧（已知真实回环约束，高置信）
         vslam::LoopEdge le;
         le.a = 0;
         le.b = (unsigned long)(N - 1);
         le.T_rel = gt[0].inverse() * gt[N - 1];  // X_0⁻¹·X_{N-1} 的期望值
         le.weight = 10.0;
-        vslam::Optimizer::poseGraphOptimization(map, {le});
+        vslam::Optimizer::poseGraphOptimization(map, odometry_edges, {le});
 
         // 优化后末帧误差应显著下降
         vslam::SE3 Twc_after = map->getKeyFrame((unsigned long)(N - 1))->pose_cw.inverse();
@@ -874,6 +883,13 @@ void test_pose_graph() {
         assert(err_after < err_before * 0.2);
         assert(err_after < 0.5);
     } TEST_PASS();
+#else
+    TEST("位姿图优化：回环约束校正累积漂移") {
+        auto map = std::make_shared<vslam::Map>();
+        assert(!vslam::Optimizer::poseGraphOptimization(map, {}, {}));
+        std::cout << "SKIPPED (built without g2o)";
+    } TEST_PASS();
+#endif
 }
 
 // ============================================================
@@ -881,7 +897,7 @@ void test_pose_graph() {
 // ============================================================
 void test_loop_closure() {
 #ifdef HAS_DBOW3
-    TEST("LoopClosure 合成回环：词袋命中 + PnP 验证 + Sim3 尺度≈1") {
+    TEST("LoopClosure 合成回环：词袋命中 + PnP 验证 + SE3 回环边") {
         // 相机（合成针孔）
         auto cam = std::make_shared<vslam::MonocularCamera>();
         cam->fx = cam->fy = 500; cam->cx = 320; cam->cy = 240;
@@ -983,11 +999,15 @@ void test_loop_closure() {
         assert(cand != nullptr);
         assert(cand->id < last_kf->id);
 
-        // 几何验证：PnP 内点足够 + Sim3 尺度 ≈ 1（无尺度变化）
-        vslam::Sim3 sim3;
-        assert(lc.verifyLoop(last_kf, cand, sim3));
-        std::cout << " (scale=" << sim3.s << ")";
-        assert(std::abs(sim3.s - 1.0) < 0.05);
+        // 几何验证：PnP 直接输出 loop→curr 的位姿图 SE3 测量。
+        // 它应与无漂移合成真值一致，不依赖 last_kf 中保存的 VO 漂移位姿。
+        last_kf->pose_cw.t += vslam::Vec3(3.0, -2.0, 1.0);
+        vslam::SE3 T_loop_curr;
+        assert(lc.verifyLoop(last_kf, cand, T_loop_curr));
+        const vslam::SE3 expected = cand->pose_cw * poses.back();
+        assert(T_loop_curr.t.isApprox(expected.t, 0.1));
+        assert(T_loop_curr.q.toRotationMatrix().isApprox(
+            expected.q.toRotationMatrix(), 0.02));
 
         // 负例：中段帧（id 20，所有高分候选都在时间窗内）应返回 nullptr
         assert(mid_kf != nullptr);

@@ -7,6 +7,7 @@
 #include <Eigen/SVD>
 
 #include <set>
+#include <unordered_map>
 #include <algorithm>
 #include <ranges>
 #include <limits>
@@ -238,7 +239,7 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     // pose_cw.t 是世界原点在相机系中的坐标，不是相机位置。
     // 原地旋转时它会随 R_cw 绕圈；轨迹必须记录相机光心 C_w = -R_cw^T t_cw。
     if (status_.pose_valid) {
-        trajectory_.push_back(curr_frame_->pose_cw.camera_position());
+        pose_trajectory_.push_back(curr_frame_->pose_cw);
         traj_frame_ids_.push_back(curr_frame_->id);  // 回环校正定位漂移段用
     }
     return curr_frame_->pose_cw;
@@ -432,6 +433,9 @@ bool VisualOdometry::tryInitialize() {
 
     map_->insertKeyFrame(ref_frame_);
     map_->insertKeyFrame(curr_frame_);
+    odometry_edges_.push_back({
+        ref_frame_->id, curr_frame_->id,
+        ref_frame_->pose_cw * curr_frame_->pose_cw.inverse(), 1.0});
     last_kf_frame_id_ = curr_frame_->id;   // 初始化插入的两个关键帧也参与冷却
 
     LOG_INFO("Init OK! parallax=" << parallax << " inliers=" << inliers
@@ -881,6 +885,7 @@ bool VisualOdometry::tryRelocalize() {
 // 关键帧插入 + 三角化 + Local BA
 // ============================================================
 void VisualOdometry::insertKeyFrame() {
+    const Frame::Ptr prev_kf = ref_frame_;
     map_->insertKeyFrame(curr_frame_);
     // 双目/RGB-D：当前帧有视差/深度的特征直接建点（绝对尺度）
     createMapPointsFromStereo(curr_frame_);
@@ -905,6 +910,21 @@ void VisualOdometry::insertKeyFrame() {
     if (cfg_.enable_local_ba)
         Optimizer::localBundleAdjustment(camera_, map_, window, cfg_.local_ba_iterations);
 
+    // Local BA 和新点关联完成后冻结相邻 KF 测量；后续位姿图不得从已优化
+    // 轨迹重算它，否则会把上一次闭环结果误当成新的里程计观测。
+    if (prev_kf) {
+        std::set<unsigned long> prev_mp_ids;
+        for (const auto& mp : prev_kf->map_points)
+            if (mp) prev_mp_ids.insert(mp->id);
+        int covisibility = 0;
+        for (const auto& mp : curr_frame_->map_points)
+            if (mp && prev_mp_ids.count(mp->id)) covisibility++;
+        odometry_edges_.push_back({
+            prev_kf->id, curr_frame_->id,
+            prev_kf->pose_cw * curr_frame_->pose_cw.inverse(),
+            1.0 + std::log2(1.0 + covisibility)});
+    }
+
     // ============================================================
     // Phase 2 回环钩子：新关键帧入词袋数据库；每 N 个关键帧检测一次。
     // 放在 Local BA 之后，避免两处位姿修改互相干扰。
@@ -920,9 +940,17 @@ void VisualOdometry::insertKeyFrame() {
             if (cooled) {
                 auto cand = loop_closure_->detectLoop(curr_frame_);
                 if (cand) {
-                    Sim3 sim3;
-                    if (loop_closure_->verifyLoop(curr_frame_, cand, sim3))
-                        handleLoopCorrection(sim3, curr_frame_, cand);
+                    // DBoW3 数据库跨 Atlas 子地图缓存；当前尚未实现跨尺度
+                    // 子地图融合，不能把另一张 map 的候选伪装成本图闭环。
+                    if (!map_->getKeyFrame(cand->id)) {
+                        LOG_WARN("LoopClosure: cross-submap candidate kf#"
+                                 << cand->id << " rejected");
+                        updateStatus(status_.matches, status_.inliers, status_.parallax);
+                        return;
+                    }
+                    SE3 T_loop_curr;
+                    if (loop_closure_->verifyLoop(curr_frame_, cand, T_loop_curr))
+                        handleLoopCorrection(T_loop_curr, curr_frame_, cand);
                 }
             }
         }
@@ -932,55 +960,97 @@ void VisualOdometry::insertKeyFrame() {
 }
 
 // ============================================================
-// Phase 2 回环校正：Sim3 传播 → 位姿图优化 → 全局 BA → 轨迹更新
+// Phase 2 回环校正：位姿图优化 → 地图点同步 → 全局 BA → 逐帧轨迹同步
 // ============================================================
-void VisualOdometry::handleLoopCorrection(const Sim3& sim3_loop_to_curr,
+void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
                                           const Frame::Ptr& kf_curr,
                                           const Frame::Ptr& kf_loop) {
-    // 1. 合成 S_global：当前子地图坐标系 U → 回环子地图坐标系 W。
-    //    回环尺度下 kf_curr 的位姿 = S ∘ T_cw_loop（相似变换组合）；
-    //    把 VO 坐标系拉回回环坐标系的变换：
-    //    S_global = T_cw_curr_new⁻¹ · T_cw_curr_old
-    const Mat44 T_cw_loop = kf_loop->pose_cw.matrix();
-    const Mat44 T_cw_curr_new = sim3_loop_to_curr.matrix() * T_cw_loop;
-    const Sim3 S_global = Sim3::fromMatrix(
-        T_cw_curr_new.inverse() * kf_curr->pose_cw.matrix());
-
-    // 2. 关键帧位姿传播：整个当前子地图统一变换（整体相似变换保持内部
-    //    相对关系 → 无跳变；多次回环校正自然收敛，不会叠加切碎轨迹）：
-    //    相机位置作为点变换 C_w' = s·R·C_w + t（尺度进入平移），
-    //    朝向旋转合成 R_wc' = R_S·R_wc —— 位姿始终是欧氏变换（SE3）。
+    // 1. 保存优化前位姿。旧实现先对全部 KF/MP 施加同一 Sim3，这只会更换
+    //    全局坐标系，完全不改变 loop ↔ curr 的相对残差；这里直接让位姿图
+    //    在固定首帧的前提下沿轨迹分配闭环误差。
     auto all_kfs = map_->getAllKeyFrames();
-    for (auto& kf : all_kfs) {
-        SE3 Twc = kf->pose_cw.inverse();
-        const Vec3 C_new = S_global * Twc.t;
-        const Eigen::Quaterniond q_new = S_global.q * Twc.q;
-        kf->pose_cw = SE3(q_new, C_new).inverse();
-    }
+    std::unordered_map<unsigned long, SE3> old_pose_cw;
+    for (const auto& kf : all_kfs) old_pose_cw.emplace(kf->id, kf->pose_cw);
 
-    // 3. 地图点更新：全部（整个子地图统一变换）
-    for (auto& mp : map_->getAllMapPoints())
-        mp->pos_w = S_global * mp->pos_w;
-
-    // 4. 位姿图优化：相邻边（里程计约束）+ 回环边。
-    //    回环边用 SE3（丢尺度）——尺度已由 Sim3 传播吸收（决策 §4.4）。
+    // 2. 累积保留历史回环边，避免后一次闭环丢掉前一次约束。
     LoopEdge le;
     le.a = kf_loop->id;
     le.b = kf_curr->id;
-    le.T_rel = sim3_loop_to_curr.toSE3().inverse();  // X_b = X_a · T_rel ⇒ T_rel = S⁻¹
+    le.T_rel = T_loop_curr;
     le.weight = 10.0;  // 回环约束高置信
-    Optimizer::poseGraphOptimization(map_, {le});
+    loop_edges_.push_back(le);
+    if (!Optimizer::poseGraphOptimization(map_, odometry_edges_, loop_edges_)) {
+        loop_edges_.pop_back();
+        LOG_WARN("Loop correction skipped: pose graph backend unavailable or constraints invalid");
+        return;
+    }
 
-    // 5. 全局 BA：回环后全图精修（motion-only，点坐标已由 Sim3 传播修正）
-    Optimizer::globalBundleAdjustment(camera_, map_);
+    // 3. 位姿图只优化关键帧。地图点按其最早观测关键帧的位姿增量同步，
+    //    保持该关键帧中的局部坐标不变，再交给全局 BA 做小量精修。
+    std::unordered_map<unsigned long, unsigned long> mp_reference_kf;
+    for (const auto& kf : all_kfs) {
+        for (const auto& mp : kf->map_points) {
+            if (mp) mp_reference_kf.emplace(mp->id, kf->id);
+        }
+    }
+    for (auto& mp : map_->getAllMapPoints()) {
+        auto ref = mp_reference_kf.find(mp->id);
+        if (ref == mp_reference_kf.end()) continue;
+        auto old = old_pose_cw.find(ref->second);
+        auto kf = map_->getKeyFrame(ref->second);
+        if (old == old_pose_cw.end() || !kf) continue;
+        const SE3 correction = kf->pose_cw.inverse() * old->second;
+        mp->pos_w = correction * mp->pos_w;
+    }
 
-    // 6. 轨迹更新：全部轨迹点应用同一变换（保证 TUM 输出与地图一致）
-    for (auto& p : trajectory_) p = S_global * p;
+    // 4. 全局 BA：地图点固定、优化关键帧位姿；使用配置的迭代次数。
+    Optimizer::globalBundleAdjustment(camera_, map_, cfg_.global_ba_iterations);
+
+    // 5. 非关键帧不在位姿图中。将相邻关键帧的最终校正插值后施加到完整
+    //    T_cw 轨迹，既保留朝向供 TUM 输出，也避免整段只用一个刚体变换。
+    std::vector<std::pair<unsigned long, SE3>> corrections;
+    corrections.reserve(all_kfs.size());
+    for (const auto& kf : all_kfs) {
+        auto old = old_pose_cw.find(kf->id);
+        if (old == old_pose_cw.end()) continue;
+        corrections.emplace_back(kf->id, kf->pose_cw.inverse() * old->second);
+    }
+    for (size_t i = 0; i < pose_trajectory_.size() && i < traj_frame_ids_.size(); i++) {
+        const unsigned long frame_id = traj_frame_ids_[i];
+        auto upper = std::lower_bound(
+            corrections.begin(), corrections.end(), frame_id,
+            [](const auto& item, unsigned long id) { return item.first < id; });
+
+        SE3 correction;
+        if (upper != corrections.end() && upper->first == frame_id) {
+            // 关键帧直接采用最终优化结果，避免历史 Local BA 已经让缓存轨迹
+            // 与 old_pose_cw 存在微小偏差。
+            auto kf = map_->getKeyFrame(frame_id);
+            if (kf) {
+                pose_trajectory_[i] = kf->pose_cw;
+                continue;
+            }
+            correction = upper->second;
+        } else if (upper == corrections.begin()) {
+            correction = upper->second;
+        } else if (upper == corrections.end()) {
+            correction = corrections.back().second;
+        } else {
+            const auto& [id1, c1] = *upper;
+            const auto& [id0, c0] = *(upper - 1);
+            const double alpha = static_cast<double>(frame_id - id0) /
+                                 static_cast<double>(id1 - id0);
+            correction.q = c0.q.slerp(alpha, c1.q).normalized();
+            correction.t = (1.0 - alpha) * c0.t + alpha * c1.t;
+        }
+        const SE3 Twc_new = correction * pose_trajectory_[i].inverse();
+        pose_trajectory_[i] = Twc_new.inverse();
+    }
 
     loop_closure_count_++;
     last_loop_kf_id_ = kf_curr->id;  // 更新回环校正冷却基准
     LOG_INFO("Loop closed! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
-             << " scale=" << sim3_loop_to_curr.s << " (total " << loop_closure_count_ << ")");
+             << " (total " << loop_closure_count_ << ")");
 }
 
 // ============================================================
@@ -1108,7 +1178,11 @@ bool VisualOdometry::needNewKeyFrame() const {
 }
 
 std::vector<Vec3> VisualOdometry::getTrajectory() const {
-    return trajectory_;
+    std::vector<Vec3> trajectory;
+    trajectory.reserve(pose_trajectory_.size());
+    for (const auto& pose_cw : pose_trajectory_)
+        trajectory.push_back(pose_cw.camera_position());
+    return trajectory;
 }
 
 } // namespace vslam

@@ -12,7 +12,6 @@
 #include <g2o/types/slam3d/vertex_se3.h>      // Phase 2 位姿图：VertexSE3
 #include <g2o/types/slam3d/edge_se3.h>        // Phase 2 位姿图：EdgeSE3
 
-#include <set>
 #include <unordered_map>
 #endif
 
@@ -222,23 +221,26 @@ void Optimizer::localBundleAdjustment(
 #endif
 }
 
-void Optimizer::globalBundleAdjustment(const Camera& camera, Map::Ptr map) {
+void Optimizer::globalBundleAdjustment(const Camera& camera, Map::Ptr map,
+                                       int max_iterations) {
     // 结构同 localBA，但使用所有关键帧和地图点
     auto all_kfs = map->getAllKeyFrames();
-    localBundleAdjustment(camera, map, all_kfs);
+    localBundleAdjustment(camera, map, all_kfs, max_iterations);
     LOG_INFO("Global BA complete");
 }
 
-void Optimizer::poseGraphOptimization(Map::Ptr map,
+bool Optimizer::poseGraphOptimization(Map::Ptr map,
+                                      const std::vector<LoopEdge>& odometry_edges,
                                       const std::vector<LoopEdge>& loop_edges) {
 #ifndef HAS_G2O
     (void)map;
+    (void)odometry_edges;
     (void)loop_edges;
     LOG_WARN("Pose graph optimization skipped: vslam was built without g2o");
-    return;
+    return false;
 #else
     auto kfs = map->getAllKeyFrames();
-    if (kfs.size() < 2) return;
+    if (kfs.size() < 2) return false;
 
     // ========================================================
     // 1. 构建优化器（位姿图专用 <6,6> solver：纯 6D 位姿顶点）
@@ -275,25 +277,15 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
     };
 
     // ========================================================
-    // 3. 相邻边（里程计约束）：kf[i-1] → kf[i]
-    //    T_rel = X_prev⁻¹·X_curr = T_cw_prev · T_wc_curr
-    //    信息权重按共视地图点数加权（共视多 → 置信高）
+    // 3. 里程计边：使用关键帧插入时冻结的测量。不能从上一次优化后的
+    //    位姿重算，否则会把优化结果误当成新的观测并逐次锁死。
     // ========================================================
     int edge_count = 0;
-    for (size_t i = 1; i < kfs.size(); i++) {
-        auto& kf_prev = kfs[i - 1];
-        auto& kf_curr = kfs[i];
-        SE3 T_rel = kf_prev->pose_cw * kf_curr->pose_cw.inverse();
-
-        std::set<unsigned long> prev_mp;
-        for (auto& mp : kf_prev->map_points)
-            if (mp) prev_mp.insert(mp->id);
-        int cov = 0;
-        for (auto& mp : kf_curr->map_points)
-            if (mp && prev_mp.count(mp->id)) cov++;
-        double weight = 1.0 + std::log2(1.0 + cov);
-
-        add_edge(kf_vid[kf_prev->id], kf_vid[kf_curr->id], T_rel, weight);
+    for (const auto& edge : odometry_edges) {
+        auto it_a = kf_vid.find(edge.a);
+        auto it_b = kf_vid.find(edge.b);
+        if (it_a == kf_vid.end() || it_b == kf_vid.end()) continue;
+        add_edge(it_a->second, it_b->second, edge.T_rel, edge.weight);
         edge_count++;
     }
 
@@ -312,7 +304,7 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     if (edge_count < 2) {
         LOG_WARN("Pose graph: too few edges (" << edge_count << "), skipping");
-        return;
+        return false;
     }
 
     // ========================================================
@@ -331,6 +323,7 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     LOG_INFO("Pose graph: optimized " << kfs.size() << " keyframes, "
              << edge_count << " edges");
+    return true;
 #endif
 }
 

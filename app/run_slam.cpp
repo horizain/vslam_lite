@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <format>
 #include <chrono>
+#include <algorithm>
 
 int main(int argc, char** argv) {
     std::string input_path;
@@ -98,12 +99,8 @@ int main(int argc, char** argv) {
     int frame_count = 0;
     auto start_time = std::chrono::steady_clock::now();
 
-    struct TrajectoryRecord {
-        double timestamp;
-        vslam::SE3 pose_cw;
-        vslam::VisualOdometry::Status status;
-    };
-    std::vector<TrajectoryRecord> traj_saved;
+    // VO 内部保留并回环修正完整 T_cw；这里只保存与有效位姿一一对应的时间戳。
+    std::vector<double> valid_timestamps;
 
     LOG_INFO("Starting SLAM pipeline (loop closure "
              << (vo.loopClosureEnabled() ? "ON" : "OFF")
@@ -118,7 +115,7 @@ int main(int argc, char** argv) {
             : vo.addFrame(image, image_right, timestamp);
 
         auto st = vo.getStatus();
-        traj_saved.push_back({timestamp, pose, st});
+        if (st.pose_valid) valid_timestamps.push_back(timestamp);
 
         std::string state_str;
         switch (st.state) {
@@ -155,22 +152,26 @@ int main(int argc, char** argv) {
     if (!headless) viewer.stop();
 
     // ---- 保存轨迹（TUM 格式，回环校正后的全局位姿）----
-    if (!traj_saved.empty()) {
+    const auto pose_trajectory = vo.getPoseTrajectory();
+    if (!pose_trajectory.empty()) {
+        if (valid_timestamps.size() != pose_trajectory.size()) {
+            LOG_ERROR("Trajectory timestamp/pose size mismatch: "
+                      << valid_timestamps.size() << " vs " << pose_trajectory.size());
+        }
         std::ofstream ofs(traj_path);
         if (ofs.is_open()) {
             ofs << std::fixed << std::setprecision(6);
-            size_t valid_count = 0;
-            for (const auto& record : traj_saved) {
-                if (!record.status.pose_valid) continue;
-                vslam::SE3 Twc = record.pose_cw.inverse();
-                ofs << record.timestamp << " "
+            const size_t valid_count = std::min(valid_timestamps.size(),
+                                                pose_trajectory.size());
+            for (size_t i = 0; i < valid_count; i++) {
+                vslam::SE3 Twc = pose_trajectory[i].inverse();
+                ofs << valid_timestamps[i] << " "
                     << Twc.t.x() << " " << Twc.t.y() << " " << Twc.t.z() << " "
                     << Twc.q.x() << " " << Twc.q.y() << " " << Twc.q.z() << " "
                     << Twc.q.w() << "\n";
-                valid_count++;
             }
             LOG_INFO("Trajectory saved to " << traj_path
-                     << " (" << valid_count << "/" << traj_saved.size()
+                     << " (" << valid_count << "/" << valid_timestamps.size()
                      << " globally valid poses, TUM format)");
         } else {
             LOG_ERROR("Cannot write trajectory to " << traj_path);

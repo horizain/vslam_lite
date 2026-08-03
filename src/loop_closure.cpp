@@ -148,9 +148,9 @@ Frame::Ptr LoopClosure::detectLoop(Frame::Ptr kf) {
 }
 
 bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
-                             Sim3& sim3_loop_to_curr) {
+                             SE3& T_loop_curr) {
 #ifndef HAS_DBOW3
-    (void)kf_curr; (void)kf_loop; (void)sim3_loop_to_curr;
+    (void)kf_curr; (void)kf_loop; (void)T_loop_curr;
     return false;
 #else
     if (!camera_ || !kf_curr || !kf_loop) return false;
@@ -166,14 +166,12 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
     //    2D = kf_curr 侧特征点像素
     std::vector<cv::Point3f> pts3d;
     std::vector<cv::Point2f> pts2d;
-    std::vector<size_t> used_idx;  // 命中地图点的匹配下标
     for (size_t i = 0; i < matches.size(); i++) {
         auto mp = kf_loop->map_points[matches[i].trainIdx];
         if (!mp) continue;
         const auto& kp = kf_curr->keypoints[matches[i].queryIdx];
         pts3d.emplace_back(mp->pos_w.x(), mp->pos_w.y(), mp->pos_w.z());
         pts2d.emplace_back(kp.pt.x, kp.pt.y);
-        used_idx.push_back(i);
     }
     if (pts3d.size() < 8) {
         LOG_WARN("LoopClosure: too few 3D-2D correspondences (" << pts3d.size() << ")");
@@ -197,29 +195,14 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
         return false;
     }
 
-    // 5. Sim3 求解：内点 3D-3D 对应 p_loop_c ↔ p_curr_c
-    //    （同一世界点经两个相机位姿变换到各自相机系）
-    SE3 T_cw_loop = kf_loop->pose_cw;
-    SE3 T_cw_curr = matToSE3(rvec, tvec);
-    std::vector<Vec3> src, dst;  // src = p_loop_c（回环帧系），dst = p_curr_c（当前帧系）
-    src.reserve(inliers.size());
-    dst.reserve(inliers.size());
-    for (int idx : inliers) {
-        auto mp = kf_loop->map_points[matches[used_idx[idx]].trainIdx];
-        if (!mp) continue;
-        src.push_back(T_cw_loop * mp->pos_w);
-        dst.push_back(T_cw_curr * mp->pos_w);
-    }
-    if (src.size() < 8) return false;
-
-    Sim3 sim3;
-    if (!Sim3::estimate(src, dst, sim3)) {
-        LOG_WARN("LoopClosure: Sim3 estimate failed (degenerate points)");
-        return false;
-    }
-    sim3_loop_to_curr = sim3;
+    // 5. PnP 已直接给出当前帧在回环地图坐标中的 T_cw。由此构造
+    //    位姿图测量 X_loop^-1 * X_curr（X 为 T_wc）。旧实现把同一批世界点
+    //    分别乘两个 SE3 后做 Umeyama，尺度在数学上恒为 1，不能观测单目尺度，
+    //    再把结果作为 Sim3 传播反而会引入错误的全图 gauge 变换。
+    const SE3 T_cw_curr_in_loop = matToSE3(rvec, tvec);
+    T_loop_curr = kf_loop->pose_cw * T_cw_curr_in_loop.inverse();
     LOG_INFO("LoopClosure: verified! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
-             << " inliers=" << inliers.size() << " scale=" << sim3.s);
+             << " inliers=" << inliers.size());
     return true;
 #endif
 }

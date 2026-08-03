@@ -22,7 +22,7 @@
 |---|--------|------|
 | 1 | KITTI 00 全程运行 | 无 LOST，FPS ≥ 20（与 Phase 1 同量级） |
 | 2 | 回环正确性 | 检测出的回环中 ≥ 90% 通过几何验证且为真实回环（KITTI 00 已知 0→末端闭合） |
-| 3 | ATE 提升 | 全量 ATE RMSE 从 Phase 1 的 ~133.6m 显著下降（目标 ≤ 50m，Sim3 同时校正尺度漂移） |
+| 3 | ATE 不退化 | SE3 回环版全量 ATE 不高于 VO 基线；真正尺度修正和 ≤50m 目标留待 Sim3 位姿图实现 |
 | 4 | 回归 | 全部既有单元测试仍通过；新增 Sim3/回环/位姿图测试通过 |
 | 5 | 教学可读 | 每个新模块 ≤ 200 行，注释中文，可逐文件读懂 |
 
@@ -33,7 +33,7 @@
 | 组件 | 现状 | Phase 2 差距 |
 |------|------|--------------|
 | DBoW3 依赖 | `install_deps.sh` 已支持安装；CMake `find_package(DBoW3)` + `HAS_DBOW3` 已接入 | 本机实际安装；需要预训练词典文件（ORBvoc） |
-| `loop_closure.h/cpp` | 接口已留：`loadVocabulary` / `addKeyFrame` / `detectLoop` / `verifyLoop`，实现全 TODO | 完整实现（词袋加载、数据库增查、候选过滤、几何验证、Sim3 输出） |
+| `loop_closure.h/cpp` | 接口已留：`loadVocabulary` / `addKeyFrame` / `detectLoop` / `verifyLoop`，实现全 TODO | 完整实现（词袋加载、数据库增查、候选过滤、PnP 几何验证、SE3 回环边输出） |
 | `optimizer.cpp` | `localBundleAdjustment` ✅、`globalBundleAdjustment` ✅（转发 Local BA）、`poseGraphOptimization` ❌ TODO | 实现位姿图优化（相邻边 + 回环边）；全局 BA 增加回环后触发路径 |
 | `common.h` | 只有 `SE3` | 新增轻量 `Sim3`（含 Umeyama 求解） |
 | `vo.h/cpp` | 纯前端，关键帧插入后无回环钩子 | 增加回环开关/参数；关键帧插入后喂给 LoopClosure；回环校正后更新地图 |
@@ -61,12 +61,12 @@
                      │  每 N 个关键帧 detectLoop(kf)          │
                      │      │ 候选帧 + 分数过滤                │
                      │      ▼                                │
-                     │  verifyLoop(kf, kf_loop, sim3)        │
-                     │      │  PnP 几何验证 + Umeyama Sim3    │
-                     │      ▼                                │
-                     │  校正成功：Sim3 传播 + 地图点更新        │
+                     │  verifyLoop(kf, kf_loop, T_loop_curr) │
+                     │      │  PnP 几何验证 + SE3 回环约束     │
                      │      ▼                                │
                      │  Optimizer::poseGraphOptimization(map) │
+                     │      │  KF 位姿增量同步地图点/逐帧轨迹   │
+                     │      ▼                                │
                      │  Optimizer::globalBundleAdjustment(...)│
                      └──────────────────┬────────────────────┘
                                         ▼
@@ -121,7 +121,7 @@ struct Sim3 {
 bool loadVocabulary(const std::string& vocab_path);       // 加载 + 建库（DBoW3 Database::setVocabulary）
 void addKeyFrame(Frame::Ptr kf);                          // 计算 bow/feat 向量，db_->add，缓存 id
 Frame::Ptr detectLoop(Frame::Ptr kf);                     // 返回候选关键帧；nullptr 表示无回环
-bool verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop, Sim3& sim3_loop_to_curr); // 验证 + 输出 Sim3
+bool verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop, SE3& T_loop_curr); // 验证 + 输出位姿图边
 ```
 
 **detectLoop 候选过滤三步**：
@@ -129,17 +129,19 @@ bool verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop, Sim3& sim3_loop_to_curr)
 2. **时间过滤**：候选帧 id 与当前帧 id 差 < `temporal_window`（默认 30）→ 跳过（刚走过的路不算回环）；
 3. **分数过滤**：DBoW3 归一化分数 ≥ `min_score`（默认 0.3）→ 取最高分候选返回。
 
-**verifyLoop（几何验证 + Sim3 求解，教学简化版 ORB-SLAM 流程）**：
+**verifyLoop（几何验证 + SE3 回环约束）**：
 1. ORB 描述子匹配 kf_curr ↔ kf_loop（复用 `FeatureMatcher` 的 knn+ratio，不用基础矩阵 RANSAC）；
 2. 收集 3D-2D 对应：匹配对中 kf_loop 侧已关联地图点 `mp_loop`（回环尺度）↔ kf_curr 侧特征点像素；
 3. `solvePnPRansac` 求 kf_curr 在回环尺度下的位姿 `T_cw_curr'`；
 4. **内点判定**：内点数 ≥ `min_loop_inliers`（默认 30）且内点比例 ≥ `pnp_inlier_ratio`（默认 0.7）→ 验证通过；
-5. **Sim3 求解**：对内点中 kf_loop 关联的地图点，构造 3D-3D 对应
-   `p_loop_c = T_cw_loop · mp_loop_w` ↔ `p_curr_c = T_cw_curr' · mp_loop_w`，
-   `Sim3::estimate(p_loop_c, p_curr_c)` → `sim3_loop_to_curr`（含尺度比 s）；
+5. 直接构造位姿图测量
+   `T_loop_curr = T_cw_loop · (T_cw_curr')⁻¹`，满足
+   `T_wc_curr = T_wc_loop · T_loop_curr`；
 6. 返回 true。**不通过则返回 false**（候选被拒，不影响后续）。
 
-> 教学注记：真实 ORB-SLAM 用 Sim3Solver 做 RANSAC + 图优化迭代；本设计用"PnP 初值 → Umeyama 精化"，数学等价、实现短、可读性强，精度对教学级足够。
+> 教学注记：对同一批世界点分别施加两个 SE3 后再做 Umeyama，所得尺度理论上恒为 1，
+> 不能观测单目尺度漂移。本实现因此只声明 SE3 闭环能力；真正的尺度闭环需要两侧独立
+> 3D 地图点对应和 Sim3 位姿图，不能用全图统一缩放替代。
 
 ### 4.3 回环校正与地图更新（vo.cpp 内新增私有方法）
 
@@ -149,36 +151,35 @@ bool verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop, Sim3& sim3_loop_to_curr)
 1. `loop_closure_->addKeyFrame(kf)`（词袋入库）；
 2. 每 `loop_detection_interval`（默认 10）个关键帧触发一次检测：
    - `cand = loop_closure_->detectLoop(kf)`；无候选 → 跳过；
-   - `Sim3 sim3; ok = loop_closure_->verifyLoop(kf, cand, sim3)`；失败 → 跳过；
-   - 成功 → `handleLoopCorrection(sim3, kf, cand)`。
+   - `SE3 edge; ok = loop_closure_->verifyLoop(kf, cand, edge)`；失败 → 跳过；
+   - 成功 → `handleLoopCorrection(edge, kf, cand)`。
 
 `handleLoopCorrection`（新私有方法）：
-1. **Sim3 传播**：回环帧及其后续关键帧的位姿应用校正
-   `T_wc_i' = S_global · T_wc_i`，其中 `S_global` 由 `sim3_loop_to_curr` 与当前关键帧位姿合成（把当前子地图拉回回环子地图的全局坐标系）；关键帧 `pose_cw` 取逆回写；
-2. **地图点更新**：所有受影响地图点 `pos_w' = S_global · pos_w`；重建观测帧的 `map_points` 引用（仅位姿/坐标更新，引用关系不变）；
-3. **位姿图优化**：`Optimizer::poseGraphOptimization(map_, loop_edges)`；
-4. **全局 BA**：`Optimizer::globalBundleAdjustment(camera_, map_)`（全部关键帧+地图点，迭代数取 `global_ba_iterations`）；
-5. 更新 `trajectory_` 中受影响的历史轨迹点（与 Step 1 同一变换），保证输出的 TUM 轨迹与校正后地图一致；
-6. 状态栏/日志输出：`Loop closed! kf# -> kf#  scale=... inliers=...`。
+1. 关键帧插入时冻结里程计边；接受回环后累计保存所有历史回环边；
+2. 固定原始首帧，以完整的里程计边和回环边集合执行位姿图优化；
+3. 每个地图点按其最早观测关键帧的 `old_pose → new_pose` 增量同步一次；
+4. 执行全局 motion-only BA，迭代数取 `global_ba_iterations`；
+5. 对非关键帧插值相邻关键帧校正，更新完整 `T_cw` 历史，保证 TUM 位置和朝向均来自校正后轨迹；
+6. 状态栏/日志输出：`Loop closed! kf# -> kf#`。
 
 ### 4.4 位姿图优化（optimizer.cpp，g2o）
 
 **顶点**：所有关键帧（`g2o::VertexSE3Expmap`，T_wc 语义——沿用 localBA 的取逆约定）。
 
 **边**：
-- **相邻边**（里程计约束）：`kf[i-1] ↔ kf[i]` 的相对位姿 `T_rel = T_cw[i] · T_cw[i-1]⁻¹`（组合为 T_wc 后再取相对），信息矩阵按两帧共视地图点数加权（共视多 → 置信高）；
-- **回环边**（Sim3 约束）：`kf_loop ↔ kf_curr`，由 `sim3_loop_to_curr` 转 `g2o::EdgeSim3`（如 apt g2o 可用）或转 SE3 边（`sim3.toSE3()`，丢尺度但位姿图只优化位姿，尺度已由 Sim3 传播时吸收——**决策：回环边用 SE3 表示，尺度校正完全交给 Sim3 传播 + 全局 BA**，避免依赖 g2o Sim3 边，降低版本兼容风险）。
+- **相邻边**（里程计约束）：关键帧插入时冻结 `T_rel = T_cw_prev · T_wc_curr`，后续优化不得从已校正位姿重算；
+- **回环边**：PnP 直接输出 `kf_loop ↔ kf_curr` 的 SE3 测量；所有已接受回环联合优化。
 
 **固定**：第一个关键帧 `setFixed(true)` 锚定坐标系。
 
-**回写**：优化后所有关键帧 `pose_cw` 取逆写回；地图点坐标随最近关键帧的相对关系重投影更新（简化：地图点不动，仅位姿更新——全局 BA 紧接着做精细修正）。
+**回写**：优化后所有关键帧 `pose_cw` 取逆写回；地图点按最早观测关键帧的位姿增量同步。
 
 接口签名调整（`optimizer.h`）：
 
 ```cpp
 /// (Phase 2) 位姿图优化：相邻边 + 回环边校正全局漂移
-/// @param loop_edges  回环边列表：{kf_id_a, kf_id_b, 相对 SE3, 权重}
-static void poseGraphOptimization(Map::Ptr map,
+static bool poseGraphOptimization(Map::Ptr map,
+    const std::vector<LoopEdge>& odometry_edges,
     const std::vector<LoopEdge>& loop_edges = {});
 ```
 
@@ -221,8 +222,8 @@ LoopClosure:
 |--------|------|----------|
 | M0 依赖 | 安装 DBoW3（`bash scripts/install_deps.sh`）；获取 ORBvoc 词典（新增 `scripts/fetch_vocab.sh`，下载 ORB-SLAM2 的 `ORBvoc.txt.tar.gz` 并解压到 `config/`）；确认 CMake 输出 `DBoW3 found` | `cmake -S . -B build` 日志含 `HAS_DBOW3` |
 | M1 Sim3 | `common.h` 加 `Sim3` + `Sim3::estimate`（Umeyama） | 单元测试：合成点集（s=1.37, R, t）恢复误差 < 1e-6；逆/矩阵互转测试 |
-| M2 回环检测 | `loop_closure.cpp` 完整实现（词袋加载/入库/候选/验证/Sim3） | 单元测试：合成"先走远再回起点"场景，detectLoop 命中、verifyLoop 通过且尺度比 ≈ 1 |
-| M3 校正与优化 | `poseGraphOptimization`；`handleLoopCorrection`（Sim3 传播 + 全局 BA 触发） | 单元测试：合成漂移轨迹 + 回环约束 → 优化后位姿误差下降 |
+| M2 回环检测 | `loop_closure.cpp` 完整实现（词袋加载/入库/候选/PnP 验证/SE3 边） | 单元测试：合成"先走远再回起点"场景，detectLoop 命中、verifyLoop 输出真值附近的 SE3 |
+| M3 校正与优化 | 冻结里程计边；累计回环边；位姿图后同步地图点和完整轨迹 | 单元测试：合成漂移轨迹 + 回环约束 → 优化后位姿误差下降 |
 | M4 集成与评估 | `run_slam.cpp` + CMake；VO 钩子；KITTI 00 全程评估 | 验收标准表（§1）全部满足，写回 DEVELOPMENT_LOG |
 
 ---
@@ -231,7 +232,7 @@ LoopClosure:
 
 1. **Sim3 代数**：正变换、逆变换、`matrix()`/`fromMatrix` 互转、`toSE3` 丢尺度；
 2. **Sim3::estimate**：随机 s/R/t 下 Umeyama 恢复精度；退化输入（点数 < 3 / 共线）返回 false；
-3. **LoopClosure 合成回环**：构造两段轨迹（出发 → 绕行 → 回到起点附近），插入关键帧；验证 `detectLoop` 命中历史关键帧、`verifyLoop` 返回 true 且 `sim3.s ≈ 1.0`；负例（无回环）返回 nullptr/false；
+3. **LoopClosure 合成回环**：构造两段轨迹（出发 → 绕行 → 回到起点附近），插入关键帧；验证 `detectLoop` 命中历史关键帧、`verifyLoop` 返回与真值一致的 SE3；负例返回 nullptr/false；
 4. **位姿图优化**：合成带漂移的关键帧链 + 末端回环边 → 优化后累计漂移下降（量化断言）；
 5. **全局 BA 回归**：既有 `test_local_ba` 保持通过（改动不得破坏位姿语义）；
 6. **长期稳定性回归**：既有 `test_long_run_stability` 保持通过（LoopClosure 数据增长须有界——数据库只增关键帧词袋，数量与关键帧数线性，无额外泄漏）。
@@ -262,12 +263,12 @@ evo_ape tum slam_traj.txt kitti_gt.txt -a    # 对比回环版
 | 风险/决策 | 说明 | 处置 |
 |-----------|------|------|
 | 词典获取依赖网络 | ORBvoc 约 30MB 外部下载 | `fetch_vocab.sh` + 自训练兜底 |
-| apt g2o 的 Sim3 边可用性 | `g2o::EdgeSim3` 在部分版本缺失/语义差异 | 回环边用 SE3（决策，§4.4）；Sim3 只用于传播，不用于 g2o 边 |
-| 单目回环的全局尺度跳变 | Sim3 传播改变全局尺度，轨迹文件必须同步 | `handleLoopCorrection` 统一更新 trajectory_（§4.3-5） |
+| apt g2o 的 Sim3 边可用性 | `g2o::EdgeSim3` 在部分版本缺失/语义差异 | 当前回环边明确使用 SE3；尺度闭环留待独立 Sim3 位姿图实现 |
+| 单目尺度漂移 | PnP SE3 回环不能直接恢复尺度 | 不再伪造恒为 1 的 Sim3 或整体缩放地图；评估时明确记录此限制 |
 | 回环检测频率与实时性 | DBoW3 查询在关键帧数量大时变慢 | 每 N=10 个关键帧才检测一次；数据库只存词袋向量 |
 | 误回环 | 词袋误报会引入错误约束 | 三重过滤：分数 + 时间窗 + PnP 几何验证（内点比例 ≥ 0.7） |
 | run_vo / run_slam 行为分叉 | 回环开/关影响轨迹输出 | run_vo 固定关闭、run_slam 固定开启，yaml 开关仍可覆盖 |
-| 与既有 MiniAtlas 共存 | LOST 重建子地图后回环检测跨子地图 | LoopClosure 数据库全局唯一（跨子地图累积），Sim3 校正天然处理尺度比；不做子地图融合 |
+| 与既有 MiniAtlas 共存 | LOST 重建子地图后回环检测跨子地图 | 当前只对激活地图内可解析的边优化；跨尺度子地图融合留待 Sim3 图实现 |
 
 ---
 

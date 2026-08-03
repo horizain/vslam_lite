@@ -11,7 +11,7 @@ namespace vslam {
 
 /// 回环检测模块（Phase 2）
 ///
-/// 数据流：词袋检测(DBoW3) → 候选过滤（时间窗 + 分数）→ PnP 几何验证 → Sim3 输出。
+/// 数据流：词袋检测(DBoW3) → 候选过滤（时间窗 + 分数）→ PnP 几何验证 → SE3 回环约束。
 /// 只负责"检测 + 验证"，位姿/地图校正由 VisualOdometry::handleLoopCorrection 完成。
 class LoopClosure {
 public:
@@ -33,10 +33,11 @@ public:
     /// 候选过滤：DBoW3 Top-5 → 时间窗（跳过刚走过的路）→ 分数阈值。
     Frame::Ptr detectLoop(Frame::Ptr kf);
 
-    /// 几何一致性验证：ORB 匹配 → 3D-2D PnP → 内点判定 → Sim3 求解。
-    /// 成功时输出 sim3_loop_to_curr（回环帧相机系 → 当前帧相机系，含尺度比）。
+    /// 几何一致性验证：ORB 匹配 → 3D-2D PnP → 内点判定。
+    /// 成功时输出 T_loop_curr，满足 T_wc_curr = T_wc_loop * T_loop_curr，
+    /// 可直接作为位姿图中 loop → curr 的 EdgeSE3 测量。
     bool verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
-                    Sim3& sim3_loop_to_curr);
+                    SE3& T_loop_curr);
 
 private:
 #ifdef HAS_DBOW3
