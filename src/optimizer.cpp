@@ -43,9 +43,9 @@ void Optimizer::localBundleAdjustment(
     // 2. 添加相机参数
     // ========================================================
     auto* cam_params = new g2o::CameraParameters(
-        camera.fx,
-        g2o::Vector2(camera.cx, camera.cy),
-        0.0);  // baseline = 0 (monocular)
+        camera->fx,
+        g2o::Vector2(camera->cx, camera->cy),
+        0.0);  // baseline = 0 (monocular projection edge)
     cam_params->setId(0);
     if (!optimizer.addParameter(cam_params)) {
         LOG_WARN("Local BA: camera parameter already exists");  // will use existing

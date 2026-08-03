@@ -53,3 +53,12 @@ Viewer:
   camera_size: 0.1         # 相机位姿显示尺寸
   point_size: 2            # 地图点显示尺寸
   trajectory_color: [0.0, 0.8, 1.0]  # 轨迹颜色 (RGB)
+
+# ---- 双目参数 ----
+Stereo:
+  baseline: 0.54          # 基线（米）。KITTI 序列 ≈ 0.54m（由 calib.txt P1[0][3] = -fx*baseline 反推）
+  min_depth: 0.5          # 有效深度下限（米），过近视差噪声大
+  max_depth: 50.0         # 有效深度上限（米），过远视差分辨率不足
+  keyframe_translation: 1.5  # 双目关键帧最小平移（米）。双目有绝对尺度，单帧即可建点；
+                             # 阈值过大 → ref 间隔远 → 高速段 ORB 匹配骤减会 LOST；
+                             # 阈值过小 → 每帧插 KF → 地图膨胀 + BA 空转

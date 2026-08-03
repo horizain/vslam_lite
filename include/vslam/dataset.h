@@ -21,14 +21,17 @@ public:
     Dataset(const std::string& path, Type type);
     Dataset(int camera_index = 0);  // 实时摄像头
 
-    /// 读取下一帧，返回 false 表示数据结束
-    bool nextFrame(cv::Mat& image, double& timestamp);
+    /// 读取下一帧（左目 + 右目；单目数据 right 为空），返回 false 表示数据结束
+    bool nextFrame(cv::Mat& left, cv::Mat& right, double& timestamp);
 
     /// 获取相机模型（从数据集自带参数或标定文件读取）
     const vslam::Camera& getCamera() const { return camera_; }
 
     /// 是否从数据集加载了标定内参（否则由调用方用配置文件）
     bool hasCalibration() const { return calib_loaded_; }
+
+    /// 是否双目数据（含右目图像流）
+    bool isStereo() const { return !right_image_paths_.empty(); }
 
     /// 获取数据集类型
     Type type() const { return type_; }
@@ -49,7 +52,8 @@ private:
     vslam::Camera camera_;
 
     // 数据集文件列表 / 时间戳 / 摄像头句柄
-    std::vector<std::string> image_paths_;
+    std::vector<std::string> image_paths_;        // 左目（主目）图像列表
+    std::vector<std::string> right_image_paths_;  // 右目图像列表（双目；单目为空）
     std::vector<double>      timestamps_;   // 数据集自带时间戳（KITTI 为空则按 10fps 推算）
     cv::VideoCapture cap_;
 

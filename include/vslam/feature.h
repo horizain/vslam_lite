@@ -32,6 +32,14 @@ public:
         const Frame::Ptr& prev_frame,
         Frame::Ptr& curr_frame);
 
+    /// 双目左右目匹配：LK 光流 左目→右目（校正图像行对齐，亚像素视差）。
+    /// 输入左目特征点，输出每点对应的右目像素坐标；返回成功掩码。
+    std::vector<unsigned char> matchStereo(
+        const cv::Mat& left_gray,
+        const cv::Mat& right_gray,
+        const std::vector<cv::KeyPoint>& left_keypoints,
+        std::vector<cv::Point2f>& right_pts);
+
     /// 从匹配中提取匹配点的像素坐标对
     static void getMatchedPoints(
         const Frame::Ptr& f1,

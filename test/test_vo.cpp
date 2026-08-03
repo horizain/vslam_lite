@@ -70,20 +70,20 @@ void test_se3_basics() {
 
 void test_camera_projection() {
     TEST("Camera pixel2camera") {
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
-        auto p3d = cam.pixel2camera(vslam::Vec2(320, 240), 2.0);
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        auto p3d = cam->pixel2camera(vslam::Vec2(320, 240), 2.0);
         assert(std::abs(p3d.x()) < 1e-10);
         assert(std::abs(p3d.y()) < 1e-10);
         assert(std::abs(p3d.z() - 2.0) < 1e-10);
     } TEST_PASS();
 
     TEST("Camera world2pixel") {
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
         vslam::SE3 T_cw; // Identity (camera at origin, looking +z)
         // Point at (0, 0, 1) in world → (0,0,1) in camera → pixel (320, 240)
-        auto px = cam.world2pixel(vslam::Vec3(0, 0, 1), T_cw);
+        auto px = cam->world2pixel(vslam::Vec3(0, 0, 1), T_cw);
         assert(std::abs(px.x() - 320.0) < 1e-6);
         assert(std::abs(px.y() - 240.0) < 1e-6);
     } TEST_PASS();
@@ -118,9 +118,9 @@ void test_vo_initialization() {
         cv::rectangle(img2, cv::Rect(100, 100, 200, 200), cv::Scalar(255), -1);  // moved right
         cv::circle(img2, cv::Point(450, 300), 50, cv::Scalar(0), -1);            // moved right
 
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
-        cam.img_width = 640; cam.img_height = 480;
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
 
         // 合成场景特征匹配数较少，显式放宽初始化阈值（验证 VOConfig 接口生效）
         vslam::VOConfig cfg;
@@ -151,9 +151,9 @@ void test_vo_initialization() {
 // ============================================================
 void test_pose_semantics() {
     TEST("recoverPose→T_cw 位姿语义 (known motion)") {
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
-        cv::Mat K = cam.K();
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cv::Mat K = cam->K();
 
         // 世界点（深度 3~12m，破坏共面性）
         std::mt19937 gen(11);
@@ -234,10 +234,10 @@ void test_lk_tracking() {
     };
 
     TEST("LK 光流模式多帧跟踪") {
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
-        cam.img_width = 640; cam.img_height = 480;
-        cv::Mat K = cam.K();
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        cv::Mat K = cam->K();
 
         std::mt19937 gen(7);
         std::uniform_real_distribution<double> dx(-4, 4), dy(-3, 3), dz(3, 6),
@@ -293,10 +293,10 @@ void test_long_run_stability() {
     };
 
     TEST("长时间运行：关键帧/地图点有界 + 帧耗时稳定") {
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
-        cam.img_width = 640; cam.img_height = 480;
-        cv::Mat K = cam.K();
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        cv::Mat K = cam->K();
 
         std::mt19937 gen(7);
         std::uniform_real_distribution<double> dx(-4, 4), dy(-3, 3), dz(3, 6),
@@ -355,9 +355,9 @@ void test_long_run_stability() {
 // ============================================================
 void test_local_ba() {
     TEST("Local BA 保持尺度 (3 帧已知位姿)") {
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
-        cam.img_width = 640; cam.img_height = 480;
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
 
         auto map = std::make_shared<vslam::Map>();
 
@@ -383,7 +383,7 @@ void test_local_ba() {
             mp->observed_count = 3;
             map->insertMapPoint(mp);
             for (int f = 0; f < 3; f++) {
-                vslam::Vec2 px = cam.world2pixel(mp->pos_w, kfs[f]->pose_cw);
+                vslam::Vec2 px = cam->world2pixel(mp->pos_w, kfs[f]->pose_cw);
                 cv::KeyPoint kp;
                 kp.pt = cv::Point2f((float)px.x(), (float)px.y());
                 kfs[f]->keypoints.push_back(kp);
@@ -447,9 +447,9 @@ void test_rotation_detection() {
 // ============================================================
 void test_rotation_ambiguity() {
     TEST("旋转-平移歧义抑制 (远点原地转头)") {
-        vslam::Camera cam;
-        cam.fx = 500; cam.fy = 500; cam.cx = 320; cam.cy = 240;
-        cam.img_width = 640; cam.img_height = 480;
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
 
         // 纯远点 3D 点云（无近点 → 平移不可观测）
         std::mt19937 gen(11);
@@ -462,7 +462,7 @@ void test_rotation_ambiguity() {
             cv::Mat img = cv::Mat::zeros(480, 640, CV_8UC1);
             for (auto& p : pts) {
                 vslam::Vec3 pr = R_scene * p;
-                vslam::Vec2 px = cam.world2pixel(pr, T_wc.inverse());
+                vslam::Vec2 px = cam->world2pixel(pr, T_wc.inverse());
                 if (px.x() > 5 && px.x() < 635 && px.y() > 5 && px.y() < 475)
                     cv::rectangle(img, cv::Rect((int)px.x() - 4, (int)px.y() - 4, 8, 8), 200, -1);
             }
@@ -506,6 +506,112 @@ void test_rotation_ambiguity() {
 }
 
 // ============================================================
+// 双目相机模型测试：右目投影 / 视差-深度互逆 / 离轴点投影
+// ============================================================
+void test_stereo_camera() {
+    auto cam = std::make_shared<vslam::StereoCamera>();
+    cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+    cam->img_width = 640; cam->img_height = 480;
+    cam->fx_r = 500; cam->fy_r = 500; cam->cx_r = 320; cam->cy_r = 240;
+    cam->baseline_m = 0.5;
+
+    TEST("StereoCamera 右目投影/视差/深度一致性") {
+        // 主轴上 5m 的点：右目 x 应左移 fx*b/z = 500*0.5/5 = 50px
+        vslam::Vec3 p_c(0, 0, 5.0);
+        vslam::Vec2 pr = cam->camera2pixelRight(p_c);
+        assert(std::abs(pr.x() - 270.0) < 1e-6);
+        assert(std::abs(pr.y() - 240.0) < 1e-6);
+
+        // 视差→深度 与 深度→视差 互逆：z = fx*b/d
+        double disparity = 320.0 - pr.x();
+        double depth = cam->disparityToDepth(disparity);
+        assert(std::abs(depth - 5.0) < 1e-9);
+
+        // 左目像素 + 视差深度反投影 → 相机系 3D 坐标
+        vslam::Vec3 p3 = cam->pixel2camera(vslam::Vec2(320, 240), depth);
+        assert(std::abs(p3.z() - 5.0) < 1e-9);
+        assert(std::abs(p3.x()) < 1e-9);
+    } TEST_PASS();
+
+    TEST("StereoCamera 离轴点右目投影") {
+        // 点 (1, 0.5, 4)：右目 x = fx_r*(x-b)/z + cx_r = 500*(1-0.5)/4+320 = 382.5
+        //                   右目 y = fy_r*y/z + cy_r = 500*0.5/4+240 = 302.5
+        vslam::Vec3 p_c(1.0, 0.5, 4.0);
+        vslam::Vec2 pr = cam->camera2pixelRight(p_c);
+        assert(std::abs(pr.x() - 382.5) < 1e-6);
+        assert(std::abs(pr.y() - 302.5) < 1e-6);
+    } TEST_PASS();
+}
+
+// ============================================================
+// 双目 VO 测试：合成方块场景精确渲染左右目
+// 验证：1) 首帧即 TRACKING（绝对尺度，无需对极初始化）
+//       2) 前进 1m 的位移尺度正确（双目核心优势 vs 单目尺度不可观测）
+// ============================================================
+void test_stereo_vo() {
+    auto cam = std::make_shared<vslam::StereoCamera>();
+    cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+    cam->img_width = 640; cam->img_height = 480;
+    cam->fx_r = 500; cam->fy_r = 500; cam->cx_r = 320; cam->cy_r = 240;
+    cam->baseline_m = 0.5;
+
+    struct Blk { cv::Point3f c; float sx, sy; int gray; };
+    std::mt19937 gen(7);
+    std::uniform_real_distribution<double> dx(-4, 4), dy(-3, 3), dz(3, 6),
+                                           ds(0.5, 1.5), dg(80, 255);
+    std::vector<Blk> blks;
+    for (int i = 0; i < 60; i++)
+        blks.push_back({cv::Point3f(dx(gen), dy(gen), dz(gen)),
+                        (float)ds(gen), (float)ds(gen), (int)dg(gen)});
+
+    // 渲染左右目：左目用 world2pixel，右目用 camera2pixelRight
+    auto render = [&](const vslam::SE3& T_wc, cv::Mat& left, cv::Mat& right) {
+        vslam::SE3 T_cw = T_wc.inverse();
+        left  = cv::Mat(480, 640, CV_8UC1, cv::Scalar(64));
+        right = cv::Mat(480, 640, CV_8UC1, cv::Scalar(64));
+        for (auto& b : blks) {
+            std::vector<cv::Point3f> corners = {
+                cv::Point3f(b.c.x - b.sx/2, b.c.y - b.sy/2, b.c.z),
+                cv::Point3f(b.c.x + b.sx/2, b.c.y - b.sy/2, b.c.z),
+                cv::Point3f(b.c.x + b.sx/2, b.c.y + b.sy/2, b.c.z),
+                cv::Point3f(b.c.x - b.sx/2, b.c.y + b.sy/2, b.c.z)};
+            std::vector<cv::Point> pi_l, pi_r;
+            for (auto& q : corners) {
+                vslam::Vec3 p(q.x, q.y, q.z);
+                vslam::Vec2 pl = cam->world2pixel(p, T_cw);
+                vslam::Vec2 pr = cam->camera2pixelRight(T_cw * p);
+                pi_l.emplace_back(cvRound(pl.x()), cvRound(pl.y()));
+                pi_r.emplace_back(cvRound(pr.x()), cvRound(pr.y()));
+            }
+            cv::fillConvexPoly(left, pi_l, cv::Scalar(b.gray));
+            cv::fillConvexPoly(right, pi_r, cv::Scalar(b.gray));
+        }
+    };
+
+    TEST("双目 VO：首帧即建图 + 绝对尺度跟踪") {
+        vslam::VOConfig cfg;
+        cfg.min_matches_track = 10;
+        vslam::VisualOdometry vo(cam, cfg);
+
+        // 帧 1（原点）：双目首帧直接建图，状态应为 TRACKING
+        cv::Mat l1, r1;
+        render(vslam::SE3(), l1, r1);
+        vo.addFrame(l1, r1, 0.0);
+        assert(vo.state() == vslam::VisualOdometry::State::TRACKING);
+        assert(vo.getMap()->mapPointCount() > 50);
+
+        // 帧 2：相机沿 +z 前进 1m，位移尺度应 ≈1m（绝对尺度）
+        cv::Mat l2, r2;
+        vslam::SE3 T_wc2(Eigen::Quaterniond::Identity(), vslam::Vec3(0, 0, 1.0));
+        render(T_wc2, l2, r2);
+        auto pose2 = vo.addFrame(l2, r2, 0.1);
+        double disp = pose2.inverse().t.norm();   // T_cw → T_wc 位移
+        std::cout << " (disp=" << disp << "m mp=" << vo.getMap()->mapPointCount() << ")";
+        assert(std::abs(disp - 1.0) < 0.3);
+    } TEST_PASS();
+}
+
+// ============================================================
 // 主函数
 // ============================================================
 int main() {
@@ -516,6 +622,12 @@ int main() {
 
     std::cout << "\n[Camera Projection]\n";
     test_camera_projection();
+
+    std::cout << "\n[Stereo Camera]\n";
+    test_stereo_camera();
+
+    std::cout << "\n[Stereo VO]\n";
+    test_stereo_vo();
 
     std::cout << "\n[Feature Extraction]\n";
     test_feature_extraction();

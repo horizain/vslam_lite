@@ -23,19 +23,30 @@ void Viewer::stop() {
 
 void Viewer::updateFrame(const cv::Mat& image,
                          const std::vector<cv::KeyPoint>& keypoints,
-                         const std::vector<Vec3>& trajectory) {
+                         const std::vector<Vec3>& trajectory,
+                         const cv::Mat& image_right) {
     std::lock_guard<std::mutex> lock(data_mutex_);
 
-    // 视频流优先彩色：单通道（灰度）输入则转 BGR 显示
-    if (image.channels() == 1) {
-        cv::cvtColor(image, display_img_, cv::COLOR_GRAY2BGR);
-    } else {
-        display_img_ = image.clone();
-    }
+    auto to_bgr = [](const cv::Mat& img, cv::Mat& out) {
+        if (img.channels() == 1) cv::cvtColor(img, out, cv::COLOR_GRAY2BGR);
+        else out = img.clone();
+    };
 
-    // 绿色特征点
-    for (const auto& kp : keypoints)
-        cv::circle(display_img_, kp.pt, 3, cv::Scalar(0, 255, 0), -1);
+    // 双目：左右目并排拼接成一张宽图（特征点画在左目上）
+    if (!image_right.empty()) {
+        cv::Mat left_bgr, right_bgr;
+        to_bgr(image, left_bgr);
+        to_bgr(image_right, right_bgr);
+        for (const auto& kp : keypoints)
+            cv::circle(left_bgr, kp.pt, 3, cv::Scalar(0, 255, 0), -1);
+        cv::hconcat(left_bgr, right_bgr, display_img_);
+    } else {
+        // 单目：视频流优先彩色（单通道灰度则转 BGR）
+        to_bgr(image, display_img_);
+        // 绿色特征点
+        for (const auto& kp : keypoints)
+            cv::circle(display_img_, kp.pt, 3, cv::Scalar(0, 255, 0), -1);
+    }
 
     // 状态文字叠画在图像底部（黑底白字）
     if (!status_text_.empty()) {

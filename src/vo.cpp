@@ -4,6 +4,8 @@
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <Eigen/SVD>
+
 #include <set>
 #include <algorithm>
 #include <ranges>
@@ -33,6 +35,12 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (o["local_ba_iterations"]) cfg.local_ba_iterations = o["local_ba_iterations"].as<int>();
             if (o["enable_local_ba"])     cfg.enable_local_ba     = o["enable_local_ba"].as<bool>();
         }
+        if (auto s = root["Stereo"]) {
+            if (s["min_depth"]) cfg.stereo_min_depth = s["min_depth"].as<double>();
+            if (s["max_depth"]) cfg.stereo_max_depth = s["max_depth"].as<double>();
+            if (s["keyframe_translation"])
+                cfg.keyframe_translation_stereo = s["keyframe_translation"].as<double>();
+        }
         LOG_INFO("VO config loaded from: " << path);
     } catch (const std::exception& e) {
         LOG_WARN("VOConfig::fromYaml failed (" << e.what() << "), using defaults");
@@ -49,19 +57,37 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
 }
 
 SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
+    return addFrameImpl(image, cv::Mat(), timestamp);
+}
+
+SE3 VisualOdometry::addFrame(const cv::Mat& left, const cv::Mat& right, double timestamp) {
+    return addFrameImpl(left, right, timestamp);
+}
+
+SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, double timestamp) {
     unsigned long frame_id = frame_count_++;
     LOG_INFO("--- Frame " << frame_id << " ---");
 
     // 1. 创建当前帧 + CLAHE 增强
     curr_frame_ = std::make_shared<Frame>(frame_id, timestamp);
-    if (image.channels() == 3)
-        cv::cvtColor(image, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
+    if (left.channels() == 3)
+        cv::cvtColor(left, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
     else
-        curr_frame_->image_gray = image;
-    curr_frame_->image = image;
+        curr_frame_->image_gray = left;
+    curr_frame_->image = left;
 
     static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
     clahe->apply(curr_frame_->image_gray, curr_frame_->image_gray);
+
+    // 双目：右目图做同样的灰度化 + 增强（左右目一致，保证双目匹配质量）
+    if (!right.empty()) {
+        curr_frame_->image_right = right;
+        if (right.channels() == 3)
+            cv::cvtColor(right, curr_frame_->image_right_gray, cv::COLOR_BGR2GRAY);
+        else
+            curr_frame_->image_right_gray = right;
+        clahe->apply(curr_frame_->image_right_gray, curr_frame_->image_right_gray);
+    }
 
     // 2. 提取/跟踪特征
     // LK 模式（feature_method=1）：TRACKING 阶段用光流跟踪上一帧，不重新提取 ORB
@@ -83,6 +109,9 @@ SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
         return (state_ != State::INITIALIZING) ? ref_frame_->pose_cw : SE3();
     }
 
+    // 2.5 双目/RGB-D：视差（或深度）→ 每特征点的相机系 3D 观测 pts_c
+    computeStereoDepths();
+
     // 3. 状态机处理
     if (state_ == State::INITIALIZING) {
         bool ok = tryInitialize();
@@ -96,12 +125,89 @@ SE3 VisualOdometry::addFrame(const cv::Mat& image, double timestamp) {
         // 跟踪可能把状态置为 LOST（跳变保护），此时不能再插入关键帧
         if (state_ == State::TRACKING && needNewKeyFrame()) insertKeyFrame();
     } else if (state_ == State::LOST) {
-        if (tryRelocalize()) { state_ = State::TRACKING; }
+        if (tryRelocalize()) {
+            state_ = State::TRACKING;
+        } else if (camera_->hasPerFrameDepth()) {
+            // 双目/RGB-D 兜底：重定位失败时直接用当前帧重新初始化——
+            // 单帧即有绝对尺度深度，无需历史地图（ORB-SLAM stereo 的 Lost→Reset 语义），
+            // 避免高速段长时间卡在 LOST 循环（每帧 × 30 KF 匹配 → 帧率暴跌）
+            map_->clear();
+            ref_frame_.reset();
+            prev_frame_.reset();
+            trajectory_.clear();
+            last_kf_frame_id_ = 0;
+            if (tryInitialize()) {
+                LOG_WARN("Stereo re-init with current frame (map reset)");
+                state_ = State::TRACKING;
+            }
+        }
     }
 
     prev_frame_ = curr_frame_;
     trajectory_.push_back(curr_frame_->pose_cw.t);
     return curr_frame_->pose_cw;
+}
+
+// ============================================================
+// 双目/RGB-D 深度计算：视差（或深度）→ pts_c
+// ============================================================
+void VisualOdometry::computeStereoDepths() {
+    curr_frame_->pts_c.clear();
+    curr_frame_->pts_c.resize(curr_frame_->keypoints.size(), Vec3::Zero());
+    // 单目：无单帧深度，pts_c 全部无效（走多帧三角化）
+    if (!camera_->hasPerFrameDepth() || curr_frame_->image_right.empty()) return;
+
+    // 双目匹配用原始灰度（非 CLAHE）：CLAHE 是内容相关的非线性增强，
+    // 左右目同一 3D 点的局部直方图不同 → 灰度不一致 → 破坏光度一致性，
+    // 显著降低 LK 左右目匹配质量。
+    cv::Mat left_raw, right_raw;
+    if (curr_frame_->image.channels() == 3)
+        cv::cvtColor(curr_frame_->image, left_raw, cv::COLOR_BGR2GRAY);
+    else
+        left_raw = curr_frame_->image;
+    if (curr_frame_->image_right.channels() == 3)
+        cv::cvtColor(curr_frame_->image_right, right_raw, cv::COLOR_BGR2GRAY);
+    else
+        right_raw = curr_frame_->image_right;
+
+    std::vector<cv::Point2f> right_pts;
+    auto status = feature_matcher_.matchStereo(
+        left_raw, right_raw,
+        curr_frame_->keypoints, right_pts);
+
+    for (size_t i = 0; i < status.size() && i < curr_frame_->keypoints.size(); i++) {
+        if (!status[i]) continue;
+        double disparity = curr_frame_->keypoints[i].pt.x - right_pts[i].x;
+        if (disparity <= 0) continue;
+        double depth = camera_->fx * camera_->baseline() / disparity;  // z = fx*b/d
+        if (depth < cfg_.stereo_min_depth || depth > cfg_.stereo_max_depth) continue;
+        curr_frame_->pts_c[i] = camera_->pixel2camera(
+            Vec2(curr_frame_->keypoints[i].pt.x, curr_frame_->keypoints[i].pt.y), depth);
+    }
+}
+
+// ============================================================
+// 双目/RGB-D 单帧建点：pts_c 有效 → 世界系 3D 地图点
+// ============================================================
+void VisualOdometry::createMapPointsFromStereo(const Frame::Ptr& frame) {
+    if (!camera_->hasPerFrameDepth()) return;
+
+    int cnt = 0;
+    for (size_t i = 0; i < frame->keypoints.size(); i++) {
+        if (frame->pts_c[i].z() > 0 && frame->map_points[i] == nullptr) {
+            // p_w = T_wc * p_c（pose_cw 的逆把相机系点转到世界系）
+            Vec3 p_w = frame->pose_cw.inverse() * frame->pts_c[i];
+            auto mp = std::make_shared<MapPoint>(map_->nextMapPointId());
+            mp->pos_w = p_w;
+            if (!frame->descriptors.empty())
+                mp->descriptor = frame->descriptors.row((int)i).clone();
+            mp->observed_count = 1;  // 仅当前帧观测，后续跟踪帧会累加
+            map_->insertMapPoint(mp);
+            frame->map_points[i] = mp;
+            cnt++;
+        }
+    }
+    if (cnt > 0) LOG_INFO("Stereo map points created: " << cnt);
 }
 
 // ============================================================
@@ -120,6 +226,23 @@ void VisualOdometry::updateStatus(int matches, int inliers, double parallax) {
 // 初始化
 // ============================================================
 bool VisualOdometry::tryInitialize() {
+    // 双目/RGB-D：首帧即有绝对尺度深度，直接建图进入 TRACKING
+    // （无需对极初始化——这是双目相对单目的本质区别：尺度可观测）
+    if (camera_->hasPerFrameDepth()) {
+        if (!ref_frame_) {
+            ref_frame_ = curr_frame_;
+            createMapPointsFromStereo(ref_frame_);
+            map_->insertKeyFrame(ref_frame_);
+            last_kf_frame_id_ = curr_frame_->id;
+            LOG_INFO("Stereo init OK! (first frame, absolute scale) mp="
+                     << map_->mapPointCount());
+            updateStatus(0, 0, 0.0);
+            return true;
+        }
+        return false;
+    }
+
+    // ---- 单目：两帧对极几何初始化（尺度归一化）----
     if (!ref_frame_) {
         ref_frame_ = curr_frame_;
         updateStatus(0, 0, 0.0);
@@ -137,10 +260,10 @@ bool VisualOdometry::tryInitialize() {
     std::vector<cv::Point2f> pts1, pts2;
     FeatureMatcher::getMatchedPoints(ref_frame_, curr_frame_, matches, pts1, pts2);
 
-    cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_.K(),
+    cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_->K(),
                                      cv::RANSAC, 0.999, 1.0);
     cv::Mat R, t;
-    int inliers = cv::recoverPose(E, pts1, pts2, camera_.K(), R, t);
+    int inliers = cv::recoverPose(E, pts1, pts2, camera_->K(), R, t);
     double parallax = cv::norm(t);
 
     if (parallax < 0.1) {
@@ -204,7 +327,7 @@ SE3 VisualOdometry::trackFrame() {
     if (pts3d.size() >= 6) {
         cv::Mat rvec, tvec;
         std::vector<int> inliers;
-        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_.K(),
+        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
                                      cv::Mat(), rvec, tvec,
                                      false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
         if (ok && inliers.size() >= 10) {
@@ -224,13 +347,18 @@ SE3 VisualOdometry::trackFrame() {
             }
             updateStatus((int)matches.size(), inliers_cnt, 0.0);
 
-            // 位姿跳变保护：单帧位移异常说明数值发散（如对极尺度错误累积），
-            // 拒绝该位姿并进入 LOST，等待重定位
+            // 位姿跳变保护：单帧位移异常说明数值发散（如旋转-平移歧义的假平移）。
+            // 阈值按传感器分派：双目有绝对尺度（真实帧间位移小），用运动先验相对阈值；
+            // 单目尺度不定（recoverPose 归一化），保留宽松的固定阈值。
             SE3 Twc_new  = curr_frame_->pose_cw.inverse();
             SE3 Twc_ref  = ref_frame_->pose_cw.inverse();
-            if ((Twc_new.t - Twc_ref.t).norm() > 30.0) {
+            double jump_thresh = camera_->hasPerFrameDepth()
+                ? motionPrior() * 6.0 + 2.0 : 30.0;
+            if ((Twc_new.t - Twc_ref.t).norm() > jump_thresh) {
                 LOG_WARN("Pose jump detected (" << (Twc_new.t - Twc_ref.t).norm()
-                         << "m), tracking lost");
+                         << "m), retry stereo 3D-3D");
+                // 旋转-平移歧义时 PnP 的假平移不可信，改用双目真实深度重新估计
+                if (tryTrack3D3D(matches)) return curr_frame_->pose_cw;
                 state_ = State::LOST;
                 updateStatus(0, 0, 0.0);
                 return ref_frame_->pose_cw;
@@ -239,14 +367,19 @@ SE3 VisualOdometry::trackFrame() {
         }
     }
 
-    // 对极几何回退
+    // 双目/RGB-D：PnP 失败后走 3D-3D 位姿估计（绝对尺度、旋转鲁棒）。
+    // 对极几何是单目尺度估计的手段（recoverPose 的 t 归一化、旋转主导时退化），
+    // 双目有绝对尺度（当前帧 pts_c），3D-3D 天然保持尺度且对旋转鲁棒。
+    if (tryTrack3D3D(matches)) return curr_frame_->pose_cw;
+
+    // 对极几何回退（仅单目：recoverPose 的 t 归一化，双目有绝对尺度不可用）
     // recoverPose 返回 T_rel 满足 p_c2 = T_rel * p_c1 → T_cw2 = T_rel * T_cw1
-    if (matches.size() >= (size_t)cfg_.min_matches_track) {
+    if (!camera_->hasPerFrameDepth() && matches.size() >= (size_t)cfg_.min_matches_track) {
         std::vector<cv::Point2f> pts1, pts2;
         FeatureMatcher::getMatchedPoints(ref_frame_, curr_frame_, matches, pts1, pts2);
-        cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_.K(), cv::RANSAC, 0.999, 1.0);
+        cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_->K(), cv::RANSAC, 0.999, 1.0);
         cv::Mat R, t;
-        cv::recoverPose(E, pts1, pts2, camera_.K(), R, t);
+        cv::recoverPose(E, pts1, pts2, camera_->K(), R, t);
         SE3 T_rel = matToSE3(R, t);
         curr_frame_->pose_cw = T_rel * ref_frame_->pose_cw;
         inliers_cnt = (int)matches.size();
@@ -276,6 +409,83 @@ SE3 VisualOdometry::trackFrame() {
 }
 
 // ============================================================
+// 双目/RGB-D 3D-3D 位姿估计
+// ref 帧世界系点 ↔ 当前帧相机系点（双目视差），RANSAC 求解 T_cw。
+// 用真实深度测量：天然保持绝对尺度、对旋转-平移歧义鲁棒
+// （对极几何的 t 归一化 + 旋转主导退化在双目下不可用）。
+// ============================================================
+bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
+    if (!camera_->hasPerFrameDepth() || matches.size() < 10) return false;
+
+    std::vector<cv::Point3f> pts_w;   // ref 帧世界系 3D 点
+    std::vector<cv::Point3f> pts_c;   // 当前帧相机系 3D 点（双目视差）
+    std::vector<int> idx3;
+    for (auto [k, m] : matches | std::views::enumerate) {
+        auto& mp = ref_frame_->map_points[m.queryIdx];
+        if (mp && curr_frame_->pts_c[m.trainIdx].z() > 0) {
+            pts_w.emplace_back((float)mp->pos_w.x(), (float)mp->pos_w.y(), (float)mp->pos_w.z());
+            pts_c.emplace_back((float)curr_frame_->pts_c[m.trainIdx].x(),
+                               (float)curr_frame_->pts_c[m.trainIdx].y(),
+                               (float)curr_frame_->pts_c[m.trainIdx].z());
+            idx3.push_back((int)k);
+        }
+    }
+    if ((int)pts_w.size() < 6) return false;
+
+    cv::Mat affine, inliers;
+    // RANSAC 3D-3D：返回 3x4 [R|t] 满足 dst = R*src + t → 即 T_cw（世界→相机）
+    bool ok = cv::estimateAffine3D(pts_w, pts_c, affine, inliers, 1.0, 0.99);
+    if (!ok) return false;
+
+    // affine 允许缩放/剪切，把 R 投影回 SO(3)（SVD 正交化）
+    Eigen::Matrix3d Rm;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            Rm(i, j) = affine.at<double>(i, j);
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(Rm, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d R_orth = svd.matrixU() * svd.matrixV().transpose();
+    if (R_orth.determinant() < 0) R_orth.col(2) *= -1;
+    Vec3 t(affine.at<double>(0, 3), affine.at<double>(1, 3), affine.at<double>(2, 3));
+    SE3 pose_cw(Eigen::Quaterniond(R_orth), t);
+
+    // 跳变保护（运动先验）：3D-3D 用真实深度，异常解概率低，但兜底拒绝
+    SE3 Twc_new = pose_cw.inverse();
+    SE3 Twc_ref = ref_frame_->pose_cw.inverse();
+    if ((Twc_new.t - Twc_ref.t).norm() > motionPrior() * 6.0 + 2.0) {
+        LOG_WARN("3D-3D pose jump (" << (Twc_new.t - Twc_ref.t).norm() << "m), rejected");
+        return false;
+    }
+
+    curr_frame_->pose_cw = pose_cw;
+    // 关联内点（共视统计 + observed_count）
+    int inl_cnt = 0;
+    for (size_t i = 0; i < inliers.total() && i < idx3.size(); i++) {
+        if (!inliers.at<uchar>(i)) continue;
+        inl_cnt++;
+        int k = idx3[i];
+        auto& mp = ref_frame_->map_points[matches[k].queryIdx];
+        if (mp) {
+            mp->observed_count++;
+            curr_frame_->map_points[matches[k].trainIdx] = mp;
+        }
+    }
+    updateStatus((int)matches.size(), inl_cnt, 0.0);
+    return true;
+}
+
+// ============================================================
+// 运动先验：ref→上一帧 位移（跳变保护阈值基准）
+// ============================================================
+double VisualOdometry::motionPrior() const {
+    if (prev_frame_ && ref_frame_ && prev_frame_->id != ref_frame_->id) {
+        SE3 Twc_prev = prev_frame_->pose_cw.inverse();
+        SE3 Twc_ref  = ref_frame_->pose_cw.inverse();
+        return std::max((Twc_prev.t - Twc_ref.t).norm(), 0.3);
+    }
+    return cfg_.keyframe_translation;
+}
+
+// ============================================================
 // LK 光流跟踪（feature_method=1）
 // 光流后 map_points 与关键点索引对齐（继承自上一帧），直接做 PnP
 // ============================================================
@@ -298,7 +508,7 @@ SE3 VisualOdometry::trackFrameLK() {
     if (pts3d.size() >= 6) {
         cv::Mat rvec, tvec;
         std::vector<int> inliers;
-        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_.K(),
+        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
                                      cv::Mat(), rvec, tvec,
                                      false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
         if (ok && inliers.size() >= 10) {
@@ -357,7 +567,7 @@ bool VisualOdometry::tryRelocalize() {
 
         cv::Mat rvec, tvec;
         std::vector<int> inliers;
-        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_.K(),
+        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
                                      cv::Mat(), rvec, tvec,
                                      false, 100, cfg_.ransac_pixel_threshold, 0.99, inliers);
         if (ok && (int)inliers.size() > best_inliers) {
@@ -394,6 +604,8 @@ bool VisualOdometry::tryRelocalize() {
 // ============================================================
 void VisualOdometry::insertKeyFrame() {
     map_->insertKeyFrame(curr_frame_);
+    // 双目/RGB-D：当前帧有视差/深度的特征直接建点（绝对尺度）
+    createMapPointsFromStereo(curr_frame_);
     // LK 模式：关键帧用干净的 ORB 特征重建（LK 关键点无方向，描述子无法与
     // 历史关键帧匹配），保证与上一关键帧的 ORB 匹配/三角化可靠；
     // 普通帧仍用 LK 光流跟踪（从关键帧 ORB 特征出发）
@@ -492,7 +704,7 @@ void VisualOdometry::triangulateNewPoints(
     const Frame::Ptr& f1, const Frame::Ptr& f2,
     const std::vector<cv::DMatch>& matches) {
 
-    cv::Mat K = camera_.K();
+    cv::Mat K = camera_->K();
     int cnt = 0;
     for (auto& m : matches) {
         if (f1->map_points[m.queryIdx] == nullptr) {
@@ -531,7 +743,11 @@ bool VisualOdometry::needNewKeyFrame() const {
     if (weak_match &&
         curr_frame_->id - last_kf_frame_id_ < (unsigned long)cfg_.min_keyframe_interval)
         weak_match = false;
-    return dtrans > cfg_.keyframe_translation || drot > cfg_.keyframe_rotation || weak_match;
+    // 平移阈值按传感器类型分派：双目/RGB-D 有绝对尺度（真实帧间位移大），
+    // 单目尺度归一化后位移小——共用阈值会导致双目每帧插 KF
+    double kf_trans = camera_->hasPerFrameDepth()
+        ? cfg_.keyframe_translation_stereo : cfg_.keyframe_translation;
+    return dtrans > kf_trans || drot > cfg_.keyframe_rotation || weak_match;
 }
 
 std::vector<Vec3> VisualOdometry::getTrajectory() const {

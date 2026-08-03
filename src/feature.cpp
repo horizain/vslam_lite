@@ -117,6 +117,32 @@ std::vector<unsigned char> FeatureMatcher::trackLK(
     return status;
 }
 
+std::vector<unsigned char> FeatureMatcher::matchStereo(
+    const cv::Mat& left_gray,
+    const cv::Mat& right_gray,
+    const std::vector<cv::KeyPoint>& left_keypoints,
+    std::vector<cv::Point2f>& right_pts) {
+
+    right_pts.clear();
+    if (left_keypoints.empty() || left_gray.empty() || right_gray.empty()) return {};
+
+    std::vector<cv::Point2f> left_pts;
+    left_pts.reserve(left_keypoints.size());
+    for (const auto& kp : left_keypoints) left_pts.push_back(kp.pt);
+
+    // 校正后的双目图像行对齐：左目→右目 的 LK 光流退化为近一维搜索，
+    // 稳定且给出亚像素视差（比 ORB 左右匹配精度更高）。
+    // 金字塔 5 层 + 31x31 窗口：KITTI 近点视差可达 100px+，默认 3 层/21px 会追丢。
+    std::vector<unsigned char> status;
+    std::vector<float> err;
+    cv::calcOpticalFlowPyrLK(
+        left_gray, right_gray,
+        left_pts, right_pts, status, err,
+        cv::Size(31, 31), 5);
+
+    return status;
+}
+
 void FeatureMatcher::getMatchedPoints(
     const Frame::Ptr& f1,
     const Frame::Ptr& f2,

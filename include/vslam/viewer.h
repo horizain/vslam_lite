@@ -18,10 +18,12 @@ public:
     void stop();
     bool shouldQuit() const { return quit_.load(); }
 
-    /// 更新视频帧（优先彩色，单通道自动转 BGR）+ 特征点（绿色）+ 轨迹
+    /// 更新视频帧（优先彩色，单通道自动转 BGR）+ 特征点（绿色）+ 轨迹。
+    /// 双目模式下传入 image_right → 左右目并排拼接显示；单目可省略。
     void updateFrame(const cv::Mat& image,
                      const std::vector<cv::KeyPoint>& keypoints,
-                     const std::vector<Vec3>& trajectory);
+                     const std::vector<Vec3>& trajectory,
+                     const cv::Mat& image_right = cv::Mat());
 
     /// 更新状态文本（叠加在图像上）
     void setStatus(const std::string& text);
