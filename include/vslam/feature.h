@@ -51,6 +51,9 @@ public:
 private:
     cv::Ptr<cv::ORB> orb_;
     cv::Ptr<cv::DescriptorMatcher> matcher_;
+    int num_features_ = 1000;      // ORB 特征预算（并行分带提取用）
+    double scale_factor_ = 1.2;
+    int pyramid_levels_ = 8;
 };
 
 } // namespace vslam

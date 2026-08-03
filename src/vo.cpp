@@ -150,18 +150,20 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
 
     // 2. 提取/跟踪特征
     // LK 模式（feature_method=1）：TRACKING 阶段用光流跟踪上一帧，不重新提取 ORB
-    PERF_SCOPE("vo.extract");
-    const bool use_lk = (cfg_.feature_method == 1 && state_ == State::TRACKING
-                         && prev_frame_ && !prev_frame_->keypoints.empty());
-    if (use_lk) {
-        feature_matcher_.trackLK(prev_frame_, curr_frame_);
-        if (curr_frame_->keypoints.size() < (size_t)cfg_.min_matches_track) {
-            LOG_WARN("LK track degraded (" << curr_frame_->keypoints.size()
-                     << " pts), fallback to ORB extraction");
+    {
+        PERF_SCOPE("vo.extract");
+        const bool use_lk = (cfg_.feature_method == 1 && state_ == State::TRACKING
+                             && prev_frame_ && !prev_frame_->keypoints.empty());
+        if (use_lk) {
+            feature_matcher_.trackLK(prev_frame_, curr_frame_);
+            if (curr_frame_->keypoints.size() < (size_t)cfg_.min_matches_track) {
+                LOG_WARN("LK track degraded (" << curr_frame_->keypoints.size()
+                         << " pts), fallback to ORB extraction");
+                feature_matcher_.extract(curr_frame_);
+            }
+        } else {
             feature_matcher_.extract(curr_frame_);
         }
-    } else {
-        feature_matcher_.extract(curr_frame_);
     }
     if (curr_frame_->keypoints.empty()) {
         LOG_WARN("No features extracted, skipping frame");

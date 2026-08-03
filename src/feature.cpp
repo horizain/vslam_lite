@@ -2,7 +2,9 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/video/tracking.hpp>
+#include <algorithm>
 #include <cmath>
+#include <numeric>
 
 namespace vslam {
 
@@ -15,6 +17,9 @@ FeatureMatcher::FeatureMatcher() {
 }
 
 void FeatureMatcher::setParams(int num_features, double scale_factor, int pyramid_levels) {
+    num_features_ = num_features;
+    scale_factor_ = scale_factor;
+    pyramid_levels_ = pyramid_levels;
     orb_ = cv::ORB::create(num_features, (float)scale_factor, pyramid_levels,
                            15, 0, 2, cv::ORB::HARRIS_SCORE, 19, 10);
 }
@@ -23,12 +28,92 @@ void FeatureMatcher::extract(Frame::Ptr frame) {
     if (frame->image_gray.empty()) {
         cv::cvtColor(frame->image, frame->image_gray, cv::COLOR_BGR2GRAY);
     }
+    const cv::Mat& img = frame->image_gray;
+    const int rows = img.rows;
 
-    frame->keypoints.clear();
-    orb_->detectAndCompute(frame->image_gray, cv::Mat(),
-                           frame->keypoints, frame->descriptors);
+    // ---- 并行分带提取 ----
+    // ORB 内部已按金字塔 octave 并行（约 8 个任务）。把图像按行分成 N 个带，
+    // 各带独立 detectAndCompute，得到 N×octave 个可并行任务，进一步发挥多核。
+    // 每个带在上下各扩 kBorder 像素提取、只保留核心区 [y0,y1) 内的特征：
+    // 边界角点由相邻带的核心区自然保留（无重复、不丢点），且每个保留特征
+    // 距提取 ROI 边界 ≥ kBorder（> ORB edgeThreshold=15），描述子不退化。
+    // 小图退化为单带串行，行为与旧实现一致（保证单元测试确定性）。
+    constexpr int kBorder = 18;
+    int nbands = 1;
+    if (rows >= 2 * kBorder + 64 && num_features_ >= 500) {
+        nbands = std::clamp(cv::getNumThreads() / 2, 1, 8);
+        while (nbands > 1 && rows / nbands < 48) --nbands;
+    }
 
-    // 初始化 map_points 占位
+    if (nbands <= 1) {
+        orb_->detectAndCompute(img, cv::Mat(), frame->keypoints, frame->descriptors);
+        frame->map_points.resize(frame->keypoints.size(), nullptr);
+        return;
+    }
+
+    // 每带预算放大以补偿带间重叠区的重复提取，合并后统一截断到 num_features_
+    const int per_band = std::max(32, num_features_ * 2 / nbands);
+    std::vector<std::vector<cv::KeyPoint>> band_kps(nbands);
+    std::vector<cv::Mat> band_desc(nbands);
+
+    cv::parallel_for_(cv::Range(0, nbands), [&](const cv::Range& r) {
+        for (int b = r.start; b < r.end; b++) {
+            const int y0 = rows * b / nbands;
+            const int y1 = rows * (b + 1) / nbands;
+            const int top = std::max(0, y0 - kBorder);
+            const int bot = std::min(rows, y1 + kBorder);
+            const int roi_h = bot - top;
+            // 带高受限时收敛金字塔层数，避免最深层退化到过小分辨率。
+            // 注意按真实 scale_factor（1.2）计算，不能用 >>（那是按 2 倍）。
+            int levels = pyramid_levels_;
+            while (levels > 1 && roi_h / std::pow(scale_factor_, levels - 1) < 16.0)
+                --levels;
+            cv::Mat roi = img(cv::Rect(0, top, img.cols, roi_h));
+            auto orb = cv::ORB::create(per_band, (float)scale_factor_, levels,
+                                       15, 0, 2, cv::ORB::HARRIS_SCORE, 19, 10);
+            std::vector<cv::KeyPoint> kps;
+            cv::Mat desc;
+            orb->detectAndCompute(roi, cv::Mat(), kps, desc);
+            // 只保留核心区 [y0, y1) 内的特征
+            for (size_t i = 0; i < kps.size(); i++) {
+                const float gy = kps[i].pt.y + (float)top;  // 带内坐标 → 全局
+                if (gy >= (float)y0 && gy < (float)y1) {
+                    band_kps[b].push_back(kps[i]);
+                    band_kps[b].back().pt.y = gy;
+                    band_desc[b].push_back(desc.row((int)i));
+                }
+            }
+        }
+    });
+
+    // 合并各带（各带至多 per_band 个；总量可能超 num_features_，按响应截断）
+    std::vector<cv::KeyPoint> kps;
+    std::vector<cv::Mat> descs;
+    for (int b = 0; b < nbands; b++) {
+        kps.insert(kps.end(), band_kps[b].begin(), band_kps[b].end());
+        if (!band_desc[b].empty()) descs.push_back(band_desc[b]);
+    }
+    cv::Mat desc;
+    if (descs.size() == 1) desc = descs[0];
+    else if (!descs.empty()) cv::vconcat(descs, desc);
+
+    if ((int)kps.size() > num_features_) {
+        std::vector<int> idx(kps.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + num_features_, idx.end(),
+                          [&](int a, int b) { return kps[a].response > kps[b].response; });
+        std::vector<cv::KeyPoint> sel(num_features_);
+        cv::Mat sel_desc(num_features_, desc.cols, desc.type());
+        for (int i = 0; i < num_features_; i++) {
+            sel[i] = kps[idx[i]];
+            desc.row(idx[i]).copyTo(sel_desc.row(i));
+        }
+        kps.swap(sel);
+        desc = sel_desc;
+    }
+
+    frame->keypoints = std::move(kps);
+    frame->descriptors = desc;
     frame->map_points.resize(frame->keypoints.size(), nullptr);
 }
 
@@ -134,6 +219,8 @@ std::vector<unsigned char> FeatureMatcher::matchStereo(
     // 校正后的双目图像行对齐：左目→右目 的 LK 光流退化为近一维搜索，
     // 稳定且给出亚像素视差（比 ORB 左右匹配精度更高）。
     // 金字塔 5 层 + 31x31 窗口：KITTI 近点视差可达 100px+，默认 3 层/21px 会追丢。
+    // 注：calcOpticalFlowPyrLK 内部已用 TBB 并行处理关键点；外部再分块会重复
+    // 构建金字塔反而更慢（OpenCV 4.6 无接收预建金字塔的重载），故保持串行调用。
     std::vector<unsigned char> status;
     std::vector<float> err;
     cv::calcOpticalFlowPyrLK(
