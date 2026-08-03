@@ -1005,7 +1005,9 @@ void test_loop_closure() {
         vslam::SE3 T_loop_curr;
         assert(lc.verifyLoop(last_kf, cand, T_loop_curr));
         const vslam::SE3 expected = cand->pose_cw * poses.back();
-        assert(T_loop_curr.t.isApprox(expected.t, 0.1));
+        // isApprox 是相对精度（|a-b|² ≤ prec²·min(|a|²,|b|²)），期望平移为零时
+        // 分母恒为 0，任何非零误差都会失败，故用绝对范数判据。
+        assert((T_loop_curr.t - expected.t).norm() < 0.1);
         assert(T_loop_curr.q.toRotationMatrix().isApprox(
             expected.q.toRotationMatrix(), 0.02));
 

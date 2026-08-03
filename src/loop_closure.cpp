@@ -195,12 +195,14 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
         return false;
     }
 
-    // 5. PnP 已直接给出当前帧在回环地图坐标中的 T_cw。由此构造
-    //    位姿图测量 X_loop^-1 * X_curr（X 为 T_wc）。旧实现把同一批世界点
-    //    分别乘两个 SE3 后做 Umeyama，尺度在数学上恒为 1，不能观测单目尺度，
-    //    再把结果作为 Sim3 传播反而会引入错误的全图 gauge 变换。
-    const SE3 T_cw_curr_in_loop = matToSE3(rvec, tvec);
-    T_loop_curr = kf_loop->pose_cw * T_cw_curr_in_loop.inverse();
+    // 5. solvePnP 的 rvec/tvec 把世界点变换到相机系（T_wc 语义），
+    //    matToSE3(rvec, tvec) 的矩阵正是当前帧在回环地图坐标中的 T_wc。
+    //    由此构造位姿图测量 T_loop_curr = X_loop⁻¹ · X_curr（X 为 T_wc，
+    //    满足 X_curr = X_loop · T_loop_curr，见 loop_closure.h）。旧实现用
+    //    同一批世界点做 Umeyama 求 Sim3，尺度恒为 1 无法观测单目尺度，
+    //    还引入了错误的全图 gauge 变换。
+    const SE3 T_wc_curr_in_loop = matToSE3(rvec, tvec);
+    T_loop_curr = kf_loop->pose_cw * T_wc_curr_in_loop;
     LOG_INFO("LoopClosure: verified! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
              << " inliers=" << inliers.size());
     return true;
