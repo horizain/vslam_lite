@@ -12,6 +12,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+
+# ============================================================
+# 性能监测（utils/perf_monitor.h）
+#   ON  : PERF_SCOPE 计时生效，run_vo/run_slam 退出时输出 perf 报告
+#   OFF : 全部展开为空实现，零运行时开销
+# ============================================================
+option(VSLAM_ENABLE_PERF "Enable performance instrumentation (PERF_SCOPE)" ON)
+if(VSLAM_ENABLE_PERF)
+    add_compile_definitions(VSLAM_ENABLE_PERF)
+    message(STATUS "Performance instrumentation ENABLED (VSLAM_ENABLE_PERF=ON)")
+endif()
 # 注意：不能用 -march=native（AVX/32字节对齐）——apt 版 g2o 库按 SSE/16 字节
 # 对齐编译，跨 DSO 传递 Eigen Isometry3d 等固定大小类型时对齐假设不一致，
 # 会导致 EdgeSE3 测量值静默损坏、位姿图优化发散（实测）。用 SSE2 保持
@@ -106,6 +117,7 @@ target_include_directories(vslam
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+        ${CMAKE_SOURCE_DIR}/utils       # perf_monitor.h（性能监测）
         ${Pangolin_INCLUDE_DIRS}
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src)

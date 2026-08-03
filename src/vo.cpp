@@ -1,5 +1,6 @@
 #include "vslam/vo.h"
 #include "vslam/optimizer.h"
+#include "perf_monitor.h"
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
@@ -112,6 +113,7 @@ SE3 VisualOdometry::addFrame(const cv::Mat& left, const cv::Mat& right, double t
 }
 
 SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, double timestamp) {
+    PERF_SCOPE("vo.frame_total");
     unsigned long frame_id = frame_count_++;
     LOG_INFO("--- Frame " << frame_id << " ---");
 
@@ -148,6 +150,7 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
 
     // 2. 提取/跟踪特征
     // LK 模式（feature_method=1）：TRACKING 阶段用光流跟踪上一帧，不重新提取 ORB
+    PERF_SCOPE("vo.extract");
     const bool use_lk = (cfg_.feature_method == 1 && state_ == State::TRACKING
                          && prev_frame_ && !prev_frame_->keypoints.empty());
     if (use_lk) {
@@ -175,7 +178,10 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     }
 
     // 2.5 双目/RGB-D：视差（或深度）→ 每特征点的相机系 3D 观测 pts_c
-    computeStereoDepths();
+    {
+        PERF_SCOPE("vo.stereo_depth");
+        computeStereoDepths();
+    }
 
     // 3. 状态机处理
     if (state_ == State::INITIALIZING) {
@@ -189,10 +195,13 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
         }
     } else if (state_ == State::TRACKING) {
         // LK 模式：描述子为空说明走的是光流路径，用索引对齐的 PnP 跟踪
-        if (cfg_.feature_method == 1 && curr_frame_->descriptors.empty())
-            trackFrameLK();
-        else
-            trackFrame();
+        {
+            PERF_SCOPE("vo.track");
+            if (cfg_.feature_method == 1 && curr_frame_->descriptors.empty())
+                trackFrameLK();
+            else
+                trackFrame();
+        }
         // 跟踪可能把状态置为 RECOVERING（跳变保护），此时不能再插入关键帧
         if (state_ == State::TRACKING && needNewKeyFrame()) insertKeyFrame();
     }
@@ -213,7 +222,10 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
         } else {
             ++relocalization_frames_;
             if (relocalization_frames_ >= cfg_.max_relocalize_frames) {
-                createSubmap();
+                {
+                    PERF_SCOPE("vo.submap_reinit");
+                    createSubmap();
+                }
                 if (tryInitialize()) {
                     LOG_WARN((camera_->hasPerFrameDepth()
                               ? "Stereo re-init in anchored submap"
@@ -895,18 +907,24 @@ void VisualOdometry::insertKeyFrame() {
     // 必须在建新点之前执行：若在建点后剔除，本轮 createMapPointsFromStereo
     // 刚创建的点（observed_count=1）会被 cullMapPoints(2) 当场删除，参考
     // 关键帧瞬间失去全部新点，后续帧 PnP 可用 3D 点骤减 → 垃圾解 → LOST。
-    if (map_->keyFrameCount() % 20 == 0)
-        map_->cullMapPoints(2);
+    {
+        PERF_SCOPE("kf.cull");
+        if (map_->keyFrameCount() % 20 == 0)
+            map_->cullMapPoints(2);
+    }
 
     // 双目/RGB-D：当前帧有视差/深度的特征直接建点（绝对尺度）
-    createMapPointsFromStereo(curr_frame_);
-    // LK 模式：关键帧用干净的 ORB 特征重建（LK 关键点无方向，描述子无法与
-    // 历史关键帧匹配），保证与上一关键帧的 ORB 匹配/三角化可靠；
-    // 普通帧仍用 LK 光流跟踪（从关键帧 ORB 特征出发）
-    if (cfg_.feature_method == 1)
-        feature_matcher_.extract(curr_frame_);
-    triangulateNewPoints(ref_frame_, curr_frame_,
-        feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
+    {
+        PERF_SCOPE("kf.build_points");
+        createMapPointsFromStereo(curr_frame_);
+        // LK 模式：关键帧用干净的 ORB 特征重建（LK 关键点无方向，描述子无法与
+        // 历史关键帧匹配），保证与上一关键帧的 ORB 匹配/三角化可靠；
+        // 普通帧仍用 LK 光流跟踪（从关键帧 ORB 特征出发）
+        if (cfg_.feature_method == 1)
+            feature_matcher_.extract(curr_frame_);
+        triangulateNewPoints(ref_frame_, curr_frame_,
+            feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
+    }
     ref_frame_ = curr_frame_;
     last_kf_frame_id_ = curr_frame_->id;   // 更新关键帧冷却基准
 
@@ -914,8 +932,10 @@ void VisualOdometry::insertKeyFrame() {
 
     // 共视图滑动窗口（按共视地图点数选帧）+ Local BA
     std::vector<Frame::Ptr> window = selectLocalWindow(cfg_.local_window_size);
-    if (cfg_.enable_local_ba)
+    if (cfg_.enable_local_ba) {
+        PERF_SCOPE("kf.local_ba");
         Optimizer::localBundleAdjustment(camera_, map_, window, cfg_.local_ba_iterations);
+    }
 
     // Local BA 和新点关联完成后冻结相邻 KF 测量；后续位姿图不得从已优化
     // 轨迹重算它，否则会把上一次闭环结果误当成新的里程计观测。
@@ -986,10 +1006,13 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
     le.T_rel = T_loop_curr;
     le.weight = 10.0;  // 回环约束高置信
     loop_edges_.push_back(le);
-    if (!Optimizer::poseGraphOptimization(map_, odometry_edges_, loop_edges_)) {
-        loop_edges_.pop_back();
-        LOG_WARN("Loop correction skipped: pose graph backend unavailable or constraints invalid");
-        return;
+    {
+        PERF_SCOPE("loop.pose_graph");
+        if (!Optimizer::poseGraphOptimization(map_, odometry_edges_, loop_edges_)) {
+            loop_edges_.pop_back();
+            LOG_WARN("Loop correction skipped: pose graph backend unavailable or constraints invalid");
+            return;
+        }
     }
 
     // 3. 位姿图只优化关键帧。地图点按其最早观测关键帧的位姿增量同步，
@@ -1011,7 +1034,10 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
     }
 
     // 4. 全局 BA：地图点固定、优化关键帧位姿；使用配置的迭代次数。
-    Optimizer::globalBundleAdjustment(camera_, map_, cfg_.global_ba_iterations);
+    {
+        PERF_SCOPE("loop.global_ba");
+        Optimizer::globalBundleAdjustment(camera_, map_, cfg_.global_ba_iterations);
+    }
 
     // 5. 非关键帧不在位姿图中。将相邻关键帧的最终校正插值后施加到完整
     //    T_cw 轨迹，既保留朝向供 TUM 输出，也避免整段只用一个刚体变换。

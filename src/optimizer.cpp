@@ -1,4 +1,5 @@
 #include "vslam/optimizer.h"
+#include "perf_monitor.h"
 
 #ifdef HAS_G2O
 #include <g2o/core/base_unary_edge.h>
@@ -40,6 +41,7 @@ void Optimizer::localBundleAdjustment(
     LOG_WARN("Local BA skipped: vslam was built without g2o");
     return;
 #else
+    PERF_SCOPE("opt.ba");
     if (active_kfs.size() < 2) {
         LOG_INFO("Local BA: not enough keyframes (" << active_kfs.size() << ")");
         return;
@@ -239,6 +241,7 @@ bool Optimizer::poseGraphOptimization(Map::Ptr map,
     LOG_WARN("Pose graph optimization skipped: vslam was built without g2o");
     return false;
 #else
+    PERF_SCOPE("opt.pose_graph");
     auto kfs = map->getAllKeyFrames();
     if (kfs.size() < 2) return false;
 

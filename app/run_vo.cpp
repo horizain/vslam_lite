@@ -18,6 +18,7 @@
 #include "vslam/dataset.h"
 #include "vslam/viewer.h"
 #include "vslam/camera.h"
+#include "perf_monitor.h"
 
 #include <iostream>
 #include <string>
@@ -234,6 +235,9 @@ int main(int argc, char** argv) {
              << frame_count * 1000.0 / total_time << " FPS)");
     LOG_INFO("Final map: " << vo.getMap()->mapPointCount() << " points, "
              << vo.getMap()->keyFrameCount() << " keyframes");
+
+    // 性能监测 dump（VSLAM_ENABLE_PERF 关闭时为空操作）
+    vslam::perf_dump("perf.csv");
 
     return 0;
 }

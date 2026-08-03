@@ -1,5 +1,6 @@
 #include "vslam/loop_closure.h"
 #include "vslam/mappoint.h"
+#include "perf_monitor.h"
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -114,6 +115,7 @@ Frame::Ptr LoopClosure::detectLoop(Frame::Ptr kf) {
     (void)kf;
     return nullptr;
 #else
+    PERF_SCOPE("lc.detect");
     if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return nullptr;
 
     // 1. 词袋查询 Top-5
@@ -153,6 +155,7 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
     (void)kf_curr; (void)kf_loop; (void)T_loop_curr;
     return false;
 #else
+    PERF_SCOPE("lc.verify");
     if (!camera_ || !kf_curr || !kf_loop) return false;
 
     // 1. ORB 匹配：knn + ratio（queryIdx 属于 kf_curr，trainIdx 属于 kf_loop）
