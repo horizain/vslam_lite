@@ -910,7 +910,11 @@ void test_loop_closure() {
         assert(!vocab.empty());
 
         vslam::LoopClosure lc;
-        lc.setParams(0.3, 30, 30, 0.7, 3.0, cam);
+        // min_score 取 0.05：合成圆点特征的 ORB 描述子对微小视差很敏感，
+        // 末帧偏离原点 0.3m 后 BoW 分数会跌破 0.3。时间窗（30）才是防误报的
+        // 主闸，分数阈值只兜底，PnP 验证（min_loop_inliers=30, ratio=0.7）
+        // 仍会拒绝弱候选。
+        lc.setParams(0.05, 30, 30, 0.7, 3.0, cam);
         assert(lc.loadVocabulary(vocab));
 
         // 世界点云：相机前方（世界系 +Z 方向 10~30m，相机光轴默认朝 +Z）
@@ -950,8 +954,16 @@ void test_loop_closure() {
             poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(10 * step, i * step, 0)));
         for (int i = 1; i <= 10; i++)  // 段3：-X
             poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3((10 - i) * step, 10 * step, 0)));
-        for (int i = 1; i <= 10; i++)  // 段4：-Y（回到原点）
+        for (int i = 1; i <= 10; i++)  // 段4：-Y（回到起点附近）
             poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(0, (10 - i) * step, 0)));
+        // 末帧故意偏离原点（非单位位姿，T_cw ≠ T_wc）：若 verifyLoop 把
+        // solvePnP 输出的 T_cw 误当 T_wc 而漏掉求逆，回环边测量会反号，
+        // 下面的期望断言（cand->pose_cw * T_wc_curr）必然失败——覆盖 6c311d7
+        // 回归（当时末帧恰为单位位姿，正反求逆结果相同，测试无法区分）。
+        // 偏移取 0.15m 级：足够区分（反号误差 2×||t||≈0.36m >> 0.1m 容差），
+        // 又尽量保持合成圆点特征的 ORB 匹配内点比例（0.3m 时跌到 0.67）。
+        poses.back() = vslam::SE3(Eigen::Quaterniond::Identity(),
+                                  vslam::Vec3(0.15, 0.10, 0.0));
 
         // 逐帧：渲染 → 提取 ORB → 关联地图点 → 入词袋数据库
         vslam::FeatureMatcher matcher;

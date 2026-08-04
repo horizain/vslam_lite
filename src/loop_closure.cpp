@@ -198,14 +198,17 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
         return false;
     }
 
-    // 5. solvePnP 的 rvec/tvec 把世界点变换到相机系（T_wc 语义），
-    //    matToSE3(rvec, tvec) 的矩阵正是当前帧在回环地图坐标中的 T_wc。
-    //    由此构造位姿图测量 T_loop_curr = X_loop⁻¹ · X_curr（X 为 T_wc，
-    //    满足 X_curr = X_loop · T_loop_curr，见 loop_closure.h）。旧实现用
-    //    同一批世界点做 Umeyama 求 Sim3，尺度恒为 1 无法观测单目尺度，
-    //    还引入了错误的全图 gauge 变换。
-    const SE3 T_wc_curr_in_loop = matToSE3(rvec, tvec);
-    T_loop_curr = kf_loop->pose_cw * T_wc_curr_in_loop;
+    // 5. solvePnP 的 rvec/tvec 满足 p_c = R·p_w + t（世界→相机），即
+    //    matToSE3(rvec, tvec) 是当前帧的 T_cw（与 trackFrame 中直接把
+    //    solvePnP 结果存为 pose_cw 的用法一致）。位姿图边的测量约定为
+    //    Z = X_loop⁻¹ · X_curr（X 为 T_wc，见 loop_closure.h 与
+    //    test_vo.cpp 位姿图测试），故需要 T_cw_curr 的逆：
+    //      Z = kf_loop->pose_cw * T_wc_curr = T_cw_loop * T_cw_curr⁻¹。
+    //    注意：6c311d7 曾误判 solvePnP 输出为 T_wc 而删掉此逆，导致
+    //    回环约束与里程计矛盾、每次校正把轨迹拉向错误方向（ATE 恶化），
+    //    已在 2026-08-04 修正回 T_cw 语义。
+    const SE3 T_cw_curr_in_loop = matToSE3(rvec, tvec);
+    T_loop_curr = kf_loop->pose_cw * T_cw_curr_in_loop.inverse();
     LOG_INFO("LoopClosure: verified! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
              << " inliers=" << inliers.size());
     return true;
