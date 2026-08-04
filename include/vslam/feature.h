@@ -13,7 +13,8 @@ public:
     FeatureMatcher();
 
     /// 设置 ORB 提取参数（重建提取器）
-    void setParams(int num_features, double scale_factor, int pyramid_levels);
+    void setParams(int num_features, double scale_factor, int pyramid_levels,
+                   int orb_max_bands = 8);
 
     /// 对一帧图像提取 ORB 特征，结果写入 frame.keypoints / frame.descriptors
     void extract(Frame::Ptr frame);
@@ -54,6 +55,7 @@ private:
     int num_features_ = 1000;      // ORB 特征预算（并行分带提取用）
     double scale_factor_ = 1.2;
     int pyramid_levels_ = 8;
+    int orb_max_bands_ = 8;        // 分带上限；1 禁用外层分带并行
 };
 
 } // namespace vslam

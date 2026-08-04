@@ -38,6 +38,15 @@ struct Frame {
 
     Frame() = default;
     Frame(unsigned long id_, double ts_) : id(id_), timestamp(ts_) {}
+
+    /// 释放仅供前端处理/Viewer 使用的像素缓冲，保留关键帧几何与回环数据。
+    /// LK 时序跟踪尚未完成时可暂时保留左目灰度图；右目只在当前帧计算深度时使用。
+    void releaseImages(bool keep_left_gray = false) {
+        image.release();
+        image_right.release();
+        image_right_gray.release();
+        if (!keep_left_gray) image_gray.release();
+    }
 };
 
 } // namespace vslam

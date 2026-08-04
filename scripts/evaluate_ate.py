@@ -30,17 +30,29 @@ def load_tum(path):
 
 def umeyama(src, dst):
     """Sim3 对齐: dst ≈ s·R·src + t。src/dst: (N,3) 点集
-    Umeyama: Σ_xy = (1/N)·Σ(y-μ_y)(x-μ_x)ᵀ = U·D·Vᵀ
-             s = trace(D)/σ_x²，σ_x² = (1/N)·Σ||x-μ_x||²  （注意 1/N！）"""
+    使用 Σ_xy=(x-μ_x)ᵀ(y-μ_y)/N 时，旋转为 V·S·Uᵀ；
+    S 的最后一项同时用于反射修正和尺度计算。"""
+    src = np.asarray(src, dtype=float)
+    dst = np.asarray(dst, dtype=float)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3:
+        raise ValueError("src/dst 必须是形状相同的 (N,3) 点集")
+    if len(src) < 3:
+        raise ValueError("Umeyama 对齐至少需要 3 个点")
+
     n = len(src)
     mu_s, mu_d = src.mean(0), dst.mean(0)
-    S = (src - mu_s).T @ (dst - mu_d) / n
-    U, D, Vt = np.linalg.svd(S)
-    R = U @ Vt
-    if np.linalg.det(R) < 0:            # 反射修正（保证纯旋转）
-        R = U @ np.diag([1, 1, -1]) @ Vt
+    src_centered = src - mu_s
+    dst_centered = dst - mu_d
+    covariance = src_centered.T @ dst_centered / n
+    U, singular_values, Vt = np.linalg.svd(covariance)
+    signs = np.ones(3)
+    if np.linalg.det(Vt.T @ U.T) < 0:
+        signs[-1] = -1.0
+    R = Vt.T @ np.diag(signs) @ U.T
     var_s = np.sum((src - mu_s) ** 2) / n   # 方差（含 1/N）
-    s = np.trace(np.diag(D)) / var_s        # 尺度
+    if var_s <= np.finfo(float).eps:
+        raise ValueError("源点集方差为 0，无法估计 Sim3")
+    s = np.dot(singular_values, signs) / var_s
     t = mu_d - s * R @ mu_s
     return R, t, s
 

@@ -16,10 +16,12 @@ FeatureMatcher::FeatureMatcher() {
     matcher_ = cv::DescriptorMatcher::create(cv::DescriptorMatcher::BRUTEFORCE_HAMMING);
 }
 
-void FeatureMatcher::setParams(int num_features, double scale_factor, int pyramid_levels) {
+void FeatureMatcher::setParams(int num_features, double scale_factor, int pyramid_levels,
+                               int orb_max_bands) {
     num_features_ = num_features;
     scale_factor_ = scale_factor;
     pyramid_levels_ = pyramid_levels;
+    orb_max_bands_ = std::clamp(orb_max_bands, 1, 8);
     orb_ = cv::ORB::create(num_features, (float)scale_factor, pyramid_levels,
                            15, 0, 2, cv::ORB::HARRIS_SCORE, 19, 10);
 }
@@ -41,7 +43,7 @@ void FeatureMatcher::extract(Frame::Ptr frame) {
     constexpr int kBorder = 18;
     int nbands = 1;
     if (rows >= 2 * kBorder + 64 && num_features_ >= 500) {
-        nbands = std::clamp(cv::getNumThreads() / 2, 1, 8);
+        nbands = std::clamp(cv::getNumThreads() / 2, 1, orb_max_bands_);
         while (nbands > 1 && rows / nbands < 48) --nbands;
     }
 

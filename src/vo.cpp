@@ -23,8 +23,12 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (f["num_features"])    cfg.num_features           = f["num_features"].as<int>();
             if (f["scale_factor"])    cfg.scale_factor           = f["scale_factor"].as<double>();
             if (f["pyramid_levels"])  cfg.pyramid_levels         = f["pyramid_levels"].as<int>();
+            if (f["orb_max_bands"])   cfg.orb_max_bands          = f["orb_max_bands"].as<int>();
             if (f["match_ratio"])     cfg.match_ratio            = f["match_ratio"].as<double>();
             if (f["ransac_threshold"]) cfg.ransac_pixel_threshold = f["ransac_threshold"].as<double>();
+        }
+        if (auto r = root["Runtime"]) {
+            if (r["opencv_threads"]) cfg.opencv_threads = r["opencv_threads"].as<int>();
         }
         if (auto v = root["VO"]) {
             if (v["method"])              cfg.feature_method       = v["method"].as<int>();
@@ -82,7 +86,12 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
 VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
     : camera_(camera), cfg_(cfg), atlas_(std::make_shared<Atlas>()) {
     map_ = atlas_->createSubmap(SE3()).map;
-    feature_matcher_.setParams(cfg_.num_features, cfg_.scale_factor, cfg_.pyramid_levels);
+    if (cfg_.opencv_threads > 0) {
+        cv::setNumThreads(cfg_.opencv_threads);
+        LOG_INFO("OpenCV threads limited to " << cv::getNumThreads());
+    }
+    feature_matcher_.setParams(cfg_.num_features, cfg_.scale_factor,
+                               cfg_.pyramid_levels, cfg_.orb_max_bands);
     if (cfg_.feature_method != 0) {
         LOG_INFO("feature_method=" << cfg_.feature_method << " (LK 光流)");
     }
@@ -117,6 +126,17 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     unsigned long frame_id = frame_count_++;
     LOG_INFO("--- Frame " << frame_id << " ---");
 
+    // 先复制 Mat 头，兼容调用方把 currentFrame()->image 直接作为下一帧输入；
+    // 随后的 releaseImages 只移除旧 Frame 的引用，不会令本轮输入失效。
+    const cv::Mat left_input = left;
+    const cv::Mat right_input = right;
+
+    // 上次 addFrame 返回后 Viewer 已完成取帧。旧当前帧若仍是 LK 的上一帧，
+    // 只保留左灰度图到本轮光流结束；其余像素缓冲现在即可释放。异常帧可能
+    // 未被设为 prev_frame_，这种帧在进入下一轮时可以直接释放全部图像。
+    Frame::Ptr old_current = curr_frame_;
+    if (old_current) old_current->releaseImages(old_current == prev_frame_);
+
     // 1. 创建当前帧 + CLAHE 增强
     curr_frame_ = std::make_shared<Frame>(frame_id, timestamp);
     status_.tracking_valid = false;
@@ -129,22 +149,22 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     status_.pose_rmse = 0.0;
     status_.translation_delta = 0.0;
     status_.rotation_delta = 0.0;
-    if (left.channels() == 3)
-        cv::cvtColor(left, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
+    if (left_input.channels() == 3)
+        cv::cvtColor(left_input, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
     else
-        curr_frame_->image_gray = left;
-    curr_frame_->image = left;
+        curr_frame_->image_gray = left_input;
+    curr_frame_->image = left_input;
 
     static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
     clahe->apply(curr_frame_->image_gray, curr_frame_->image_gray);
 
     // 双目：右目图做同样的灰度化 + 增强（左右目一致，保证双目匹配质量）
-    if (!right.empty()) {
-        curr_frame_->image_right = right;
-        if (right.channels() == 3)
-            cv::cvtColor(right, curr_frame_->image_right_gray, cv::COLOR_BGR2GRAY);
+    if (!right_input.empty()) {
+        curr_frame_->image_right = right_input;
+        if (right_input.channels() == 3)
+            cv::cvtColor(right_input, curr_frame_->image_right_gray, cv::COLOR_BGR2GRAY);
         else
-            curr_frame_->image_right_gray = right;
+            curr_frame_->image_right_gray = right_input;
         clahe->apply(curr_frame_->image_right_gray, curr_frame_->image_right_gray);
     }
 
@@ -178,6 +198,10 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
         updateStatus(0, 0, 0.0);
         return (state_ != State::INITIALIZING) ? curr_frame_->pose_cw : SE3();
     }
+    // 时序 LK 已完成，旧上一帧的左灰度图不再被前端使用。若它同时是历史
+    // 关键帧，仅释放像素数据；描述子/关键点/map_points/pts_c 继续留在地图中。
+    // 当前帧提取失败时不能释放：prev_frame_ 仍会作为下一轮 LK 的输入。
+    if (prev_frame_) prev_frame_->releaseImages();
 
     // 2.5 双目/RGB-D：视差（或深度）→ 每特征点的相机系 3D 观测 pts_c
     {

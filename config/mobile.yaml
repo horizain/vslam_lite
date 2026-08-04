@@ -1,0 +1,80 @@
+# ============================================================
+# 移动端低资源配置
+# 用法: ./build/bin/run_vo <dataset> config/mobile.yaml traj.txt --headless
+# 相机参数仅为 KITTI 兜底；有数据集标定时仍优先使用 calib.txt。
+# ============================================================
+
+Camera:
+  fx: 718.856
+  fy: 718.856
+  cx: 607.193
+  cy: 185.216
+  width: 1241
+  height: 376
+  k1: 0.0
+  k2: 0.0
+  p1: 0.0
+  p2: 0.0
+  k3: 0.0
+
+Feature:
+  num_features: 600
+  scale_factor: 1.2
+  pyramid_levels: 6
+  orb_max_bands: 1         # 避免 ORB 内部并行之外再叠加分带任务
+  match_ratio: 0.7
+  ransac_threshold: 3.0
+
+Runtime:
+  opencv_threads: 4        # 低功耗设备可进一步改为 2
+
+VO:
+  method: 0
+  min_parallax: 0.1
+  min_matches_init: 80
+  min_matches_track: 20
+  pnp_min_inliers: 15
+  pnp_min_inlier_ratio: 0.3
+  pnp_max_rmse: 2.5
+  max_tracking_failures: 5
+  max_relocalize_frames: 20
+  max_frame_translation: 3.0
+  max_frame_rotation: 0.35
+  keyframe_translation: 0.5
+  keyframe_rotation: 0.2
+  keyframe_min_inliers: 15
+  min_keyframe_interval: 10
+  max_keyframe_interval: 15
+
+Optimizer:
+  local_window_size: 6
+  local_ba_iterations: 3
+  enable_local_ba: true
+  global_ba_iterations: 10
+
+LoopClosure:
+  enable_loop_closure: true
+  vocab_path: "config/ORBvoc.dbow3"
+  min_score: 0.1
+  temporal_window: 30
+  detection_interval: 10
+  pnp_inlier_ratio: 0.85
+  min_loop_inliers: 50
+  loop_cooldown_frames: 200
+
+Viewer:
+  enabled: true
+  camera_size: 0.1
+  point_size: 2
+  trajectory_color: [0.0, 0.8, 1.0]
+
+Stereo:
+  baseline: 0.54
+  min_depth: 0.5
+  max_depth: 35.0
+  min_points: 40
+  rigid_min_inliers: 15
+  rigid_min_inlier_ratio: 0.5
+  rigid_ransac_threshold: 0.25
+  rigid_max_rmse: 0.25
+  keyframe_translation: 0.9

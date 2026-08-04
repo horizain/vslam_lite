@@ -19,6 +19,8 @@ struct VOConfig {
     int    pyramid_levels         = 8;      // 金字塔层数
     double match_ratio            = 0.7;    // 最近邻/次近邻比率阈值
     double ransac_pixel_threshold = 3.0;    // PnP RANSAC 重投影误差阈值(px)
+    int    orb_max_bands          = 8;      // ORB 外层并行分带上限（1=单带）
+    int    opencv_threads         = 0;      // OpenCV 线程数（0=保持库默认值）
     int    min_matches_init       = 100;    // 初始化最小匹配数
     int    min_matches_track      = 20;     // 跟踪/对极回退最小匹配数
     int    pnp_min_inliers        = 15;     // PnP 最小内点数

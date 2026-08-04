@@ -126,6 +126,48 @@ void test_feature_extraction() {
     } TEST_PASS();
 }
 
+void test_frame_image_lifecycle() {
+    TEST("Frame 像素缓冲分阶段释放且关键帧数据保留") {
+        auto frame = std::make_shared<vslam::Frame>(7, 0.7);
+        frame->image = cv::Mat(48, 64, CV_8UC3, cv::Scalar(1, 2, 3));
+        frame->image_gray = cv::Mat(48, 64, CV_8UC1, cv::Scalar(4));
+        frame->image_right = cv::Mat(48, 64, CV_8UC3, cv::Scalar(5, 6, 7));
+        frame->image_right_gray = cv::Mat(48, 64, CV_8UC1, cv::Scalar(8));
+        frame->keypoints.emplace_back(cv::Point2f(10, 12), 31.0f);
+        frame->descriptors = cv::Mat::ones(1, 32, CV_8UC1);
+        frame->map_points.push_back(std::make_shared<vslam::MapPoint>(3));
+        frame->pts_c.emplace_back(1.0, 2.0, 3.0);
+
+        frame->releaseImages(true);
+        assert(frame->image.empty());
+        assert(!frame->image_gray.empty());
+        assert(frame->image_right.empty());
+        assert(frame->image_right_gray.empty());
+
+        frame->releaseImages();
+        assert(frame->image_gray.empty());
+        assert(frame->keypoints.size() == 1);
+        assert(frame->descriptors.rows == 1);
+        assert(frame->map_points.size() == 1 && frame->map_points[0]);
+        assert(frame->pts_c.size() == 1 && frame->pts_c[0].z() == 3.0);
+    } TEST_PASS();
+}
+
+void test_mobile_config() {
+    TEST("mobile.yaml 资源预算参数可加载") {
+        const auto config_path = std::filesystem::path(__FILE__).parent_path()
+            .parent_path() / "config/mobile.yaml";
+        const auto cfg = vslam::VOConfig::fromYaml(config_path.string());
+        assert(cfg.num_features == 600);
+        assert(cfg.pyramid_levels == 6);
+        assert(cfg.orb_max_bands == 1);
+        assert(cfg.opencv_threads == 4);
+        assert(cfg.local_window_size == 6);
+        assert(cfg.local_ba_iterations == 3);
+        assert(cfg.enable_loop_closure);
+    } TEST_PASS();
+}
+
 void test_vo_initialization() {
     TEST("VO two-frame initialization (synthetic)") {
         // 创建两帧合成图像（第二帧模拟向右平移）
@@ -685,6 +727,10 @@ void test_stereo_vo() {
         assert(vo.getStatus().pose_valid);
         assert(vo.getStatus().stereo_points >= cfg.stereo_min_points);
         assert(vo.getMap()->mapPointCount() > 50);
+        auto first_kf = vo.getMap()->getKeyFrame(0);
+        assert(first_kf);
+        assert(!first_kf->image.empty());       // 当前帧必须仍可供 Viewer 使用
+        assert(!first_kf->image_gray.empty());
 
         // 帧 2：相机沿 +z 前进 1m，位移尺度应 ≈1m（绝对尺度）
         cv::Mat l2, r2;
@@ -695,6 +741,16 @@ void test_stereo_vo() {
         std::cout << " (disp=" << disp << "m mp=" << vo.getMap()->mapPointCount() << ")";
         assert(std::abs(disp - 1.0) < 0.3);
         assert(vo.getStatus().pose_valid);
+        assert(first_kf->image.empty());        // 历史关键帧不再持有像素缓冲
+        assert(first_kf->image_gray.empty());
+        assert(first_kf->image_right.empty());
+        assert(first_kf->image_right_gray.empty());
+        assert(!first_kf->descriptors.empty());
+        assert(!first_kf->keypoints.empty());
+        assert(!first_kf->map_points.empty());
+        assert(!first_kf->pts_c.empty());
+        assert(!vo.currentFrame()->image.empty());
+        assert(!vo.currentFrame()->image_right.empty());
     } TEST_PASS();
 }
 
@@ -1069,6 +1125,8 @@ int main() {
 
     std::cout << "\n[Feature Extraction]\n";
     test_feature_extraction();
+    test_frame_image_lifecycle();
+    test_mobile_config();
 
     std::cout << "\n[VO Initialization]\n";
     test_vo_initialization();

@@ -21,8 +21,13 @@ Feature:
   num_features: 1000       # 每帧提取的 ORB 特征数
   scale_factor: 1.2        # 金字塔尺度因子
   pyramid_levels: 8        # 金字塔层数
+  orb_max_bands: 8         # ORB 外层并行分带上限；1=单带，8 保持原有桌面行为
   match_ratio: 0.7         # 最近邻/次近邻比率测试阈值
   ransac_threshold: 3.0    # RANSAC 重投影误差阈值
+
+# ---- 运行时资源参数 ----
+Runtime:
+  opencv_threads: 0        # 0=保持 OpenCV 默认值；移动端建议 2~4
 
 # ---- VO 参数 ----
 VO:

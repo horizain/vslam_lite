@@ -55,20 +55,33 @@ def quat_to_mat(q):
 
 def umeyama(src, dst):
     """Sim3 对齐: dst ≈ s·R·src + t（与 evaluate_ate.py 一致）"""
+    src = np.asarray(src, dtype=float)
+    dst = np.asarray(dst, dtype=float)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3:
+        raise ValueError("src/dst 必须是形状相同的 (N,3) 点集")
+    if len(src) < 3:
+        raise ValueError("Umeyama 对齐至少需要 3 个点")
+
     n = len(src)
     mu_s, mu_d = src.mean(0), dst.mean(0)
-    S = (src - mu_s).T @ (dst - mu_d) / n
-    U, D, Vt = np.linalg.svd(S)
-    R = U @ Vt
-    if np.linalg.det(R) < 0:
-        R = U @ np.diag([1, 1, -1]) @ Vt
-    s = np.trace(np.diag(D)) / (np.sum((src - mu_s) ** 2) / n)
+    src_centered = src - mu_s
+    dst_centered = dst - mu_d
+    covariance = src_centered.T @ dst_centered / n
+    U, singular_values, Vt = np.linalg.svd(covariance)
+    signs = np.ones(3)
+    if np.linalg.det(Vt.T @ U.T) < 0:
+        signs[-1] = -1.0
+    R = Vt.T @ np.diag(signs) @ U.T
+    var_s = np.sum(src_centered ** 2) / n
+    if var_s <= np.finfo(float).eps:
+        raise ValueError("源点集方差为 0，无法估计 Sim3")
+    s = np.dot(singular_values, signs) / var_s
     t = mu_d - s * R @ mu_s
     return R, t, s
 
 
 def match_timestamps(est, gt, tol=0.05):
-    """按时间戳最近邻匹配帧对（容忍 tol 秒），返回对齐后的位置数组"""
+    """按时间戳最近邻匹配帧对，返回位置数组和每个匹配对应的 GT 时间戳。"""
     gt_t = np.array([g[0] for g in gt])
     gt_pos = np.array([g[1] for g in gt])
     e_idx, g_idx = [], []
@@ -77,8 +90,9 @@ def match_timestamps(est, gt, tol=0.05):
         if abs(gt_t[k] - e[0]) <= tol:
             e_idx.append(i)
             g_idx.append(k)
+    g_idx = np.asarray(g_idx, dtype=int)
     return (np.array([est[i][1] for i in e_idx]),
-            gt_pos[np.array(g_idx)])
+            gt_pos[g_idx], gt_t[g_idx])
 
 
 def main():
@@ -95,7 +109,7 @@ def main():
         return 1
     out = args.out or (os.path.splitext(args.est)[0] + ".plot.png")
 
-    e_pts, g_pts = match_timestamps(est, gt)
+    e_pts, g_pts, matched_t = match_timestamps(est, gt)
     n = len(e_pts)
     if n < 3:
         print(f"错误: 有效匹配帧对仅 {n} 个")
@@ -140,10 +154,8 @@ def main():
     ax2.legend(fontsize=8)
 
     ax3 = fig.add_subplot(1, 3, 3)
-    # 逐帧误差的横轴 = 各估计帧时间戳对应的最近 GT 时间戳（与匹配一致）
-    gt_t_all = np.array([g[0] for g in gt])
-    e_t = np.array([e[0] for e in est])
-    matched_t = np.array([gt_t_all[np.argmin(np.abs(gt_t_all - tt))] for tt in e_t])[:n]
+    # 横轴直接使用 match_timestamps 接受的同一组索引，避免中间存在未匹配
+    # 估计帧时，简单截断全部时间戳造成误差与时间错位。
     ax3.plot(matched_t, err, color="tab:red", lw=1.0)
     ax3.axhline(rmse, color="tab:purple", ls="--", lw=1.0, label=f"RMSE {rmse:.2f} m")
     ax3.axhline(mx, color="tab:orange", ls=":", lw=1.0, label=f"Max {mx:.2f} m")
