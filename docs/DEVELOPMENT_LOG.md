@@ -902,3 +902,50 @@ kBorder 18→24 减少边界特征损失。
 **判定为已消除或概率极低**。建议：生产/长期运行环境默认开启
 `ulimit -c unlimited` + 崩溃时抓日志尾部，若再出现即可直接定位；
 **异步后端（P2-1）的并发引入风险已排除**，可择机实施。
+
+### 3.15 异步后端（P2-1）实现与 A/B 基准——净收益为负，默认关闭（2026-08-05）
+
+背景：§3.14 判定帧 4286 崩溃已消除后，按计划实施异步后端：Local BA /
+回环检测 / 回环校正在后台线程执行，前端只做跟踪不等待（帧率恒定）。
+
+**架构设计（快照隔离 + 短临界区）**：
+
+- `optimizer.cpp`：Local BA 去除 `map->getMapPoint` 依赖（改用收集期保存的
+  点指针）——优化可在"快照数据"上执行，完全不触碰地图集合；
+- `vo.cpp` 异步路径：`insertKeyFrame` 提交 BackendTask（有界队列 8，满则
+  调用方同步执行）→ 后台线程锁内构造快照（KF pose 深拷贝 + 点对象深拷贝）→
+  锁外 g2o 优化 → 锁内写回真 KF/真点；
+- `handleLoopCorrection` 重构为三阶段（锁内收集工作集 → 锁外计算 →
+  锁内写回），同步/异步共用同一实现；
+- `loop_closure.cpp`：addKeyFrame/detectLoop 内部互斥；
+- 锁序约定：backend → map → traj，无嵌套持锁。
+
+**调试记录（两个并发 bug，均实测复现+修复）**：
+
+1. **torn read**：后台写回 `Eigen::Vector3d`（24B 非原子）与前端 PnP 裸读
+   竞争 → 读到新旧混合坐标 → 垃圾 3D 点 → LOST 爆增（基准实测 async 114 vs
+   sync 34）。修复：前端所有读点路径（trackFrame/trackFrameLK/tryTrack3D3D/
+   tryRelocalize）持 map_mutex_ 拷贝。
+2. **非递归锁重入死锁**：`tryRelocalize` 成功路径在 map_mutex_ 块内调用
+   `updateStatus`（内部再次 lock）→ 确定性死锁（复现点：Relocalized 日志后
+   主线程永久卡住，/proc 所有线程 futex_do_wait）。修复：updateStatus 移出锁块。
+
+**基准测试**（新增 `scripts/benchmark.py`：N 次全程跑，汇总 FPS/ATE/LOST/
+重建/闭环/BA 峰值，支持双配置对比）：
+
+| 指标 | async (A) | sync (B) | 结论 |
+|------|-----------|----------|------|
+| FPS | 8.13 ± 0.11 | 8.55 ± 0.25 | async -5% |
+| LOST 次数 | 122.5 ± 20.5 | 53.0 ± 14.0 | async +130% |
+| ATE RMSE | 87.4 ± 14.0 | 71.5 ± 2.8 | async -18% |
+| 闭环次数 | 1.0 | 2.0 | async 滞后 |
+
+**结论**：异步后端**净收益为负**，默认关闭（`Runtime.async_backend: false`，
+代码保留为实验性开关）。根因：BA 在后台滞后数帧执行，前端 PnP 使用陈旧
+3D 点/位姿 → 跟踪误差积累 → LOST 增多 → reloc/重建开销抵消 BA 的异步收益。
+同步模式（主线程即时 BA）在"每 2 帧一个 KF、BA 25ms"的负载下没有明显瓶颈；
+异步的收益要在"前端重负载"（特征/立体匹配为主）或"KF 密集 + BA 大"的场景
+才有意义。若要真正受益，需 ORB-SLAM 级的前端/后端彻底分离（LocalMapping
+线程 + 显式关键帧/点管理 + 延迟一致），留待后续。
+
+附带修复：`opt.ba` 观测收集改为保存点指针（同步路径行为不变，单测 27 项全过）。

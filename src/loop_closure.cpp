@@ -100,6 +100,7 @@ void LoopClosure::addKeyFrame(Frame::Ptr kf) {
     (void)kf;
 #else
     if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);  // 与后台 detectLoop 互斥
     // 计算词袋向量并入库（复用已算过的，避免重复 transform）
     auto it = impl_->kf_bow.find(kf->id);
     DBoW3::BowVector bow;
@@ -124,6 +125,8 @@ std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
     PERF_SCOPE("lc.detect");
     std::vector<Frame::Ptr> candidates;
     if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return candidates;
+
+    std::lock_guard<std::mutex> lock(mutex_);  // 与主线程 addKeyFrame 互斥
 
     // 1. 词袋查询 Top-N（召回扩宽；准确性交给下方时间窗/分数过滤 + PnP 验证）
     DBoW3::BowVector bow;

@@ -8,9 +8,23 @@
 #include "vslam/feature.h"
 #include "vslam/loop_closure.h"
 #include "vslam/optimizer.h"
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <string>
+#include <unordered_set>
 
 namespace vslam {
+
+/// 异步后端任务（P2-1）：Local BA / 回环检测+校正，由后台线程执行。
+struct BackendTask {
+    enum class Type { LocalBA, LoopClosure };
+    Type type = Type::LocalBA;
+    std::vector<Frame::Ptr> window;   // LocalBA：窗口关键帧（快照在后台锁内构造）
+    Frame::Ptr curr_kf;               // LoopClosure：当前关键帧
+};
 
 /// VO/Feature/Optimizer 参数（默认值与 config/default.yaml 一致）
 struct VOConfig {
@@ -68,6 +82,10 @@ struct VOConfig {
     int    loop_position_prior_gap   = 100; // 位置先验最小关键帧间隔
     int    global_ba_iterations  = 20;      // 回环后全局 BA 迭代次数
 
+    // ---- 异步后端（P2-1）----
+    bool   async_backend         = false;   // Local BA / 回环检测 / 回环校正在后台线程执行，
+                                            // 前端只做跟踪不等待（帧率恒定）；false = 全同步（旧行为）
+
     /// 从 yaml 配置加载（缺省字段保持默认值）
     static VOConfig fromYaml(const std::string& path);
 };
@@ -105,6 +123,7 @@ public:
     };
 
     VisualOdometry(const Camera& camera, const VOConfig& cfg = VOConfig());
+    ~VisualOdometry();  // 异步后端：join 后台线程（P2-1）
 
     /// 输入一帧图像（单目/RGB-D 主图），返回当前的位姿估计
     SE3 addFrame(const cv::Mat& image, double timestamp = 0.0);
@@ -131,7 +150,10 @@ public:
     std::vector<Vec3> getTrajectory() const;
 
     /// 获取有效帧的完整位姿轨迹（T_cw，与 getTrajectory 顺序一致）
-    std::vector<SE3> getPoseTrajectory() const { return pose_trajectory_; }
+    std::vector<SE3> getPoseTrajectory() const {
+        std::lock_guard<std::mutex> lock(traj_mutex_);  // 后端回环校正重写轨迹
+        return pose_trajectory_;
+    }
 
     /// 是否应该创建新的关键帧
     bool needNewKeyFrame() const;
@@ -186,6 +208,22 @@ private:
                               const std::vector<cv::DMatch>& matches);
     static SE3 matToSE3(const cv::Mat& R, const cv::Mat& t);  // cv::Mat → SE3
 
+    // ---- 异步后端（P2-1）----
+    /// 后台线程主循环：取任务 → 快照（锁内）→ 锁外优化 → 写回（锁内）
+    void backendLoop();
+    /// 提交任务到有界队列（满则调用方同步执行，防止任务无限堆积）
+    void submitBackendTask(BackendTask task);
+    void startBackend();
+    void stopBackend();
+    /// 快照一个关键帧：pose_cw 拷贝；keep_points 为空则全部 map_points 深拷贝，
+    /// 否则只深拷贝 keep_points 中的点（其余置 nullptr，与 keypoints 索引对齐）
+    static Frame::Ptr snapshotFrame(const Frame::Ptr& kf,
+                                    const std::unordered_set<unsigned long>* keep_points = nullptr);
+    /// 后台执行 Local BA（快照隔离，优化不触碰地图集合）
+    void runBackendLocalBA(const std::vector<Frame::Ptr>& window);
+    /// 后台执行回环检测 → 验证 → 校正（候选来自词袋+位置先验）
+    void runBackendLoopClosure(const Frame::Ptr& curr_kf);
+
     // ---- 成员变量 ----
     Camera    camera_;
     VOConfig  cfg_;
@@ -205,11 +243,21 @@ private:
     std::vector<LoopEdge> odometry_edges_;   // KF 插入时冻结，不能从优化后位姿重算
     std::vector<LoopEdge> loop_edges_;       // 累积保留历史回环约束
 
-    // ---- Phase 2 回环状态 ----
+    // ---- 回环状态 ----
     std::unique_ptr<LoopClosure> loop_closure_;
     bool loop_closure_enabled_ = false;
-    unsigned long loop_closure_count_ = 0;   // 已闭合回环次数
-    unsigned long last_loop_kf_count_ = 0;   // 上次回环校正时的关键帧数（冷却基准）
+    std::atomic<unsigned long> loop_closure_count_{0};  // 已闭合回环次数（前后端共享）
+    std::atomic<unsigned long> last_loop_kf_count_{0};  // 上次回环校正时的 KF 数（冷却基准）
+
+    // ---- 异步后端同步原语 ----
+    mutable std::mutex map_mutex_;  // 保护地图集合/KF 位姿/点坐标/edges 的读写（needNewKeyFrame 为 const 方法）
+    mutable std::mutex traj_mutex_;  // 保护 pose_trajectory_/traj_frame_ids_（getter 为 const）
+    std::mutex backend_mutex_;   // 保护任务队列（锁顺序：backend → map/traj，无嵌套持锁）
+    std::condition_variable backend_cv_;
+    std::deque<BackendTask> backend_tasks_;
+    std::thread backend_thread_;
+    std::atomic<bool> backend_stop_{false};
+    std::atomic<bool> backend_running_{false};
 
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）

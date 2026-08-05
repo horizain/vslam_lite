@@ -28,6 +28,7 @@ Feature:
 # ---- 运行时资源参数 ----
 Runtime:
   opencv_threads: 0        # 0=保持 OpenCV 默认值；移动端建议 2~4
+  async_backend: false       # 异步后端（实验性）：实测净收益为负（BA 滞后致前端用陈旧点，LOST +130%），默认关闭；见 DEVELOPMENT_LOG §3.15
 
 # ---- VO 参数 ----
 VO:

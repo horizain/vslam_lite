@@ -119,6 +119,10 @@ void Optimizer::localBundleAdjustment(
     };
 
     std::unordered_map<unsigned long, std::vector<Observation>> mp_observations;
+    // 点指针与观测同步收集：BA 必须在"快照数据"上执行（异步后端场景下
+    // 优化线程不接触地图集合——快照帧持 shared_ptr，对象生命周期安全）。
+    // 不再在优化中调用 map->getMapPoint（地图集合可能被主线程并发修改）。
+    std::unordered_map<unsigned long, MapPoint::Ptr> mp_ptr_by_id;
 
     for (size_t i = 0; i < active_kfs.size(); i++) {
         auto& kf = active_kfs[i];
@@ -128,6 +132,7 @@ void Optimizer::localBundleAdjustment(
             // 检查这个地图点是否已被添加到优化器
             if (mp_observations.find(mp->id) == mp_observations.end()) {
                 mp_observations[mp->id] = {};
+                mp_ptr_by_id[mp->id] = mp;
             }
             mp_observations[mp->id].push_back({
                 i, j,
@@ -164,8 +169,9 @@ void Optimizer::localBundleAdjustment(
         if (obs_list.size() < 3) continue;  // 至少 3 帧观测，过滤弱观测坏点
         if (!selected_mps.empty() && !selected_mps.count(mp_id)) continue;
 
-        auto mp = map->getMapPoint(mp_id);
-        if (!mp) continue;
+        auto mp_it = mp_ptr_by_id.find(mp_id);
+        if (mp_it == mp_ptr_by_id.end()) continue;
+        auto& mp = mp_it->second;
 
         auto* v_point = new g2o::VertexPointXYZ();
         v_point->setId(point_vertex_id);
@@ -194,7 +200,9 @@ void Optimizer::localBundleAdjustment(
         if (it == mp_id_to_vertex.end()) continue;
 
         int point_vid = it->second;
-        auto mp = map->getMapPoint(mp_id);
+        auto mp_it = mp_ptr_by_id.find(mp_id);
+        if (mp_it == mp_ptr_by_id.end()) continue;
+        auto& mp = mp_it->second;
 
         for (auto& obs : obs_list) {
             auto* edge = new g2o::EdgeProjectXYZ2UV();
@@ -266,9 +274,9 @@ void Optimizer::localBundleAdjustment(
             optimizer.vertex(point_vid));
         if (!v_point) continue;
 
-        auto mp = map->getMapPoint(mp_id);
-        if (mp) {
-            mp->pos_w = v_point->estimate();
+        auto mp_it = mp_ptr_by_id.find(mp_id);
+        if (mp_it != mp_ptr_by_id.end() && mp_it->second) {
+            mp_it->second->pos_w = v_point->estimate();
         }
     }
 
