@@ -7,6 +7,7 @@ namespace vslam {
 void Map::insertMapPoint(MapPoint::Ptr mp) {
     if (map_points_.find(mp->id) == map_points_.end()) {
         map_points_[mp->id] = mp;
+        mp_count_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -31,6 +32,8 @@ void Map::cullMapPoints(int min_observations) {
             ++it;
         }
     }
+    if (!removed.empty())
+        mp_count_.fetch_sub(removed.size(), std::memory_order_relaxed);
     // 同步清空关键帧中的引用，让内存真正释放
     if (!removed.empty()) {
         for (auto& [id, kf] : keyframes_) {
@@ -41,8 +44,11 @@ void Map::cullMapPoints(int min_observations) {
 }
 
 void Map::insertKeyFrame(Frame::Ptr kf) {
-    kf->is_keyframe = true;
-    keyframes_[kf->id] = kf;
+    if (keyframes_.find(kf->id) == keyframes_.end()) {
+        kf->is_keyframe = true;
+        keyframes_[kf->id] = kf;
+        kf_count_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 Frame::Ptr Map::getKeyFrame(unsigned long id) const {
@@ -69,6 +75,8 @@ std::vector<MapPoint::Ptr> Map::getAllMapPoints() const {
 void Map::clear() {
     map_points_.clear();
     keyframes_.clear();
+    mp_count_.store(0, std::memory_order_relaxed);
+    kf_count_.store(0, std::memory_order_relaxed);
 }
 
 } // namespace vslam

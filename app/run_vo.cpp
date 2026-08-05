@@ -107,8 +107,14 @@ int main(int argc, char** argv) {
 
     // ---- 初始化 VO（加载 VO/Feature/Optimizer 参数）----
     vslam::VOConfig vo_cfg = vslam::VOConfig::fromYaml(config_path);
-    // run_vo 固定关闭回环：与 run_slam（回环开）构成 A/B 对比基线
+    // run_vo 固定关闭回环 + 局部 BA：定位为"纯 VO 前端"（仅跟踪），
+    // 与 run_slam（回环开 + 局部BA开）构成 A/B 对比基线。
+    // 注意：此处强制覆盖 config 的 Optimizer.enable_local_ba/LoopClosure，
+    // 如需对比"纯 VO vs 带局部BA"，请用 run_slam + 相应 config。
     vo_cfg.enable_loop_closure = false;
+    vo_cfg.enable_local_ba = false;
+    // 纯 VO 无 BA/回环任务，后端线程空转，一并关闭
+    vo_cfg.async_backend = false;
     vslam::VisualOdometry vo(camera, vo_cfg);
 
     // ---- 初始化可视化（--headless 跳过，用于批量评估）----

@@ -21,14 +21,21 @@ Feature:
   num_features: 1000       # 每帧提取的 ORB 特征数
   scale_factor: 1.2        # 金字塔尺度因子
   pyramid_levels: 8        # 金字塔层数
-  orb_max_bands: 8         # ORB 外层并行分带上限；1=单带，8 保持原有桌面行为
+  orb_max_bands: 4         # ORB 外层并行分带上限；1=单带。与 opencv_threads 配套收敛
+                           # TBB 嵌套并行度（带×octave 任务成倍放大，超订无益，见 §3.16）
   match_ratio: 0.7         # 最近邻/次近邻比率测试阈值
   ransac_threshold: 3.0    # RANSAC 重投影误差阈值
 
 # ---- 运行时资源参数 ----
 Runtime:
-  opencv_threads: 0        # 0=保持 OpenCV 默认值；移动端建议 2~4
-  async_backend: false       # 异步后端（实验性）：实测净收益为负（BA 滞后致前端用陈旧点，LOST +130%），默认关闭；见 DEVELOPMENT_LOG §3.15
+  opencv_threads: 16       # OpenCV/TBB 线程数。0=库默认（=全部逻辑核，32 核机器实测进程
+                           # 63 线程、超订无益）；设物理核数（本机 16）实测 FPS 最高且线程
+                           # 减到 47（§3.16 A/B）；移动端建议 2~4
+  async_backend: true      # 异步后端：Local BA / 回环在后台线程执行，前端不等待。
+                           # §3.15 曾因"BA 滞后致前端用陈旧点、LOST +130%"默认关闭；
+                           # §3.16 覆盖式队列 + 跳过活动参考帧写回后净收益转正：
+                           # 全程 FPS +23%（27.9→34.4）、LOST -97%（292→8）、闭环 3 次。
+                           # 设 false 回到同步（前端线程即时 BA）
 
 # ---- VO 参数 ----
 VO:

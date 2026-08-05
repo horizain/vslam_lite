@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <string>
 #include <unordered_set>
@@ -84,7 +85,9 @@ struct VOConfig {
 
     // ---- 异步后端（P2-1）----
     bool   async_backend         = false;   // Local BA / 回环检测 / 回环校正在后台线程执行，
-                                            // 前端只做跟踪不等待（帧率恒定）；false = 全同步（旧行为）
+                                            // 前端只做跟踪不等待。struct 默认 false；config 默认
+                                            // true（§3.16 覆盖式队列+跳过活动参考写回后净收益
+                                            // 转正：FPS+23%/LOST-97%）；false = 全同步（旧行为）
 
     /// 从 yaml 配置加载（缺省字段保持默认值）
     static VOConfig fromYaml(const std::string& path);
@@ -216,9 +219,12 @@ private:
     void startBackend();
     void stopBackend();
     /// 快照一个关键帧：pose_cw 拷贝；keep_points 为空则全部 map_points 深拷贝，
-    /// 否则只深拷贝 keep_points 中的点（其余置 nullptr，与 keypoints 索引对齐）
+    /// 否则只深拷贝 keep_points 中的点（其余置 nullptr，与 keypoints 索引对齐）。
+    /// with_descriptors=false 用于 BA 快照：g2o 只消费关键点像素与点位姿，
+    /// 不读描述子——全图回环快照省掉 ~70MB 描述子拷贝（P1，见 §3.16）。
     static Frame::Ptr snapshotFrame(const Frame::Ptr& kf,
-                                    const std::unordered_set<unsigned long>* keep_points = nullptr);
+                                    const std::unordered_set<unsigned long>* keep_points = nullptr,
+                                    bool with_descriptors = true);
     /// 后台执行 Local BA（快照隔离，优化不触碰地图集合）
     void runBackendLocalBA(const std::vector<Frame::Ptr>& window);
     /// 后台执行回环检测 → 验证 → 校正（候选来自词袋+位置先验）
@@ -250,7 +256,10 @@ private:
     std::atomic<unsigned long> last_loop_kf_count_{0};  // 上次回环校正时的 KF 数（冷却基准）
 
     // ---- 异步后端同步原语 ----
-    mutable std::mutex map_mutex_;  // 保护地图集合/KF 位姿/点坐标/edges 的读写（needNewKeyFrame 为 const 方法）
+    // P1：map_mutex_ 为读写锁。前端读点/位姿持共享锁（trackFrame/needNewKeyFrame 等），
+    // 后端 BA 写回与前端 KF 插入持独占锁——读路径并发、写路径独占，缩短前端等待。
+    // 写者饥饿由前端周期性独占锁（insertKeyFrame）天然消解。
+    mutable std::shared_mutex map_mutex_;  // 保护地图集合/KF 位姿/点坐标/edges 的读写
     mutable std::mutex traj_mutex_;  // 保护 pose_trajectory_/traj_frame_ids_（getter 为 const）
     std::mutex backend_mutex_;   // 保护任务队列（锁顺序：backend → map/traj，无嵌套持锁）
     std::condition_variable backend_cv_;
