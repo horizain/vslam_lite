@@ -35,6 +35,9 @@ struct VOConfig {
                                              // 单帧即可建点（绝对尺度），KF 只需服务 BA 稀疏化；
                                              // 阈值过大 → ref 间隔远 → 高速段匹配骤减会 LOST，
                                              // 过小 → 每帧插 KF → 地图膨胀 + BA 空转
+                                             // 跳过插入（关键帧稀疏化，压地图规模）
+    int    keyframe_max_count      = 1800;  // 关键帧规模硬顶：超过后平移阈值放大 1.5 倍
+                                             // （长序列/大场景防 KF 无限增长）
     double keyframe_rotation      = 0.2;    // 关键帧最小旋转(rad)
     int    keyframe_min_inliers   = 15;     // 跟踪内点低于该值 → 强制插入关键帧
     int    min_keyframe_interval  = 10;     // 关键帧最小帧间隔（防 weak_match 风暴）

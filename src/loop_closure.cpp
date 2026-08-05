@@ -116,13 +116,14 @@ void LoopClosure::addKeyFrame(Frame::Ptr kf) {
 #endif
 }
 
-Frame::Ptr LoopClosure::detectLoop(Frame::Ptr kf) {
+std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
 #ifndef HAS_DBOW3
     (void)kf;
-    return nullptr;
+    return {};
 #else
     PERF_SCOPE("lc.detect");
-    if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return nullptr;
+    std::vector<Frame::Ptr> candidates;
+    if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return candidates;
 
     // 1. 词袋查询 Top-N（召回扩宽；准确性交给下方时间窗/分数过滤 + PnP 验证）
     DBoW3::BowVector bow;
@@ -130,9 +131,8 @@ Frame::Ptr LoopClosure::detectLoop(Frame::Ptr kf) {
     DBoW3::QueryResults results;
     impl_->db->query(bow, results, top_candidates_);
 
-    // 2. 时间过滤 + 3. 分数过滤：取通过过滤的最高分候选
-    Frame::Ptr best;
-    double best_score = min_score_;
+    // 2. 时间过滤 + 3. 分数过滤：按分数降序收集候选
+    std::vector<std::pair<Frame::Ptr, double>> scored;
     for (const auto& r : results) {
         auto it = impl_->db_id_kf.find(r.Id);
         if (it == impl_->db_id_kf.end()) continue;
@@ -141,17 +141,20 @@ Frame::Ptr LoopClosure::detectLoop(Frame::Ptr kf) {
         if (cand_id >= kf->id ||
             kf->id - cand_id < (unsigned long)temporal_window_) continue;
         // 分数阈值：DBoW3 归一化分数（0~1）
-        if (r.Score < best_score) continue;
+        if (r.Score < min_score_) continue;
         auto kf_it = impl_->kf_cache.find(cand_id);
         if (kf_it == impl_->kf_cache.end()) continue;
-        best = kf_it->second;
-        best_score = r.Score;
+        scored.emplace_back(kf_it->second, r.Score);
     }
+    // 分数降序，取前 3 个（PnP 验证多个候选提高闭环召回；验证失败大概率
+    // 是候选 KF 点被 cull 稀疏，多试几个提高成功率）
+    std::ranges::sort(scored, std::greater<>{}, &std::pair<Frame::Ptr, double>::second);
+    for (size_t i = 0; i < scored.size() && i < 3; i++)
+        candidates.push_back(scored[i].first);
 
-    // 4. 位置先验：词袋未命中时，用估计轨迹的世界系距离补召回。
-    //    轨迹自交区域（如 KITTI 00 起点-末端）词袋分数常偏低，但 PnP
-    //    几何验证（min_loop_inliers + ratio 双门槛）能挡住位置先验的假候选。
-    if (!best && position_prior_dist_m_ > 0.0) {
+    // 4. 位置先验：估计轨迹自交区域词袋分数常偏低，用世界系距离补召回。
+    //    与词袋候选并列返回（放在后面），由调用方的 PnP 双门槛验证兜底。
+    if (position_prior_dist_m_ > 0.0) {
         const Vec3 curr_pos = kf->pose_cw.inverse().t;  // 相机光心（世界系）
         double best_dist = position_prior_dist_m_;
         Frame::Ptr prior_cand;
@@ -165,16 +168,21 @@ Frame::Ptr LoopClosure::detectLoop(Frame::Ptr kf) {
             }
         }
         if (prior_cand) {
-            best = prior_cand;
+            // 去重：词袋已包含时跳过
+            const bool dup = std::ranges::any_of(candidates, [&](const Frame::Ptr& c) {
+                return c->id == prior_cand->id;
+            });
+            if (!dup) candidates.push_back(prior_cand);
             LOG_INFO("LoopClosure: position prior candidate kf#"
-                     << best->id << " (dist=" << best_dist << "m)");
+                     << prior_cand->id << " (dist=" << best_dist << "m)");
         }
     }
-    if (best) {
-        LOG_INFO("LoopClosure: candidate kf#" << best->id
-                 << " (score=" << best_score << ")");
-    }
-    return best;
+
+    if (!candidates.empty())
+        LOG_INFO("LoopClosure: " << candidates.size() << " candidates, top kf#"
+                 << candidates.front()->id << " (score="
+                 << (scored.empty() ? 0.0 : scored.front().second) << ")");
+    return candidates;
 #endif
 }
 

@@ -1061,28 +1061,29 @@ void test_loop_closure() {
         }
 
         // 回环检测：最后一帧（回到原点）应命中早期帧（id 差 > 30，时间窗过滤通过）
-        auto cand = lc.detectLoop(last_kf);
-        std::cout << " (cand=kf#" << (cand ? std::to_string(cand->id) : "null")
+        auto cands = lc.detectLoop(last_kf);
+        std::cout << " (cands=" << cands.size()
+                  << " top=kf#" << (cands.empty() ? 0 : cands.front()->id)
                   << " last=kf#" << last_kf->id << ")";
-        assert(cand != nullptr);
-        assert(cand->id < last_kf->id);
+        assert(!cands.empty());
+        assert(cands.front()->id < last_kf->id);
 
         // 几何验证：PnP 直接输出 loop→curr 的位姿图 SE3 测量。
         // 它应与无漂移合成真值一致，不依赖 last_kf 中保存的 VO 漂移位姿。
         last_kf->pose_cw.t += vslam::Vec3(3.0, -2.0, 1.0);
         vslam::SE3 T_loop_curr;
-        assert(lc.verifyLoop(last_kf, cand, T_loop_curr));
-        const vslam::SE3 expected = cand->pose_cw * poses.back();
+        assert(lc.verifyLoop(last_kf, cands.front(), T_loop_curr));
+        const vslam::SE3 expected = cands.front()->pose_cw * poses.back();
         // isApprox 是相对精度（|a-b|² ≤ prec²·min(|a|²,|b|²)），期望平移为零时
         // 分母恒为 0，任何非零误差都会失败，故用绝对范数判据。
         assert((T_loop_curr.t - expected.t).norm() < 0.1);
         assert(T_loop_curr.q.toRotationMatrix().isApprox(
             expected.q.toRotationMatrix(), 0.02));
 
-        // 负例：中段帧（id 20，所有高分候选都在时间窗内）应返回 nullptr
+        // 负例：中段帧（id 20，所有高分候选都在时间窗内）应返回空候选
         assert(mid_kf != nullptr);
         auto none = lc.detectLoop(mid_kf);
-        assert(none == nullptr);
+        assert(none.empty());
     } TEST_PASS();
 #else
     TEST("LoopClosure 合成回环") {

@@ -36,9 +36,12 @@ public:
     /// 将关键帧加入数据库（词袋向量入库 + 缓存，供回查）
     void addKeyFrame(Frame::Ptr kf);
 
-    /// 检测回环：返回候选关键帧；nullptr 表示无回环。
-    /// 候选过滤：DBoW3 Top-5 → 时间窗（跳过刚走过的路）→ 分数阈值。
-    Frame::Ptr detectLoop(Frame::Ptr kf);
+    /// 检测回环：返回候选关键帧列表（按优先级排序，可空）。
+    /// 候选来源：① DBoW3 Top-N 词袋候选（分数过滤 + 时间窗）按分数降序；
+    ///            ② 位置先验候选（世界系距离近 + 间隔足够），词袋候选验证
+    ///               失败时兜底——轨迹自交区域词袋分低但几何验证仍可成功。
+    /// 调用方依次做 PnP 几何验证，第一个通过的即回环。
+    std::vector<Frame::Ptr> detectLoop(Frame::Ptr kf);
 
     /// 几何一致性验证：ORB 匹配 → 3D-2D PnP → 内点判定。
     /// 成功时输出 T_loop_curr，满足 T_wc_curr = T_wc_loop * T_loop_curr，
