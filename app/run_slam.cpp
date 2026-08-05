@@ -29,6 +29,7 @@
 #include <format>
 #include <chrono>
 #include <algorithm>
+#include <cstdlib>
 
 int main(int argc, char** argv) {
     std::string input_path;
@@ -38,11 +39,15 @@ int main(int argc, char** argv) {
 
     // ---- 解析命令行参数（与 run_vo 相同）----
     bool headless = false;
+    int max_frames = 0;  // 0 = 全程；>0 = 只处理前 N 帧（性能/回归测试用）
+    int skip_frames = 0; // 跳过前 N 帧（性能分片测试用）
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--tum")       dataset_type = vslam::Dataset::Type::TUM;
         else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
         else if (a == "--headless") headless = true;
+        else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
+        else if (a == "--skip" && i + 1 < argc) skip_frames = std::atoi(argv[++i]);
     }
     if (argc >= 2) {
         input_path = argv[1];
@@ -100,6 +105,12 @@ int main(int argc, char** argv) {
     int frame_count = 0;
     auto start_time = std::chrono::steady_clock::now();
 
+    // ---- 跳过前 N 帧（性能分片测试；不计入 frame_count）----
+    for (int i = 0; i < skip_frames && dataset.nextFrame(image, image_right, timestamp); i++) {
+    }
+    // 计时基准必须在 skip 之后，否则 Done/FPS 会包含跳帧的解码时间
+    start_time = std::chrono::steady_clock::now();
+
     // VO 内部保留并回环修正完整 T_cw；这里只保存与有效位姿一一对应的时间戳。
     std::vector<double> valid_timestamps;
 
@@ -107,7 +118,9 @@ int main(int argc, char** argv) {
              << (vo.loopClosureEnabled() ? "ON" : "OFF")
              << ")... Press Ctrl+C or close window to exit.");
 
-    while (dataset.nextFrame(image, image_right, timestamp) && (headless || !viewer.shouldQuit())) {
+    while (dataset.nextFrame(image, image_right, timestamp)
+           && (max_frames == 0 || frame_count < max_frames)
+           && (headless || !viewer.shouldQuit())) {
         frame_count++;
 
         // 运行一帧 SLAM（双目：左右目；单目：仅左目）

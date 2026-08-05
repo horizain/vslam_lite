@@ -50,7 +50,7 @@ Optimizer:
   local_window_size: 6
   local_ba_iterations: 3
   enable_local_ba: true
-  global_ba_iterations: 10
+  global_ba_iterations: 20
 
 LoopClosure:
   enable_loop_closure: true
@@ -60,7 +60,10 @@ LoopClosure:
   detection_interval: 10
   pnp_inlier_ratio: 0.85
   min_loop_inliers: 50
-  loop_cooldown_frames: 200
+  loop_cooldown_kfs: 20
+  top_candidates: 20
+  position_prior_dist: 25.0
+  position_prior_gap: 100
 
 Viewer:
   enabled: true

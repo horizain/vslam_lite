@@ -4,6 +4,8 @@
 #include "vslam/camera.h"
 #include "vslam/map.h"
 
+#include <optional>
+
 namespace vslam {
 
 /// (Phase 2) 位姿图边：关键帧 a ↔ b 的相对位姿约束
@@ -24,15 +26,24 @@ public:
     /// @param map             地图
     /// @param active_kfs      参与优化的关键帧列表（滑动窗口，第一帧固定）
     /// @param max_iterations  g2o 最大迭代次数
+    /// @param fix_points      地图点是否固定（motion-only）；默认按传感器自动选择：
+    ///                        单目固定（三角化尺度由 recoverPose 决定，点自由会引入
+    ///                        尺度 gauge 发散），双目/RGB-D 放开（视差绝对尺度可观测）
+    /// @param max_points      参与优化的地图点数量上限（按观测数降序截断；
+    ///                        地图膨胀后控制 BA 规模，防止单次 LM 到分钟级）
     static void localBundleAdjustment(
         const Camera& camera,
         Map::Ptr map,
         const std::vector<Frame::Ptr>& active_kfs,
-        int max_iterations = 10);
+        int max_iterations = 10,
+        std::optional<bool> fix_points = std::nullopt,
+        size_t max_points = 4000);
 
-    /// 全局 motion-only BA：固定地图点，优化所有关键帧位姿
+    /// 全局 BA：优化所有关键帧（+ 地图点，双目下按 fix_points 自动放开）
     static void globalBundleAdjustment(const Camera& camera, Map::Ptr map,
-                                       int max_iterations = 20);
+                                       int max_iterations = 20,
+                                       std::optional<bool> fix_points = std::nullopt,
+                                       size_t max_points = 4000);
 
     /// (Phase 2) 位姿图优化：相邻边（里程计约束）+ 回环边校正全局漂移。
     /// 顶点为所有关键帧（T_wc 语义，与 g2o EdgeSE3 群运算一致）；

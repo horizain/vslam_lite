@@ -59,7 +59,10 @@ struct VOConfig {
     int    detection_interval    = 10;      // 每 N 个关键帧检测一次回环
     double pnp_inlier_ratio      = 0.7;     // 几何验证最小内点比例
     int    min_loop_inliers      = 30;      // 几何验证最小内点数
-    int    loop_cooldown_frames  = 200;     // 回环校正冷却（帧）：防止同区域连续校正
+    int    loop_cooldown_kfs     = 20;      // 回环校正冷却（关键帧数）：防止同区域连续校正
+    int    loop_top_candidates   = 20;      // 词袋查询候选数（Top-N，提高召回）
+    double loop_position_prior_dist = 25.0; // 位置先验距离阈值(m)：轨迹自交区域补召回
+    int    loop_position_prior_gap   = 100; // 位置先验最小关键帧间隔
     int    global_ba_iterations  = 20;      // 回环后全局 BA 迭代次数
 
     /// 从 yaml 配置加载（缺省字段保持默认值）
@@ -166,6 +169,10 @@ private:
                                const std::vector<int>& inliers) const;
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
+    /// 子地图重建成功后与历史轨迹做 Umeyama 刚体对齐（双目），
+    /// 消除丢失期位移未知导致的锚点残留偏差。延迟到子地图有 ≥3 个
+    /// 关键帧时在 insertKeyFrame 中触发（重建瞬间 KF 数不足无法拟合）
+    void alignSubmapToTrajectory();
     void insertKeyFrame();              // 关键帧插入 + 三角化 + BA
     /// (Phase 2) 回环校正：位姿图优化 + 地图点/逐帧轨迹同步 + 全局 BA
     void handleLoopCorrection(const SE3& T_loop_curr,
@@ -199,12 +206,16 @@ private:
     std::unique_ptr<LoopClosure> loop_closure_;
     bool loop_closure_enabled_ = false;
     unsigned long loop_closure_count_ = 0;   // 已闭合回环次数
-    unsigned long last_loop_kf_id_ = 0;      // 上次回环校正的当前帧号（冷却基准）
+    unsigned long last_loop_kf_count_ = 0;   // 上次回环校正时的关键帧数（冷却基准）
 
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）
     SE3 last_valid_pose_cw_;
     bool has_last_valid_pose_ = false;
+    SE3 per_frame_motion_;              // 相邻有效帧相对运动（Twc：X_cur = X_last·T_rel），
+                                        // LOST 期匀速外推新子地图锚点用
+    bool has_per_frame_motion_ = false;
+    bool submap_needs_alignment_ = false;  // 子地图重建后待对齐标记（≥3 KF 时执行）
     int tracking_failures_ = 0;
     int relocalization_frames_ = 0;
     Status status_;  // 当前详细状态（初始化/跟踪/丢失信息）

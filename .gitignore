@@ -26,3 +26,6 @@ thirdparty/*/build/
 *traj*.csv
 *traj*.png
 kitti_gt.txt
+build-asan/
+perf.csv
+perf.csv.history.csv

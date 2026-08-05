@@ -16,7 +16,12 @@ MapPoint::Ptr Map::getMapPoint(unsigned long id) const {
 }
 
 void Map::cullMapPoints(int min_observations) {
-    // 先找出观测不足的点，从地图移除
+    // 按全局观测数剔除弱观测点，并同步清空关键帧引用。
+    // 历史教训（2026-08-05 两版实验均失败）：
+    // ① "只删孤儿点" → 地图无限膨胀，长序列内存失控（perf7 OOM/崩溃）；
+    // ② "保留最近 30 KF 引用的单观测点" → 单观测点里垃圾点（错误深度/三角化）
+    //    比例高，保留后 PnP 内点率骤降、跟踪 LOST 增 9 倍、子地图重建 37 次
+    //    （perf8 ATE 174.8m）。观测数 < 2 的点对跟踪是净负资产，直接删除。
     std::set<unsigned long> removed;
     for (auto it = map_points_.begin(); it != map_points_.end(); ) {
         if (it->second->observed_count < min_observations) {

@@ -71,7 +71,13 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (lc["detection_interval"])  cfg.detection_interval = lc["detection_interval"].as<int>();
             if (lc["pnp_inlier_ratio"])    cfg.pnp_inlier_ratio = lc["pnp_inlier_ratio"].as<double>();
             if (lc["min_loop_inliers"])    cfg.min_loop_inliers = lc["min_loop_inliers"].as<int>();
-            if (lc["loop_cooldown_frames"]) cfg.loop_cooldown_frames = lc["loop_cooldown_frames"].as<int>();
+            if (lc["loop_cooldown_kfs"])   cfg.loop_cooldown_kfs = lc["loop_cooldown_kfs"].as<int>();
+            // 兼容旧字段名 loop_cooldown_frames（帧计数）→ 按关键帧数换算（约 1/10）
+            if (!lc["loop_cooldown_kfs"] && lc["loop_cooldown_frames"])
+                cfg.loop_cooldown_kfs = lc["loop_cooldown_frames"].as<int>() / 10;
+            if (lc["top_candidates"])      cfg.loop_top_candidates = lc["top_candidates"].as<int>();
+            if (lc["position_prior_dist"]) cfg.loop_position_prior_dist = lc["position_prior_dist"].as<double>();
+            if (lc["position_prior_gap"])  cfg.loop_position_prior_gap = lc["position_prior_gap"].as<int>();
         }
         if (auto o = root["Optimizer"]) {
             if (o["global_ba_iterations"]) cfg.global_ba_iterations = o["global_ba_iterations"].as<int>();
@@ -104,7 +110,10 @@ bool VisualOdometry::enableLoopClosure(const std::string& vocab_path) {
     if (!loop_closure_) loop_closure_ = std::make_unique<LoopClosure>();
     loop_closure_->setParams(cfg_.min_score, cfg_.temporal_window,
                              cfg_.min_loop_inliers, cfg_.pnp_inlier_ratio,
-                             cfg_.ransac_pixel_threshold, camera_);
+                             cfg_.ransac_pixel_threshold, camera_,
+                             cfg_.loop_top_candidates,
+                             cfg_.loop_position_prior_dist,
+                             cfg_.loop_position_prior_gap);
     loop_closure_enabled_ = loop_closure_->loadVocabulary(vocab_path);
     if (loop_closure_enabled_) {
         LOG_INFO("Loop closure ENABLED (vocab=" << vocab_path
@@ -261,6 +270,9 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
                     relocalization_frames_ = 0;
                     status_.tracking_valid = true;
                     status_.pose_method = "SUBMAP_INIT";
+                    // 双目：子地图积累 ≥3 个关键帧后与历史轨迹刚体对齐，
+                    // 消除外推锚点的残留偏差（单目尺度不同源，不做）。
+                    submap_needs_alignment_ = camera_->hasPerFrameDepth();
                 }
             }
         }
@@ -268,6 +280,13 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
 
     prev_frame_ = curr_frame_;
     if (state_ == State::TRACKING && status_.tracking_valid) {
+        if (has_last_valid_pose_) {
+            // 记录逐帧相对运动（Twc 语义），LOST 期匀速外推锚点用
+            const SE3 X_cur = curr_frame_->pose_cw.inverse();
+            const SE3 X_last = last_valid_pose_cw_.inverse();
+            per_frame_motion_ = X_cur * X_last.inverse();
+            has_per_frame_motion_ = true;
+        }
         last_valid_pose_cw_ = curr_frame_->pose_cw;
         has_last_valid_pose_ = true;
         tracking_failures_ = 0;
@@ -380,9 +399,35 @@ void VisualOdometry::updateStatus(int matches, int inliers, double parallax) {
 void VisualOdometry::createSubmap() {
     // 新子地图的原点必须落在上一段全局轨迹附近。短时丢失时使用最后
     // 有效位姿；如果还没有有效位姿，则退化为当前参考帧位姿。
-    const SE3 anchor_Twc = has_last_valid_pose_
+    SE3 anchor_Twc = has_last_valid_pose_
         ? last_valid_pose_cw_.inverse()
         : (ref_frame_ ? ref_frame_->pose_cw.inverse() : SE3());
+
+    // 匀速模型外推：丢失期间（relocalization_frames_ 帧）用丢失前的逐帧
+    // 相对运动继续推进锚点，避免重初始化轨迹在丢失处出现静止/回跳
+    // （KITTI 高速段 20 帧丢失 ≈ 20m，不外推则锚点明显滞后）。
+    const int lost_frames = std::max(relocalization_frames_, 1);
+    if (has_last_valid_pose_ && has_per_frame_motion_) {
+        SE3 extrapolated = anchor_Twc;
+        // 单步位移限幅：丢失前的瞬时速度可能被 PnP 高估（off-road 段
+        // 出现过 20 帧外推 41m 的情况），限制每步 ≤ 2.5m 防锚点跑偏
+        const double step_cap = 2.5;
+        for (int i = 0; i < std::min(lost_frames, 60); i++) {
+            SE3 step = per_frame_motion_;
+            if (step.t.norm() > step_cap) {
+                step.t = step.t.normalized() * step_cap;
+                step.q = Eigen::Quaterniond::Identity();
+            }
+            extrapolated = extrapolated * step;
+        }
+        // 外推距离防爆：超过 60m 视为异常（KITTI ~1m/帧），退回不外推
+        if ((extrapolated.t - anchor_Twc.t).norm() <= 60.0)
+            anchor_Twc = extrapolated;
+        LOG_WARN("Submap anchor extrapolated by " << lost_frames
+                 << " frames (" << (anchor_Twc.t - (has_last_valid_pose_
+                     ? last_valid_pose_cw_.inverse().t : Vec3::Zero())).norm()
+                 << "m)");
+    }
 
     // anchor 继承最后有效全局位姿，新子地图实际已锚定到全局世界系。
     // 若标为 disconnected，此后所有帧 pose_valid=false（tracking_valid &&
@@ -399,6 +444,73 @@ void VisualOdometry::createSubmap() {
     tracking_failures_ = 0;
     relocalization_frames_ = 0;
     LOG_WARN("Tracking lost for too long; creating anchored submap " << submap.id);
+}
+
+// ============================================================
+// 子地图-历史轨迹刚体对齐：新子地图关键帧相机位置 vs 历史轨迹最近点，
+// Umeyama 求解 Sim3（双目下尺度≈1，仅校正旋转/平移），
+// 让重初始化后的轨迹平滑接回丢失点，不出现断点跳变。
+// ============================================================
+void VisualOdometry::alignSubmapToTrajectory() {
+    if (pose_trajectory_.empty()) return;
+    auto kfs = map_->getAllKeyFrames();
+    if (kfs.size() < 3) return;
+
+    // 只搜索轨迹末端附近（丢失点必然在当前轨迹末尾，最多向前取 100 帧）：
+    // 新子地图锚在丢失点附近，最近的旧位置就在这段里；限制搜索窗避免
+    // 误配到无关的早期区域（轨迹自交时最近邻会找错位置）。
+    const size_t search_from = pose_trajectory_.size() > 100
+        ? pose_trajectory_.size() - 100 : 0;
+
+    std::vector<Vec3> src, dst;
+    src.reserve(kfs.size());
+    dst.reserve(kfs.size());
+    const double max_match_dist = 50.0;  // 外推锚点可能偏离丢失点 20-40m，半径放宽；
+                                         // 误配风险由"末端搜索窗 + scale≈1 检查"兜底
+    for (const auto& kf : kfs) {
+        const Vec3 pos = kf->pose_cw.inverse().t;
+        double best = max_match_dist;
+        Vec3 best_p = Vec3::Zero();
+        bool found = false;
+        for (size_t i = search_from; i < pose_trajectory_.size(); i++) {
+            const Vec3 c = pose_trajectory_[i].camera_position();
+            const double d = (c - pos).norm();
+            if (d < best) {
+                best = d;
+                best_p = c;
+                found = true;
+            }
+        }
+        if (found) {
+            src.push_back(pos);
+            dst.push_back(best_p);
+        }
+    }
+    if (src.size() < 4) {
+        LOG_WARN("Submap alignment skipped: only " << src.size() << " matches");
+        return;
+    }
+
+    Sim3 S;
+    if (!Sim3::estimate(src, dst, S)) {
+        LOG_WARN("Submap alignment failed (degenerate point set)");
+        return;
+    }
+    // 双目有绝对尺度，只接受近似刚体对齐（尺度偏离 >15% 视为误配）
+    if (std::abs(S.s - 1.0) > 0.15) {
+        LOG_WARN("Submap alignment rejected: scale=" << S.s);
+        return;
+    }
+
+    for (const auto& kf : kfs) {
+        const SE3 X = kf->pose_cw.inverse();          // T_wc
+        const SE3 X2(S.q * X.q, S * X.t);             // X' = S ∘ X（点变换复合）
+        kf->pose_cw = X2.inverse();
+    }
+    for (auto& mp : map_->getAllMapPoints())
+        mp->pos_w = S * mp->pos_w;
+    LOG_INFO("Submap aligned to trajectory: " << src.size()
+             << " matches, scale=" << S.s);
 }
 
 // ============================================================
@@ -858,7 +970,9 @@ bool VisualOdometry::tryRelocalize() {
     double best_ratio = 0.0;
     double best_rmse = std::numeric_limits<double>::infinity();
     auto try_kf = [&](unsigned long submap_id, const Frame::Ptr& kf) -> bool {
-        auto matches = feature_matcher_.match(kf, curr_frame_, cfg_.match_ratio, true);
+        // 重定位不做 F 矩阵 RANSAC：外点由下方 solvePnPRansac 自己剔除
+        //（与 trackFrame 的注释一致；F 矩阵在重定位场景是纯冗余开销）
+        auto matches = feature_matcher_.match(kf, curr_frame_, cfg_.match_ratio, false);
         // 重定位用较低门槛（min_matches_init=100 是初始化专用，RANSAC 后常达不到）
         if ((int)matches.size() < 30) return false;
 
@@ -898,9 +1012,23 @@ bool VisualOdometry::tryRelocalize() {
     };
 
     // 最近关键帧优先；如果当前子地图失效，继续尝试历史子地图。
+    // 粗筛先行：256 描述子子集 BF 匹配数不足的直接跳过（~0.5ms/候选），
+    // 只对相似候选做全量 BF + PnP。候选最多 60 个，全量匹配+PnP 每个
+    // ~10ms+，粗筛把 LOST 帧的单帧开销从秒级降到几十毫秒。
+    constexpr int kQuickMatchThreshold = 20;
+    int quick_checked = 0, quick_passed = 0;
     for (const auto& [submap_id, kf] : candidates) {
+        quick_checked++;
+        if (feature_matcher_.quickMatchCount(kf->descriptors,
+                                             curr_frame_->descriptors,
+                                             256, 64.0) < kQuickMatchThreshold)
+            continue;
+        quick_passed++;
         if (try_kf(submap_id, kf)) break;
     }
+    if (quick_passed > 0)
+        LOG_INFO("Reloc prefilter: " << quick_passed << "/" << quick_checked
+                 << " candidates passed");
 
     if (best_inliers >= 20) {
         atlas_->activate(best_submap_id);
@@ -928,6 +1056,13 @@ bool VisualOdometry::tryRelocalize() {
 void VisualOdometry::insertKeyFrame() {
     const Frame::Ptr prev_kf = ref_frame_;
     map_->insertKeyFrame(curr_frame_);
+
+    // 子地图重建后延迟对齐：等新子地图有 ≥3 个关键帧（拟合最低点数），
+    // 与丢失点附近的历史轨迹做 Umeyama 刚体对齐
+    if (submap_needs_alignment_ && map_->keyFrameCount() >= 3) {
+        alignSubmapToTrajectory();
+        submap_needs_alignment_ = false;
+    }
 
     // 定期清理观测不足的地图点（每 20 个关键帧一次），防止地图无限增长。
     // 必须在建新点之前执行：若在建点后剔除，本轮 createMapPointsFromStereo
@@ -985,11 +1120,11 @@ void VisualOdometry::insertKeyFrame() {
     if (loop_closure_enabled_ && loop_closure_) {
         loop_closure_->addKeyFrame(curr_frame_);
         if (map_->keyFrameCount() % (unsigned long)std::max(1, cfg_.detection_interval) == 0) {
-            // 回环校正冷却：上次校正后至少间隔 N 帧才允许再次校正。
+            // 回环校正冷却：上次校正后至少间隔 N 个关键帧才允许再次校正。
             // 同一区域会被词袋反复命中（分数高），连续校正会让 S_global
-            // 叠加冲突、轨迹被反复拉扯变形。
-            const bool cooled = curr_frame_->id - last_loop_kf_id_
-                >= (unsigned long)cfg_.loop_cooldown_frames;
+            // 叠加冲突、轨迹被反复拉扯变形。以关键帧数计（与 KF 密度无关）。
+            const bool cooled = map_->keyFrameCount() - last_loop_kf_count_
+                >= (unsigned long)cfg_.loop_cooldown_kfs;
             if (cooled) {
                 auto cand = loop_closure_->detectLoop(curr_frame_);
                 if (cand) {
@@ -1059,10 +1194,15 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
         mp->pos_w = correction * mp->pos_w;
     }
 
-    // 4. 全局 BA：地图点固定、优化关键帧位姿；使用配置的迭代次数。
+    // 4. 全局 BA：优化所有关键帧位姿 + 地图点（点必须自由——回环校正后
+    //    点坐标由位姿增量粗同步，重投影精修是闭环收敛的关键一环；
+    //    motion-only 实测 ATE 152m 退化严重，已回滚）。全图 KF 上千时
+    //    Schur 位姿系统上万维，通过点上限 1500 + 迭代 8 控制单次开销。
     {
         PERF_SCOPE("loop.global_ba");
-        Optimizer::globalBundleAdjustment(camera_, map_, cfg_.global_ba_iterations);
+        Optimizer::globalBundleAdjustment(camera_, map_, cfg_.global_ba_iterations,
+                                          std::nullopt /* fix_points 按传感器 */,
+                                          1500 /* max_points */);
     }
 
     // 5. 非关键帧不在位姿图中。将相邻关键帧的最终校正插值后施加到完整
@@ -1107,7 +1247,7 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
     }
 
     loop_closure_count_++;
-    last_loop_kf_id_ = kf_curr->id;  // 更新回环校正冷却基准
+    last_loop_kf_count_ = map_->keyFrameCount();  // 更新回环校正冷却基准（关键帧数）
     LOG_INFO("Loop closed! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
              << " (total " << loop_closure_count_ << ")");
 }

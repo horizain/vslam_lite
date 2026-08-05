@@ -40,10 +40,13 @@ void FeatureMatcher::extract(Frame::Ptr frame) {
     // 边界角点由相邻带的核心区自然保留（无重复、不丢点），且每个保留特征
     // 距提取 ROI 边界 ≥ kBorder（> ORB edgeThreshold=15），描述子不退化。
     // 小图退化为单带串行，行为与旧实现一致（保证单元测试确定性）。
-    constexpr int kBorder = 18;
+    // 分带数取固定上限 4：TBB 内嵌 parallel_for_ 与外层并行度相乘会波动
+    //（getNumThreads()/2 推导），固定后任务数稳定、行为可复现。
+    constexpr int kBorder = 24;
     int nbands = 1;
     if (rows >= 2 * kBorder + 64 && num_features_ >= 500) {
-        nbands = std::clamp(cv::getNumThreads() / 2, 1, orb_max_bands_);
+        nbands = std::clamp(cv::getNumThreads() / 2, 1,
+                            std::min(orb_max_bands_, 4));
         while (nbands > 1 && rows / nbands < 48) --nbands;
     }
 
@@ -221,6 +224,8 @@ std::vector<unsigned char> FeatureMatcher::matchStereo(
     // 校正后的双目图像行对齐：左目→右目 的 LK 光流退化为近一维搜索，
     // 稳定且给出亚像素视差（比 ORB 左右匹配精度更高）。
     // 金字塔 5 层 + 31x31 窗口：KITTI 近点视差可达 100px+，默认 3 层/21px 会追丢。
+    // 曾实验 4 层/25px（每帧省 ~40ms），但近点视差匹配失败导致建点减少、
+    // LOST 增 6 倍（219 vs 32），回滚——精度优先，速度靠别处优化。
     // 注：calcOpticalFlowPyrLK 内部已用 TBB 并行处理关键点；外部再分块会重复
     // 构建金字塔反而更慢（OpenCV 4.6 无接收预建金字塔的重载），故保持串行调用。
     std::vector<unsigned char> status;
@@ -277,6 +282,21 @@ void FeatureMatcher::getMatchedPoints(
         pts1.push_back(f1->keypoints[m.queryIdx].pt);
         pts2.push_back(f2->keypoints[m.trainIdx].pt);
     }
+}
+
+int FeatureMatcher::quickMatchCount(const cv::Mat& desc1, const cv::Mat& desc2,
+                                    int max_query, double dist_thresh) const {
+    if (desc1.empty() || desc2.empty()) return 0;
+    const int rows = std::min(max_query, desc2.rows);
+    if (rows <= 0) return 0;
+    // 子集 × 全量的 BF 单匹配：距离 < 阈值的数量即候选相似度粗分
+    cv::Mat sub = desc2.rowRange(0, rows);
+    std::vector<cv::DMatch> matches;
+    matcher_->match(sub, desc1, matches);
+    int cnt = 0;
+    for (const auto& m : matches)
+        if (m.distance < dist_thresh) cnt++;
+    return cnt;
 }
 
 } // namespace vslam

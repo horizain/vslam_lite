@@ -49,6 +49,12 @@ public:
         std::vector<cv::Point2f>& pts1,
         std::vector<cv::Point2f>& pts2);
 
+    /// 快速匹配粗筛：用 desc2 的前 max_query 行与 desc1 全量做 BF，
+    /// 返回距离 < dist_thresh 的匹配数。重定位候选预筛用——避免对每个
+    /// 候选关键帧都做全量 BF + PnP（候选多时是 LOST 帧的卡顿主因）。
+    int quickMatchCount(const cv::Mat& desc1, const cv::Mat& desc2,
+                        int max_query = 256, double dist_thresh = 64.0) const;
+
 private:
     cv::Ptr<cv::ORB> orb_;
     cv::Ptr<cv::DescriptorMatcher> matcher_;

@@ -19,9 +19,16 @@ public:
     ~LoopClosure();  // Impl 在 .cpp 中定义，析构函数须在此处定义
 
     /// 配置回环参数 + 相机内参（PnP 几何验证需要）
+    /// @param top_candidates   词袋查询返回候选数（Top-N，提高召回）
+    /// @param pos_prior_dist_m 位置先验距离阈值(m)：新 KF 与该阈值内的历史
+    ///                          KF（间隔足够远）直接成为候选，靠 PnP 验证把关
+    /// @param pos_prior_gap    位置先验最小关键帧间隔（防刚走过的路）
     void setParams(double min_score, int temporal_window, int min_loop_inliers,
                    double pnp_inlier_ratio, double ransac_pixel_threshold,
-                   const Camera& camera);
+                   const Camera& camera,
+                   int top_candidates = 20,
+                   double pos_prior_dist_m = 25.0,
+                   int pos_prior_gap = 100);
 
     /// 从文件加载预训练词袋词典（.txt / .dbow3），并初始化数据库
     bool loadVocabulary(const std::string& vocab_path);
@@ -51,6 +58,9 @@ private:
     int    min_loop_inliers_     = 30;    // 几何验证最小内点数
     double pnp_inlier_ratio_     = 0.7;   // 几何验证最小内点比例
     double ransac_pixel_threshold_ = 3.0; // PnP RANSAC 重投影阈值(px)
+    int    top_candidates_       = 20;    // 词袋查询 Top-N（召回扩宽）
+    double position_prior_dist_m_ = 25.0; // 位置先验距离阈值(m)
+    int    position_prior_gap_   = 100;   // 位置先验最小关键帧间隔
     Camera camera_;
     FeatureMatcher matcher_;
 };

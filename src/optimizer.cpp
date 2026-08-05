@@ -1,6 +1,7 @@
 #include "vslam/optimizer.h"
 #include "perf_monitor.h"
 
+
 #ifdef HAS_G2O
 #include <g2o/core/base_unary_edge.h>
 #include <g2o/core/base_binary_edge.h>
@@ -14,6 +15,7 @@
 #include <g2o/types/slam3d/edge_se3.h>        // Phase 2 位姿图：EdgeSE3
 
 #include <unordered_map>
+#include <unordered_set>
 #endif
 
 namespace vslam {
@@ -31,7 +33,9 @@ void Optimizer::localBundleAdjustment(
     const Camera& camera,
     Map::Ptr map,
     const std::vector<Frame::Ptr>& active_kfs,
-    int max_iterations) {
+    int max_iterations,
+    std::optional<bool> fix_points,
+    size_t max_points) {
 
 #ifndef HAS_G2O
     (void)camera;
@@ -52,6 +56,8 @@ void Optimizer::localBundleAdjustment(
     // ========================================================
     g2o::SparseOptimizer optimizer;
     auto linearSolver = std::make_unique<LinearSolverType>();
+    // 防御：Cholesky 失败时避免每次迭代把整个 Hessian 写进 debug.txt
+    linearSolver->setWriteDebug(false);
     auto blockSolver  = std::make_unique<BlockSolverType>(std::move(linearSolver));
     auto algorithm    = new g2o::OptimizationAlgorithmLevenberg(std::move(blockSolver));
     optimizer.setAlgorithm(algorithm);
@@ -67,6 +73,14 @@ void Optimizer::localBundleAdjustment(
     if (!optimizer.addParameter(cam_params)) {
         LOG_WARN("Local BA: camera parameter already exists");  // will use existing
     }
+
+    // Motion-only vs 全 BA 由调用方显式指定，默认按传感器自动选择：
+    // 单目三角化点的尺度由初始化（recoverPose 归一化 t）决定，若让点自由
+    // 优化存在尺度 gauge 自由度（点+位姿平移同时缩放 s 重投影不变），
+    // 实测会让刚插入的关键帧位姿被拉偏直至发散 → 单目必须固定点；
+    // 双目/RGB-D 有绝对尺度（视差直接测深），点自由优化不会退化，
+    // 还能让回环后位姿图移动的关键帧把点坐标真正收敛到重投影残差上。
+    const bool points_fixed = fix_points.value_or(!camera->hasPerFrameDepth());
 
     // ========================================================
     // 3. 添加位姿顶点（每个关键帧一个）
@@ -122,12 +136,33 @@ void Optimizer::localBundleAdjustment(
         }
     }
 
-    // 只保留被至少 2 帧观测到的地图点
+    // 只保留被至少 3 帧观测到的地图点，且总量受限（BA 规模上限）：
+    // 后段地图膨胀后（KF 上千、点数十万），窗口内点顶点上万会让每次 LM
+    // 迭代的 Schur 消除呈超线性增长，单次 BA 实测可爆到 100 秒级。
+    // 按观测数降序保留前 max_points（观测多 = 约束强，信息量最大），
+    // 前段地图小时不触发截断，精度无损。
+    std::unordered_set<unsigned long> selected_mps;
+    if (mp_observations.size() > max_points) {
+        // 部分排序取 top-k（C++23 ranges：按观测数降序）
+        std::vector<unsigned long> ranked(mp_observations.size());
+        std::ranges::transform(mp_observations, ranked.begin(),
+                               [](const auto& kv) { return kv.first; });
+        std::ranges::partial_sort(ranked, ranked.begin() + (long)max_points,
+                                  std::greater<unsigned long>{},
+                                  [&](unsigned long id) {
+                                      return mp_observations.find(id)->second.size();
+                                  });
+        selected_mps.insert(ranked.begin(), ranked.begin() + (long)max_points);
+        LOG_WARN("BA point cap: " << mp_observations.size() << " -> "
+                 << max_points);
+    }
+
     int point_vertex_id = static_cast<int>(active_kfs.size());  // 点 ID 从 KF 数量之后开始
     std::unordered_map<unsigned long, int> mp_id_to_vertex;
 
     for (auto& [mp_id, obs_list] : mp_observations) {
         if (obs_list.size() < 3) continue;  // 至少 3 帧观测，过滤弱观测坏点
+        if (!selected_mps.empty() && !selected_mps.count(mp_id)) continue;
 
         auto mp = map->getMapPoint(mp_id);
         if (!mp) continue;
@@ -135,11 +170,12 @@ void Optimizer::localBundleAdjustment(
         auto* v_point = new g2o::VertexPointXYZ();
         v_point->setId(point_vertex_id);
         v_point->setEstimate(mp->pos_w);
-        // Motion-only BA：地图点固定，只优化位姿。
-        // 单目三角化点的尺度由初始化（recoverPose 归一化 t）决定，
-        // 若让点自由优化，存在尺度 gauge 自由度（点+位姿平移同时缩放 s
-        // 重投影不变），实测会让刚插入的关键帧位姿被拉偏直至发散。
-        v_point->setFixed(true);
+        // 单目 motion-only（points_fixed=true）：地图点固定，只优化位姿
+        v_point->setFixed(points_fixed);
+        // 关键：点顶点必须标记 marginalized，BlockSolver 才会把它们当作
+        // 3x3 路标块走 Schur 消除；否则被当作 6x6 位姿块，Eigen 固定尺寸
+        // 断言/静默损坏 Hessian → Cholesky 失败 → 每次迭代写 debug.txt。
+        v_point->setMarginalized(true);
         optimizer.addVertex(v_point);
         mp_id_to_vertex[mp_id] = point_vertex_id;
         point_vertex_id++;
@@ -148,12 +184,17 @@ void Optimizer::localBundleAdjustment(
     // ========================================================
     // 5. 添加重投影误差边
     // ========================================================
+    // 双目/RGB-D：视差测深误差 σ_z ∝ z²（z = f·b/d），近点观测精度高。
+    // 信息矩阵按 1/σ_z² 加权（近点高权重），抑制远点错误点对位姿的污染；
+    // Huber 阈值随权重等比缩放（delta' = delta/√w），保持像素级鲁棒语义不变。
+    const bool depth_weighted = camera->hasPerFrameDepth();
     int edge_count = 0;
     for (auto& [mp_id, obs_list] : mp_observations) {
         auto it = mp_id_to_vertex.find(mp_id);
         if (it == mp_id_to_vertex.end()) continue;
 
         int point_vid = it->second;
+        auto mp = map->getMapPoint(mp_id);
 
         for (auto& obs : obs_list) {
             auto* edge = new g2o::EdgeProjectXYZ2UV();
@@ -166,14 +207,26 @@ void Optimizer::localBundleAdjustment(
 
             // 观测值：像素坐标
             edge->setMeasurement(obs.pixel);
-            edge->setInformation(Eigen::Matrix2d::Identity());
+
+            double huber_delta = 5.991;  // 2 DOF, chi2 95% 阈值
+            if (depth_weighted && mp) {
+                // 该观测在所属关键帧相机系下的深度（优化前估计，仅用于定权）
+                const double depth = std::max(
+                    0.1, (active_kfs[obs.kf_idx]->pose_cw * mp->pos_w).z());
+                // 参考深度 10m 处权重为 1，近点放大、远点抑制
+                const double w = std::clamp(100.0 / (depth * depth), 0.04, 25.0);
+                edge->setInformation(w * Eigen::Matrix2d::Identity());
+                huber_delta /= std::sqrt(w);
+            } else {
+                edge->setInformation(Eigen::Matrix2d::Identity());
+            }
 
             // 关联相机参数
             edge->setParameterId(0, 0);
 
             // Huber 鲁棒核函数（抑制外点）
             auto* robust_kernel = new g2o::RobustKernelHuber();
-            robust_kernel->setDelta(5.991);  // 2 DOF, chi2 95% 阈值
+            robust_kernel->setDelta(huber_delta);
             edge->setRobustKernel(robust_kernel);
 
             optimizer.addEdge(edge);
@@ -189,6 +242,8 @@ void Optimizer::localBundleAdjustment(
     // ========================================================
     // 6. 执行优化
     // ========================================================
+    optimizer.initializeOptimization();
+    optimizer.optimize(max_iterations);
     optimizer.initializeOptimization();
     optimizer.optimize(max_iterations);
 
@@ -224,11 +279,25 @@ void Optimizer::localBundleAdjustment(
 }
 
 void Optimizer::globalBundleAdjustment(const Camera& camera, Map::Ptr map,
-                                       int max_iterations) {
-    // 结构同 localBA，但使用所有关键帧和地图点
+                                       int max_iterations,
+                                       std::optional<bool> fix_points,
+                                       size_t max_points) {
+    // 结构同 localBA，但使用所有关键帧和地图点。
+    // 全图 KF 数千时 Schur 后位姿系统上万维，单次可达分钟级；按间隔采样
+    // 位姿顶点（首尾必含），未采样 KF 保持位姿图解——全局 BA 只是回环
+    // 后的精修，采样不丢尺度约束（点仍按全图观测收集）。
     auto all_kfs = map->getAllKeyFrames();
-    localBundleAdjustment(camera, map, all_kfs, max_iterations);
-    LOG_INFO("Global BA complete");
+    std::vector<Frame::Ptr> sampled;
+    sampled.reserve(all_kfs.size() / 3 + 2);
+    for (size_t i = 0; i < all_kfs.size(); i++) {
+        if (i % 3 == 0) sampled.push_back(all_kfs[i]);
+    }
+    if (sampled.empty() || sampled.back() != all_kfs.back())
+        sampled.push_back(all_kfs.back());
+    localBundleAdjustment(camera, map, sampled, max_iterations, fix_points,
+                          max_points);
+    LOG_INFO("Global BA complete (" << all_kfs.size() << " -> "
+             << sampled.size() << " keyframes)");
 }
 
 bool Optimizer::poseGraphOptimization(Map::Ptr map,

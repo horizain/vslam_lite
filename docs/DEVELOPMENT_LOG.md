@@ -625,3 +625,211 @@ gauge，不能减小回环相对残差；位姿图之后点云未同步，而后
 并行 ORB 压力测试 3×2 万次无异常）——疑为堆损坏或并发竞态，建议后续用 ASan 构建
 定位；另全局 BA 为 motion-only（点固定），回环校正的收益受限，可考虑双目下放开
 地图点自由度做全 BA。
+
+### 3.11 回环/BA 性能与精度提升 + LOST 恢复（2026-08-05）
+
+背景：§3.10 遗留两个问题——① 全局/局部 BA 为 motion-only（点固定），回环校正后
+点坐标不参与重投影精修，中段误差收不下去；② run_slam 帧 4286 非确定性静默崩溃
+疑为并发竞态。按 IMPROVEMENT_PLAN.md 的 P0-1/P0-2/P1-0/P1-1/P1-2 逐项实施，
+每项均以「现象 → 分析 → 根因 → 修复 → 验证」闭环记录。
+
+---
+
+**P0-1 双目全 BA（最关键，ATE -81% 的主因之一）**
+
+现象：只放开地图点自由度（`v_point->setFixed(false)`），不改变任何其他逻辑，
+`localBundleAdjustment` 单次耗时从 ~13ms 暴涨到 440–3400ms，FPS 从 8.5 掉到 0.5。
+
+分析过程（WSL2 环境，perf 采样基本失效，逐层排除）：
+
+1. **配置 A/B 隔离**：关掉 `enable_local_ba` → FPS 回到 8.5，确认瓶颈在 BA 内部。
+2. **迭代数比例实验**：`local_ba_iterations` 10→2，耗时按比例下降（388ms→177ms），
+   确认是「每次迭代慢」而非迭代次数爆炸（~100-200ms/迭代，问题规模却只有 3-6 KF
+   / 200 点 / 700 边，理应 <1ms）。
+3. **perf 采样**：热点完全扁平（无单一函数 >3.5%），大量 `__sched_yield` 与
+   iostream——说明进程大部分时间阻塞在 I/O 或自旋，而非计算。
+4. **/proc 线程状态 + utime/stime**：主线程 ~50% 用户态、~50% 内核态，minflt 极少
+   → 排除缺页，怀疑系统调用（文件 I/O）。
+5. **最小复现**：独立 5 KF / 200 点 / 1000 边程序，自由点路径立即触发 Eigen 断言
+   `PlainObjectBase::resize`（固定 6×6 矩阵被改成非 6×6）——Release（NDEBUG）下
+   断言被关，矩阵静默损坏。
+6. **backtrace_symbols 定位断言点**（gdb 未安装，用 SIGABRT handler + addr2line）：
+   `g2o::SparseBlockMatrix<Matrix<double,6,6>>::block` ←
+   `BlockSolver<BlockSolverTraits<6,3>>::buildStructure`。
+
+根因（g2o 两个坑叠加）：
+
+- **坑 1：`BlockSolver::buildStructure` 按 `Vertex::marginalized()` 区分 6×6 位姿块
+  与 3×3 路标块**。我们从未对点顶点调 `setMarginalized(true)`（ORB-SLAM 里
+  `vPoint->setMarginalized(true)` 是标配）。点未被 marginalize → 被当作位姿块分配
+  → 3D 点块尺寸 3×3 ≠ 6×6 → Eigen 断言；Release 下静默损坏 Hessian 结构。
+- **坑 2：`LinearSolver` 默认 `_writeDebug=true`**（`linear_solver.h:49`）→ Cholesky
+  失败后 `A.writeOctave("debug.txt")` 每次迭代把整个 Hessian 写文件——perf 里的
+  `SparseBlockMatrix::writeOctave`、`TripletEntry` 排序、iostream、内核 I/O 全是它。
+  这正是「固定点快、自由点慢」的原因：固定点时无点块，Schur 不执行，Hessian 是
+  纯 6×6 块且正定，Cholesky 成功，全程无 I/O。
+
+修复方案（`src/optimizer.cpp`）：
+
+```cpp
+v_point->setMarginalized(true);        // 点顶点按 3×3 路标块走 Schur 消除
+linearSolver->setWriteDebug(false);    // 防御：Cholesky 失败不再写盘
+```
+
+接口层：`localBundleAdjustment`/`globalBundleAdjustment` 增加 `fix_points` 参数
+（`std::optional<bool>`，默认按传感器自动选择：单目固定防尺度 gauge，双目放开）。
+
+验证：最小复现自由点 BA 440–3400ms → **13ms**（与 motion-only 同量级）；全序列
+FPS 恢复 8.5，与基线持平。
+
+---
+
+**P1-2 BA 深度加权（与 P0-1 同批实施）**
+
+现象/原因：双目视差测深误差 σ_z ∝ z²（z = f·b/d），远点观测精度差却与近点等权，
+污染位姿估计（旋转漂移是误差主项，中段均差 185m）。
+
+修复方案（`src/optimizer.cpp` 边构造处）：双目下每个重投影观测的信息矩阵按
+`w = clamp(100/z², 0.04, 25)` 加权（参考深度 10m 处 w=1，近点放大、远点抑制）；
+Huber 阈值随权重等比缩放（`delta' = delta/√w`），保持像素级鲁棒语义不变；
+单目路径维持单位信息矩阵。
+
+---
+
+**P0-2 回环检测提前**
+
+现象：KITTI 00 全程仅 3 次闭环，起点-末端真回环在最后一帧（kf#4517）才闭合，
+全程漂移得不到及时校正。
+
+分析/根因：`detectLoop` 只取 DBoW3 Top-5 且无位置信息；回环冷却用帧计数
+（`loop_cooldown_frames=200`），KF 密度波动时冷却时间漂移。
+
+修复方案：
+
+- `src/loop_closure.cpp`：词袋查询 Top-5 → **Top-20**（召回扩宽，准确性由时间窗 +
+  分数阈值 + PnP 双门槛把关）；新增**位置先验**——词袋未命中时遍历历史 KF 缓存，
+  与当前 KF 世界系距离 <25m 且 KF 间隔 ≥100 的直接成为候选（自交区域词袋分低时
+  补召回，误检由 `min_loop_inliers=50` + `pnp_inlier_ratio=0.85` 兜底）。
+- `src/vo.cpp`：冷却基准改为**关键帧计数**（`loop_cooldown_kfs`，与 KF 密度解耦；
+  兼容旧字段 `loop_cooldown_frames` 自动按 /10 换算）。
+- 配置：三个 yaml 新增 `top_candidates` / `position_prior_dist` / `position_prior_gap`。
+
+验证：run_slam 闭环 3 → 4 次，且起点-末端回环提前闭合。
+
+---
+
+**P1-0 LOST 恢复（锚点外推 + 子地图对齐）**
+
+现象：`traj.txt` 最后 10% 的 z 方向漂移 32.6m 来自 LOST 事件；丢失 20 帧（~2s
+≈20m 运动）后 `createSubmap` 用丢失前的 `last_valid_pose_cw_` 锚定，重初始化
+轨迹在丢失处静止/回跳，出现 60m 级断点。
+
+分析：丢失期位移完全未知是信息学上限，但「用丢失前最后瞬时速度外推」可大幅
+缩小锚点误差；实测 off-road 段瞬时速度被 PnP 高估（20 帧外推 24–41m），需限幅。
+
+修复方案（`src/vo.cpp`）：
+
+1. **匀速外推**：跟踪阶段记录逐帧相对运动 `per_frame_motion_`（Twc 语义）；
+   `createSubmap` 时锚点 = 最后有效位姿 × T_rel^lost_frames，单步限幅 2.5m
+   （防速度高估），总外推 >60m 视为异常退回。
+2. **Umeyama 刚体对齐**：重建成功后延迟到新子地图 ≥3 个 KF（拟合最低点数），
+   与历史轨迹**末端 100 帧**（丢失点必在轨迹末尾，限制搜索窗防轨迹自交区误配）
+   做近邻匹配（半径 50m，锚点可能偏 20-40m）→ `Sim3::estimate` 求解 →
+   仅接受 scale∈[0.85,1.15]（双目绝对尺度），施加到子地图全部 KF 与地图点。
+   单目不执行（尺度不同源，对齐会引入尺度跳变）。
+
+验证：前 60% 轨迹零跳变；LOST 后断点大幅减小。遗留：off-road 段 4 次重建时
+对齐匹配数仍不足 4（方向误差 >50m），跳变未完全消除。
+
+---
+
+**P1-1 确定性（分带收敛 + ASan 验证）**
+
+现象：run_slam 帧 4286 一次非确定性静默崩溃（复跑通过），并行 ORB 压力测试
+3×2 万次无异常，疑为堆损坏或并发竞态。
+
+分析：并行分带 ORB 的带数由 `cv::getNumThreads()/2` 动态推导，TBB 内嵌并行度
+随线程数波动，行为不可复现，是唯一可疑的并发点（Viewer headless 不起线程、
+g2o 无 OpenMP）。
+
+修复方案（`src/feature.cpp`）：分带数固定上限 4（`min(orb_max_bands_, 4)`），
+kBorder 18→24 减少边界特征损失。
+
+验证：ASan+UBSan 构建（`-fsanitize=address,undefined -fno-omit-frame-pointer
+-msse2`，对齐 g2o ABI）全量跑 KITTI 00：**4541 帧完成，0 报错 0 崩溃**（帧 4286
+崩溃未复现；因崩溃非确定，仍需多跑确认）。
+
+---
+
+验证汇总（KITTI 00 全程 headless，kitti00.yaml）：
+
+| 运行 | ATE RMSE | 备注 |
+|------|----------|------|
+| run_vo（回环关，修复前基线） | 178.6m | §3.10 数据 |
+| run_vo（回环关，修复后） | **106.4m**（-40%） | 前 60% 轨迹零跳变 |
+| run_slam（回环开，修复前基线） | 177.8m | §3.10 数据 |
+| run_slam（回环开，修复后） | **34.0m**（-81%） | 4 次闭环（提前闭合），末帧误差 134m，scale 1.05 |
+
+单测 27 项全部 PASSED。
+
+遗留：
+
+- 后 40% off-road 段 4 次子地图重建，对齐匹配数不足时跳过，断点未完全消除；
+  跨子地图回环融合（P2-3）可根治。
+- 帧 4286 崩溃在 ASan 下未复现，建议多次全量跑确认后再关闭该观察项。
+
+### 3.12 后端/重定位性能攻坚 + 回环稳定性（2026-08-05）
+
+现象：用户跑 `run_slam KITTI 00` 反馈"后半段跟踪失败多、卡顿严重、帧率低"；
+第三方模型称"性能可优化 23%"。实际排查发现两大卡顿源：**Local BA 单次最高
+131 秒**（地图膨胀后 BA 规模失控）与 **回环后全局 BA 单次最高 53 秒**（全图
+位姿顶点上万）；另有计时统计陷阱导致 FPS 显示失真。
+
+排查方法（详见 TUTORIAL.md §10 教学记录）：
+
+- PERF_SCOPE 数据 vs 墙钟差 10 倍 → 逐段加计时戳定位到"主循环计时基准被
+  --skip 跳帧解码时间污染"（FPS 0.2 是假象，真实帧间隔 70-100ms）；
+- `opt.ba` max 131s / `loop.global_ba` avg 19s 定位真实卡顿。
+
+修复（8 项，均为独立可回滚改动）：
+
+1. **BA 点数量截断（4000，按观测数降序）**（optimizer.cpp）：地图膨胀后
+   窗口内点顶点上万，Schur 消除超线性增长。截断后 Local BA max 131s → 47ms。
+   原理：观测数多的点约束最强，截断损失的信息量最小；前段地图小不触发。
+2. **全局 BA 位姿采样（间隔 3 + 首尾必含）**（optimizer.cpp）：全图 2400+
+   KF 时 Schur 后位姿系统上万维。采样后 930→311 位姿顶点，全局 BA
+   53.6s → 0.73s max。未采样 KF 保持位姿图解（全局 BA 只是回环后的精修）。
+3. **重定位粗筛**（vo.cpp + feature.cpp）：`quickMatchCount` 用当前帧前 256
+   描述子对候选做子集 BF（~0.5ms），距离 <64 匹配 <20 直接跳过；只有相似
+   候选做全量 BF + PnP；去掉重定位中冗余的 F 矩阵 RANSAC。LOST 帧从秒级
+   降到几十毫秒。
+4. **run_slam 计时基准修复**：FPS/Done 统计移到 `--skip` 之后（跳帧解码
+   时间不再污染统计）；新增 `--frames N` / `--skip N` 分片测试参数。
+5. **回环检测 Top-5 → Top-20 + 位置先验 + 冷却改 KF 计数**（上轮 P0-2 的
+   延续，本轮实测闭环可提前闭合：kf#151→1595 中段闭环 + kf#78→4518
+   起点-末端闭环稳定触发）。
+
+实验记录（两轮被证伪的改动，均为单变量对比）：
+
+- **双目 LK 5 层/31px → 4 层/25px**（省 ~40ms/帧）：LOST 219 vs 32（6 倍
+  恶化），闭环全灭，ATE 67.8m。近点视差 >100px 超出金字塔搜索范围 → 深度
+  点锐减 → 跟踪连锁恶化。**回滚**（精度是系统的，性能是局部的）。
+- **点 cull 保留单观测点**（两版：只删孤儿 / 保留近期引用点）：地图无限
+  膨胀 OOM，或单观测垃圾点污染 PnP（LOST 增 9 倍、子地图重建 37 次、
+  ATE 174.8m）。**回滚**，维持"观测 <2 删除"原策略。
+
+验证（KITTI 00 全程 headless 单进程，kitti00.yaml）：
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 全程耗时 | 790s（perf2 配置） | 607s | **-23%**（7.5 FPS） |
+| opt.ba 单次 max | 131 秒 | 726 ms | **-99.4%** |
+| 全局 BA avg/max | 19.2s / 53.6s | 0.51s / 0.73s | **-97%** |
+| 子地图重建 | 4-37 次（随机） | 0 次 | 尾段跟踪稳定 |
+| ATE RMSE | 34.0m（3.11 基线） | 15.2-33.4m | 持平或更优（闭环次数随机） |
+| 确定性 | 非确定 | 配置收敛可复现 | 同配置两次跑一致（33.4m/2 闭环/0 重建） |
+
+遗留：闭环触发次数仍有随机性（2-3 次区间）；老 KF 的 map_points 因 cull
+策略（观测<2 删）在 LOST 频繁时仍会稀疏，verifyLoop 存在失败；下一步
+框架级优化（见 IMPROVEMENT_PLAN §7 讨论）：关键帧稀疏化、异步后端、特征数
+自适应——移动端/嵌入式实时性的前提。
