@@ -4,6 +4,7 @@
 import numpy as np
 
 import evaluate_ate
+import kitti_gt_to_tum
 import plot_traj
 
 
@@ -56,10 +57,49 @@ def assert_matched_timeline():
     assert np.allclose(est_pts[:, 0], [0.0, 2.0])
 
 
+def assert_evaluator_timestamp_matching_is_one_to_one():
+    est = [
+        (0.000, np.zeros(3), np.array([0, 0, 0, 1.])),
+        (0.009, np.ones(3), np.array([0, 0, 0, 1.])),
+        (0.100, np.full(3, 2.), np.array([0, 0, 0, 1.])),
+    ]
+    gt = [
+        (0.000, np.zeros(3), np.array([0, 0, 0, 1.])),
+        (0.100, np.full(3, 2.), np.array([0, 0, 0, 1.])),
+    ]
+    pairs = evaluate_ate.match_timestamps(est, gt, tolerance=0.02)
+    assert len(pairs) == 2
+    assert [pair[1][0] for pair in pairs] == [0.0, 0.1]
+
+
+def assert_stereo_se3_does_not_hide_scale_error():
+    src, dst, _, _, _ = transformed_points()
+    scaled_src = 0.5 * dst
+    rotation, translation, scale = evaluate_ate.alignment(scaled_src, dst, "se3")
+    aligned = scale * (rotation @ scaled_src.T).T + translation
+    assert scale == 1.0
+    assert np.sqrt(np.mean(np.sum((aligned - dst) ** 2, axis=1))) > 0.1
+    _, _, sim3_scale = evaluate_ate.alignment(scaled_src, dst, "sim3")
+    assert np.isclose(sim3_scale, 2.0)
+
+
+def assert_kitti_large_rotation_quaternions():
+    for axis in np.eye(3):
+        # 180 度旋转：R = 2 aa^T - I，必走 trace <= 0 分支。
+        rotation = 2.0 * np.outer(axis, axis) - np.eye(3)
+        quat = kitti_gt_to_tum.rot_to_quat(rotation)
+        assert np.isclose(np.linalg.norm(quat), 1.0)
+        assert np.allclose(np.abs(quat[:3]), axis)
+        assert abs(quat[3]) < 1e-12
+
+
 def main():
     assert_umeyama(evaluate_ate)
     assert_umeyama(plot_traj)
     assert_matched_timeline()
+    assert_evaluator_timestamp_matching_is_one_to_one()
+    assert_stereo_se3_does_not_hide_scale_error()
+    assert_kitti_large_rotation_quaternions()
     print("trajectory alignment regression tests: PASSED")
 
 

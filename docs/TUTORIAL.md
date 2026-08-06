@@ -342,7 +342,7 @@ ORB 每帧提取+匹配很慢。LK 光流思路：**上一帧的特征点，这�
 对极几何和单目三角化恢复的运动**没有真实尺度**（一米和一厘米在图像上可能一样）。所以：
 
 - 初始化后轨迹是"归一化尺度"
-- 与真值（如 KITTI ground truth）比较前，需要先做 Sim3 尺度对齐（EVO 工具自动处理）
+- 与真值比较时，单目使用 Sim3 对齐；双目/RGB-D 尺度可观测，只允许 SE3 对齐
 
 ---
 
@@ -521,22 +521,25 @@ std::string status = std::format("{} | Matches:{} Parallax:{:.2f}", state_str, s
 （C++23 的 `std::chrono::system_clock` 精度足够）
 
 **实验 6：真正跑通 KITTI 并评估**
-下载 KITTI → `scripts/prepare_kitti.sh` → `run_vo` 输出轨迹 → `evo_ape tum` 对比真值。
+下载 KITTI 双目 → `scripts/prepare_kitti.sh` → 传序列根目录给 `run_slam` → 输出轨迹并评估。
 
 ### 7.3 评估工具 EVO 速查
 
 ```bash
 pip install evo
 
-# 估计轨迹 vs 真值（TUM 格式）
-evo_ape tum trajectory.txt groundtruth.txt -a -v
-evo_rpe tum trajectory.txt groundtruth.txt -a -v
+# 双目/RGB-D：reference(GT) 在前，-a 只做 SE3 对齐，不修尺度
+evo_ape tum groundtruth.txt trajectory.txt -a -v
+evo_rpe tum groundtruth.txt trajectory.txt -a -v
+
+# 单目尺度未知：显式增加 -s，做 Sim3 对齐
+evo_ape tum groundtruth.txt trajectory.txt -as -v
 
 # 画图
 evo_traj tum trajectory.txt groundtruth.txt -p
 ```
 
-`-a` = 自动 Sim3 对齐（单目尺度未知，必须加）。
+`-a` = SE3 对齐；`-s` = 尺度校正。双目主指标不能加 `-s`。
 
 ---
 
@@ -685,8 +688,9 @@ LOST 帧从秒级降到几十毫秒。
 | 帧计时基准修复（--skip 污染 FPS） | run_slam.cpp | FPS 显示与真实一致 |
 | `--frames N` / `--skip N` 参数 | run_slam.cpp | 分片性能测试能力 |
 
-**验证口径**：KITTI 00 全程 headless 单进程，`config/kitti00.yaml`，
-ATE（Sim3 对齐）+ LOST/子地图重建次数 + 全程 FPS 三个指标同时看。
+**验证口径**：KITTI 00 双目全程 headless 单进程，`config/kitti00.yaml`，
+时间戳匹配的 SE3 ATE + RPE + 跳变/覆盖率 + LOST/子地图重建次数 + 全程 FPS 同时看；
+Sim3 ATE 只作为形状诊断，不能替代双目绝对尺度指标。
 
 ### 10.6 性能调优的通用检查清单
 

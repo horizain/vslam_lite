@@ -14,7 +14,8 @@
 #   https://s3.eu-central-1.amazonaws.com/avg-kitti/data_odometry_poses.zip (~100KB, 真值)
 #
 # 效果：解压出
-#   <dir>/sequences/XX/image_0/000000.png ...   (灰度图像序列)
+#   <dir>/sequences/XX/image_0/000000.png ...   (左目灰度图像)
+#   <dir>/sequences/XX/image_1/000000.png ...   (右目灰度图像)
 #   <dir>/poses/XX.txt                          (00-10 真值位姿, 3x4 矩阵每行)
 # ============================================================
 set -euo pipefail
@@ -47,11 +48,14 @@ check_zip() {
 check_zip "$GRAY_ZIP" "data_odometry_gray.zip"
 check_zip "$POSES_ZIP" "data_odometry_poses.zip"
 
-# ---- 解压图像序列（只解压需要的序列，避免全部 8GB 展开）----
+# ---- 解压双目图像序列（只解压需要的序列，避免全部 8GB 展开）----
 cd "$DATA_DIR"
 for seq in $SEQUENCES; do
-    target="sequences/$seq/image_0"
-    if [ -d "$target" ] && [ "$(ls "$target" | wc -l)" -gt 100 ]; then
+    target_left="sequences/$seq/image_0"
+    target_right="sequences/$seq/image_1"
+    if [ -d "$target_left" ] && [ -d "$target_right" ] \
+       && [ "$(ls "$target_left" | wc -l)" -gt 100 ] \
+       && [ "$(ls "$target_left" | wc -l)" -eq "$(ls "$target_right" | wc -l)" ]; then
         echo "==> 序列 $seq 已存在，跳过"
         continue
     fi
@@ -59,22 +63,26 @@ for seq in $SEQUENCES; do
     python3 - "$GRAY_ZIP" "$seq" << 'PYEOF'
 import sys, zipfile, os
 zip_path, seq = sys.argv[1], sys.argv[2]
-# 只解压左目 image_0；精确到 image_0/ 避免右目 image_1 同名文件覆盖
-# （兼容两种 zip 内部前缀：官方 "dataset/sequences/..." 或镜像 "data_odometry_gray/..."）
-prefixes = [f"dataset/sequences/{seq}/image_0/", f"data_odometry_gray/dataset/sequences/{seq}/image_0/"]
-os.makedirs(f"sequences/{seq}/image_0", exist_ok=True)
+# 同时解压 image_0/image_1；双目评估必须把序列根目录传给 run_vo/run_slam。
+# 兼容官方和镜像 zip 的两种内部前缀。
+roots = [f"dataset/sequences/{seq}", f"data_odometry_gray/dataset/sequences/{seq}"]
+for camera in ("image_0", "image_1"):
+    os.makedirs(f"sequences/{seq}/{camera}", exist_ok=True)
 z = zipfile.ZipFile(zip_path)
-count = 0
+counts = {"image_0": 0, "image_1": 0}
 for name in z.namelist():
     if not name.endswith(".png"):
         continue
-    if not any(name.startswith(p) for p in prefixes):
-        continue
-    base = os.path.basename(name)
-    with open(f"sequences/{seq}/image_0/{base}", "wb") as out:
-        out.write(z.read(name))
-    count += 1
-print(f"    {seq}: {count} 张图像")
+    for camera in counts:
+        if any(name.startswith(f"{root}/{camera}/") for root in roots):
+            base = os.path.basename(name)
+            with open(f"sequences/{seq}/{camera}/{base}", "wb") as out:
+                out.write(z.read(name))
+            counts[camera] += 1
+            break
+if counts["image_0"] == 0 or counts["image_0"] != counts["image_1"]:
+    raise SystemExit(f"{seq}: 双目帧数无效 image_0={counts['image_0']} image_1={counts['image_1']}")
+print(f"    {seq}: 双目 {counts['image_0']} 对图像")
 # 顺带解压标定文件（内参自动加载用）
 for calib_name in [f"dataset/sequences/{seq}/calib.txt",
                    f"data_odometry_gray/dataset/sequences/{seq}/calib.txt"]:
@@ -105,6 +113,8 @@ fi
 
 echo ""
 echo "==> 完成。运行示例："
-echo "  ./build/bin/run_vo $DATA_DIR/sequences/00/image_0 config/default.yaml trajectory_00.txt"
+echo "  ./build/bin/run_slam $DATA_DIR/sequences/00 config/kitti00.yaml trajectory_00.txt --headless"
+echo "  # 日志必须出现 Loaded stereo sequence；传 image_0 会退化为单目。"
 echo "  # 用 EVO 评估："
-echo "  evo_ape tum trajectory_00.txt <(python3 -c 'import sys; [print(f\"{i/10:.6f}\", *map(float, l.split()[:12])) for i,l in enumerate(open(\"$DATA_DIR/poses/00.txt\"))]')"
+echo "  python3 scripts/kitti_gt_to_tum.py $DATA_DIR/poses/00.txt $DATA_DIR/poses/00.tum"
+echo "  evo_ape tum $DATA_DIR/poses/00.tum trajectory_00.txt -a   # 双目只做 SE3 对齐，不加 -s"

@@ -81,15 +81,21 @@ def umeyama(src, dst):
 
 
 def match_timestamps(est, gt, tol=0.05):
-    """按时间戳最近邻匹配帧对，返回位置数组和每个匹配对应的 GT 时间戳。"""
+    """按时间戳单调一一匹配，返回位置数组和每个匹配对应的 GT 时间戳。"""
     gt_t = np.array([g[0] for g in gt])
     gt_pos = np.array([g[1] for g in gt])
     e_idx, g_idx = [], []
+    last_g = -1
     for i, e in enumerate(est):
-        k = np.argmin(np.abs(gt_t - e[0]))
+        pos = int(np.searchsorted(gt_t, e[0]))
+        candidates = [k for k in (pos - 1, pos) if last_g < k < len(gt)]
+        if not candidates:
+            continue
+        k = min(candidates, key=lambda idx: abs(gt_t[idx] - e[0]))
         if abs(gt_t[k] - e[0]) <= tol:
             e_idx.append(i)
             g_idx.append(k)
+            last_g = k
     g_idx = np.asarray(g_idx, dtype=int)
     return (np.array([est[i][1] for i in e_idx]),
             gt_pos[g_idx], gt_t[g_idx])
@@ -137,13 +143,14 @@ def main():
     fig = plt.figure(figsize=(16, 5))
 
     ax1 = fig.add_subplot(1, 3, 1)
-    ax1.plot(g_pts[:, 0], g_pts[:, 1], "-", color="tab:gray", lw=1.8, label="Ground Truth")
-    ax1.plot(e_pts[:, 0], e_pts[:, 1], "-", color="tab:blue", lw=1.2, label="Estimate (raw)")
-    ax1.plot(aligned[:, 0], aligned[:, 1], "-", color="tab:red", lw=1.2, label="Estimate (Sim3 aligned)")
-    ax1.scatter(g_pts[0, 0], g_pts[0, 1], marker="o", s=60, color="k", zorder=5)
-    ax1.scatter(g_pts[-1, 0], g_pts[-1, 1], marker="s", s=60, color="k", zorder=5)
-    ax1.set_xlabel("x [m]"); ax1.set_ylabel("y [m]")
-    ax1.set_title("XY 俯视轨迹叠加")
+    # KITTI 相机坐标约定中 y 为竖直方向，地面俯视必须绘制 x-z。
+    ax1.plot(g_pts[:, 0], g_pts[:, 2], "-", color="tab:gray", lw=1.8, label="Ground Truth")
+    ax1.plot(e_pts[:, 0], e_pts[:, 2], "-", color="tab:blue", lw=1.2, label="Estimate (raw)")
+    ax1.plot(aligned[:, 0], aligned[:, 2], "-", color="tab:red", lw=1.2, label="Estimate (Sim3 aligned)")
+    ax1.scatter(g_pts[0, 0], g_pts[0, 2], marker="o", s=60, color="k", zorder=5)
+    ax1.scatter(g_pts[-1, 0], g_pts[-1, 2], marker="s", s=60, color="k", zorder=5)
+    ax1.set_xlabel("x [m]"); ax1.set_ylabel("z [m]")
+    ax1.set_title("XZ 地面俯视轨迹叠加")
     ax1.legend(fontsize=8); ax1.axis("equal"); ax1.grid(alpha=0.3)
 
     ax2 = fig.add_subplot(1, 3, 2, projection="3d")

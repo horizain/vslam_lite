@@ -26,10 +26,12 @@ def rot_to_quat(R):
         j = (i + 1) % 3
         k = (j + 1) % 3
         s = np.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k]) * 2
-        q = np.array([(R[j, k] - R[k, j]) / s,
-                      (R[i, k] - R[k, i]) / s,
-                      (R[i, j] - R[j, i]) / s,
-                      0.25 * s])
+        q = np.zeros(4)
+        q[i] = 0.25 * s
+        q[j] = (R[j, i] + R[i, j]) / s
+        q[k] = (R[k, i] + R[i, k]) / s
+        q[3] = (R[k, j] - R[j, k]) / s
+    q /= np.linalg.norm(q)
     # 保证 w > 0（四元数 q 与 -q 等价，统一符号便于比较）
     if q[3] < 0:
         q = -q

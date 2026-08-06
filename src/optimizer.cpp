@@ -1,6 +1,10 @@
 #include "vslam/optimizer.h"
 #include "perf_monitor.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <vector>
 
 #ifdef HAS_G2O
 #include <g2o/core/base_unary_edge.h>
@@ -314,6 +318,54 @@ bool Optimizer::poseGraphOptimization(Map::Ptr map,
     auto kfs = map->getAllKeyFrames();
     if (kfs.size() < 2) return false;
 
+    // 优化前保留完整 T_wc，用于错误回环预检和优化后事务式验收。PGO 在快照
+    // Map 上运行，验收失败时只需不回写即可保证真实地图完全不受影响。
+    std::vector<SE3> old_twc;
+    old_twc.reserve(kfs.size());
+    for (const auto& kf : kfs) old_twc.push_back(kf->pose_cw.inverse());
+
+    const Vec3 anchor = old_twc.front().t;
+    double graph_span = 0.0;
+    std::vector<double> old_steps;
+    old_steps.reserve(old_twc.size() - 1);
+    for (size_t i = 0; i < old_twc.size(); i++) {
+        graph_span = std::max(graph_span, (old_twc[i].t - anchor).norm());
+        if (i > 0) old_steps.push_back((old_twc[i].t - old_twc[i - 1].t).norm());
+    }
+    auto median = [](std::vector<double> values) {
+        if (values.empty()) return 0.0;
+        const size_t mid = values.size() / 2;
+        std::nth_element(values.begin(), values.begin() + (long)mid, values.end());
+        return values[mid];
+    };
+    const double median_step = median(old_steps);
+    const double loop_translation_limit = std::max(100.0, 2.0 * graph_span);
+    const double correction_limit = std::max(100.0, 2.0 * graph_span);
+    const double neighbor_step_limit = std::max(50.0, 10.0 * median_step);
+    constexpr double kLoopRotationLimit = 150.0 * M_PI / 180.0;
+    auto rotation_angle = [](const SE3& pose) {
+        return 2.0 * std::acos(std::clamp(std::abs(pose.q.w()), 0.0, 1.0));
+    };
+
+    // 回环测量必须至少与当前图预测处于同一数量级。真实闭环可以修正几十米
+    // 漂移，但不能接受相对残差超过整张图尺度数倍或接近反向 180 度的边。
+    for (const auto& le : loop_edges) {
+        auto kf_a = map->getKeyFrame(le.a);
+        auto kf_b = map->getKeyFrame(le.b);
+        if (!kf_a || !kf_b) continue;
+        const SE3 predicted = kf_a->pose_cw * kf_b->pose_cw.inverse();
+        const SE3 residual = le.T_rel.inverse() * predicted;
+        if (!std::isfinite(residual.t.norm())
+            || residual.t.norm() > loop_translation_limit
+            || rotation_angle(residual) > kLoopRotationLimit) {
+            LOG_WARN("Pose graph rejected loop edge kf#" << le.a << " -> kf#" << le.b
+                     << ": residual=" << residual.t.norm() << "m/"
+                     << rotation_angle(residual) * 180.0 / M_PI << "deg"
+                     << " limits=" << loop_translation_limit << "m/150deg");
+            return false;
+        }
+    }
+
     // ========================================================
     // 1. 构建优化器（位姿图专用 <6,6> solver：纯 6D 位姿顶点）
     // ========================================================
@@ -339,12 +391,18 @@ bool Optimizer::poseGraphOptimization(Map::Ptr map,
     }
 
     // 添加一条相对位姿边：测量 T_rel 满足 X_b = X_a · T_rel
-    auto add_edge = [&](int vid_a, int vid_b, const SE3& T_rel, double weight) {
+    auto add_edge = [&](int vid_a, int vid_b, const SE3& T_rel,
+                        double weight, bool robust) {
         auto* edge = new g2o::EdgeSE3();
         edge->setVertex(0, optimizer.vertex(vid_a));
         edge->setVertex(1, optimizer.vertex(vid_b));
         edge->setMeasurement(Eigen::Isometry3d(T_rel.matrix()));
         edge->setInformation(Eigen::MatrixXd::Identity(6, 6) * weight);
+        if (robust) {
+            auto* kernel = new g2o::RobustKernelHuber();
+            kernel->setDelta(std::sqrt(12.592));  // 6 DoF chi2 95%
+            edge->setRobustKernel(kernel);
+        }
         optimizer.addEdge(edge);
     };
 
@@ -357,7 +415,7 @@ bool Optimizer::poseGraphOptimization(Map::Ptr map,
         auto it_a = kf_vid.find(edge.a);
         auto it_b = kf_vid.find(edge.b);
         if (it_a == kf_vid.end() || it_b == kf_vid.end()) continue;
-        add_edge(it_a->second, it_b->second, edge.T_rel, edge.weight);
+        add_edge(it_a->second, it_b->second, edge.T_rel, edge.weight, false);
         edge_count++;
     }
 
@@ -368,7 +426,7 @@ bool Optimizer::poseGraphOptimization(Map::Ptr map,
         auto it_a = kf_vid.find(le.a);
         auto it_b = kf_vid.find(le.b);
         if (it_a == kf_vid.end() || it_b == kf_vid.end()) continue;
-        add_edge(it_a->second, it_b->second, le.T_rel, le.weight);
+        add_edge(it_a->second, it_b->second, le.T_rel, le.weight, true);
         edge_count++;
         LOG_INFO("Pose graph: loop edge kf#" << le.a << " -> kf#" << le.b
                  << " weight=" << le.weight);
@@ -383,18 +441,55 @@ bool Optimizer::poseGraphOptimization(Map::Ptr map,
     // 5. 执行优化 + 回写（estimate 是 T_wc → 取逆写回 pose_cw）
     // ========================================================
     optimizer.initializeOptimization();
-    optimizer.optimize(100);
+    optimizer.computeActiveErrors();
+    const double initial_chi2 = optimizer.activeRobustChi2();
+    const int iterations = optimizer.optimize(100);
+    optimizer.computeActiveErrors();
+    const double final_chi2 = optimizer.activeRobustChi2();
 
+    if (iterations <= 0 || !std::isfinite(initial_chi2) || !std::isfinite(final_chi2)
+        || final_chi2 > initial_chi2 * 1.01) {
+        LOG_WARN("Pose graph rejected optimizer result: iterations=" << iterations
+                 << " chi2=" << initial_chi2 << " -> " << final_chi2);
+        return false;
+    }
+
+    double max_correction = 0.0;
+    double max_neighbor_step = 0.0;
+    std::vector<SE3> optimized_twc;
+    optimized_twc.reserve(kfs.size());
     for (size_t i = 0; i < kfs.size(); i++) {
         auto* v = dynamic_cast<g2o::VertexSE3*>(optimizer.vertex(static_cast<int>(i)));
-        if (!v) continue;
-        const Eigen::Isometry3d& Twc = v->estimate();
-        kfs[i]->pose_cw = SE3(Eigen::Quaterniond(Twc.linear()), Twc.translation())
-                              .inverse();
+        if (!v) return false;
+        const Eigen::Isometry3d& value = v->estimate();
+        SE3 Twc(Eigen::Quaterniond(value.linear()), value.translation());
+        if (!Twc.t.allFinite() || !Twc.q.coeffs().allFinite()) {
+            LOG_WARN("Pose graph rejected non-finite vertex #" << i);
+            return false;
+        }
+        max_correction = std::max(
+            max_correction, (old_twc[i].inverse() * Twc).t.norm());
+        if (!optimized_twc.empty()) {
+            max_neighbor_step = std::max(
+                max_neighbor_step, (Twc.t - optimized_twc.back().t).norm());
+        }
+        optimized_twc.push_back(Twc);
+    }
+
+    if (max_correction > correction_limit || max_neighbor_step > neighbor_step_limit) {
+        LOG_WARN("Pose graph rejected unsafe correction: max_delta=" << max_correction
+                 << "m (limit " << correction_limit << "), neighbor_step="
+                 << max_neighbor_step << "m (limit " << neighbor_step_limit << ")");
+        return false;
+    }
+
+    for (size_t i = 0; i < kfs.size(); i++) {
+        kfs[i]->pose_cw = optimized_twc[i].inverse();
     }
 
     LOG_INFO("Pose graph: optimized " << kfs.size() << " keyframes, "
-             << edge_count << " edges");
+             << edge_count << " edges, chi2=" << initial_chi2 << " -> " << final_chi2
+             << ", max_delta=" << max_correction << "m");
     return true;
 #endif
 }

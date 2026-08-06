@@ -165,6 +165,10 @@ int main(int argc, char** argv) {
     // ---- 清理 ----
     if (!headless) viewer.stop();
 
+    // 批量评估必须等待排队中的 BA/回环全部写回；否则末次优化、闭环计数和
+    // perf 数据可能发生在轨迹保存之后，结果随线程时序变化。
+    vo.finishPendingBackendWork();
+
     // ---- 保存轨迹（TUM 格式，回环校正后的全局位姿）----
     const auto pose_trajectory = vo.getPoseTrajectory();
     if (!pose_trajectory.empty()) {
@@ -202,7 +206,7 @@ int main(int argc, char** argv) {
              << vo.getMap()->keyFrameCount() << " keyframes");
 
     // 性能监测 dump（VSLAM_ENABLE_PERF 关闭时为空操作）
-    vslam::perf_dump("perf.csv");
+    vslam::perf_dump(traj_path + ".perf.csv");
 
     return 0;
 }

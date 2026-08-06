@@ -930,7 +930,7 @@ void test_pose_graph() {
         le.b = (unsigned long)(N - 1);
         le.T_rel = gt[0].inverse() * gt[N - 1];  // X_0⁻¹·X_{N-1} 的期望值
         le.weight = 10.0;
-        vslam::Optimizer::poseGraphOptimization(map, odometry_edges, {le});
+        assert(vslam::Optimizer::poseGraphOptimization(map, odometry_edges, {le}));
 
         // 优化后末帧误差应显著下降
         vslam::SE3 Twc_after = map->getKeyFrame((unsigned long)(N - 1))->pose_cw.inverse();
@@ -938,6 +938,38 @@ void test_pose_graph() {
         std::cout << " (drift_before=" << err_before << "m after=" << err_after << "m)";
         assert(err_after < err_before * 0.2);
         assert(err_after < 0.5);
+    } TEST_PASS();
+
+    TEST("位姿图拒绝百万米错误回环且不修改地图") {
+        constexpr int N = 10;
+        auto map = std::make_shared<vslam::Map>();
+        std::vector<vslam::LoopEdge> odometry_edges;
+        for (int i = 0; i < N; i++) {
+            auto kf = std::make_shared<vslam::Frame>((unsigned long)i, (double)i);
+            const vslam::SE3 Twc(Eigen::Quaterniond::Identity(), vslam::Vec3(i, 0, 0));
+            kf->pose_cw = Twc.inverse();
+            map->insertKeyFrame(kf);
+            if (i > 0) {
+                odometry_edges.push_back({
+                    (unsigned long)(i - 1), (unsigned long)i,
+                    vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(1, 0, 0)),
+                    1.0});
+            }
+        }
+
+        vslam::LoopEdge bad_loop;
+        bad_loop.a = 0;
+        bad_loop.b = N - 1;
+        bad_loop.T_rel = vslam::SE3(
+            Eigen::Quaterniond::Identity(), vslam::Vec3(1e6, 0, 0));
+        bad_loop.weight = 10.0;
+
+        assert(!vslam::Optimizer::poseGraphOptimization(
+            map, odometry_edges, {bad_loop}));
+        for (int i = 0; i < N; i++) {
+            const auto Twc = map->getKeyFrame((unsigned long)i)->pose_cw.inverse();
+            assert((Twc.t - vslam::Vec3(i, 0, 0)).norm() < 1e-12);
+        }
     } TEST_PASS();
 #else
     TEST("位姿图优化：回环约束校正累积漂移") {

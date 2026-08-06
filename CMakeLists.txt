@@ -66,13 +66,28 @@ find_package(yaml-cpp REQUIRED)
 # 只构建本项目需要的核心库，关闭 apps/examples/unit tests/benchmarks、OpenGL
 # （g2o_viewer 不需要）与 spdlog/fmt 日志（GCC 13 + C++23 下与系统 fmt 9
 # 存在 constexpr 兼容性问题，且本项目用 LOG_INFO 自管日志）。
-set(G2O_BUILD_APPS OFF)
-set(G2O_BUILD_EXAMPLES OFF)
-set(G2O_BUILD_BENCHMARKS OFF)
-set(BUILD_UNITTESTS OFF)
-set(G2O_USE_OPENGL OFF)
-set(G2O_USE_LOGGING OFF)
-add_subdirectory(thirdparty/g2o)
+# CACHE+FORCE 是为了覆盖旧 build/CMakeCache 中 g2o 默认的 ON；普通 set()
+# 会被 option() 的既有缓存值反向覆盖，导致 logging/无关 types 悄悄重新启用。
+set(G2O_BUILD_APPS OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(G2O_USE_OPENGL OFF CACHE BOOL "" FORCE)
+set(G2O_USE_LOGGING OFF CACHE BOOL "" FORCE)
+set(G2O_USE_CHOLMOD OFF CACHE BOOL "" FORCE)
+set(G2O_USE_CSPARSE OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_SLAM2D_TYPES OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_SLAM2D_ADDON_TYPES OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_DATA_TYPES OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_SCLAM2D_TYPES OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_SLAM3D_TYPES ON CACHE BOOL "" FORCE)
+set(G2O_BUILD_SLAM3D_ADDON_TYPES OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_SBA_TYPES ON CACHE BOOL "" FORCE)
+set(G2O_BUILD_ICP_TYPES OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_SIM3_TYPES OFF CACHE BOOL "" FORCE)
+# g2o 根工程会声明其他 solver 目标；EXCLUDE_FROM_ALL 保证默认构建只沿下方
+# 五个链接目标的依赖闭包编译，不额外构建 pcg/dense/structure_only 等库。
+add_subdirectory(thirdparty/g2o EXCLUDE_FROM_ALL)
 add_definitions(-DHAS_G2O)
 message(STATUS "g2o vendored in thirdparty/g2o - backend optimization enabled")
 

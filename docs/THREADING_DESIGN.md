@@ -215,3 +215,145 @@ LOST 292→8（-97%）、闭环 1→3、子地图重建 13→3。
 
 g2o 保持单线程：窗口 BA 与回环位姿图规模已被窗口/点截断/位姿采样控制住，
 多核收益应投向可并行热点（ORB/LK），而非 BA。
+
+## 十四、版本化事务写回与子地图坐标管理（2026-08-06）
+
+§十三的 ACTIVE/FROZEN/C 三层模型给出了低锁读路径，但还缺少两个正确性前提：
+
+1. 优化快照必须绑定明确的地图版本，过期结果不得按 ID 覆盖实时对象；
+2. 子地图必须真正拥有局部坐标，全局位姿只能由子地图变换和局部状态派生。
+
+在这两个前提完成前直接增加校正场 C，只会产生第四份可变位姿，不能解决一致性问题。
+
+### 14.1 强制不变量
+
+1. Optimizer 永远不接收可写的实时 `Map::Ptr`，只读不可变快照；
+2. 每个任务携带 `submap_id + topology_revision + geometry_revision`；
+3. Local BA/PGO/GBA 只返回候选增量和质量指标，不能直接修改 Frame/MapPoint；
+4. 只有一个 `BackendCommitter` 有权发布几何新版本；
+5. 地图、约束、轨迹锚点必须在同一提交中切换版本；
+6. Tracking 每帧开始读取一次只读快照，整帧不得跨版本读数据；
+7. 优化失败、结果过期或验收失败时，实时状态必须逐项保持不变。
+
+### 14.2 优化接口与版本模型
+
+```cpp
+struct OptimizationSnapshot {
+    SubmapId submap_id;
+    uint64_t topology_revision;  // KF/点/观测集合变化
+    uint64_t geometry_revision;  // pose/point 坐标变化
+    std::vector<KeyframeState> keyframes;
+    std::vector<LandmarkState> landmarks;
+    std::vector<Constraint> constraints;
+};
+
+struct OptimizationResult {
+    SubmapId submap_id;
+    uint64_t base_topology_revision;
+    uint64_t base_geometry_revision;
+    std::vector<PoseUpdate> poses;
+    std::vector<PointUpdate> points;
+    OptimizationMetrics metrics;  // chi2、最大校正、连续性、有限值
+};
+```
+
+Optimizer API 改为纯计算：
+
+```cpp
+OptimizationResult solveLocalBA(const OptimizationSnapshot&);
+OptimizationResult solvePoseGraph(const OptimizationSnapshot&);
+CommitStatus BackendCommitter::commit(const OptimizationResult&);
+```
+
+提交器依次检查目标子地图、版本、对象存活和优化质量，然后在一次状态临界区中应用全部
+pose/point/constraint 更新并增加 revision。Local BA 结果过期时直接丢弃并调度最新窗口；
+PGO 第一阶段也严格丢弃。只有在“同一子地图、拓扑未变、仅尾部追加 KF”的协议和测试完成后，
+才允许显式 rebase，禁止隐式猜测。
+
+### 14.3 子地图局部坐标
+
+定义 `T_ws` 为子地图坐标到世界坐标，`T_cs` 为子地图坐标到相机坐标，地图点存 `p_s`：
+
+```text
+T_wc = T_ws · T_sc
+p_w  = T_ws · p_s
+```
+
+```cpp
+enum class SubmapState { ACTIVE, FROZEN, RETIRED };
+enum class ConnectionState { UNCONNECTED, TENTATIVE, CONNECTED };
+
+struct Submap {
+    SubmapId id;
+    SE3 T_ws;
+    uint64_t topology_revision;
+    uint64_t geometry_revision;
+    SubmapState state;
+    ConnectionState connection;
+    Map::Ptr local_map;
+};
+```
+
+任意时刻只能有一个 ACTIVE 子地图。LOST 后匀速外推只能产生低置信 TrackingBridge 约束，
+新图状态为 TENTATIVE，不能直接冒充可靠全局连接。更新子地图全局位置时只修改 `T_ws`，
+不再遍历所有 KF 和地图点。
+
+### 14.4 锚定轨迹与地图点
+
+普通帧不再重复保存全局 `T_cw`，而是记录相对参考关键帧的固定局部运动：
+
+```cpp
+struct FramePoseRecord {
+    FrameId frame_id;
+    double timestamp;
+    SubmapId submap_id;
+    KeyframeId anchor_kf;
+    SE3 T_c_anchor;
+    bool valid;
+};
+```
+
+导出/Viewer 按 `T_cw(frame) = T_c_anchor * T_anchor_w` 派生全局位姿。回环只更新锚点/子地图
+校正，普通帧自动跟随，不再按 KF id 对校正量做区间插值。地图点同样保存
+`anchor_kf + p_anchor`；Local BA 提交点结果时转换回锚定坐标。锚点 KF 被删除前必须先执行
+显式 re-anchor，不能留下悬空引用。
+
+### 14.5 Atlas 子地图约束图
+
+Atlas 节点是 Submap，边分三类：
+
+- `TrackingBridge`：跟丢后运动外推，低权重、可被后续约束修正；
+- `Relocalization`：跨子地图重定位产生的 SE3/Sim3 约束；
+- `LoopClosure`：完整几何验证后的高置信鲁棒约束。
+
+跨子地图重定位不再立即 `activate + 覆盖 curr_frame pose`，而是先生成约束、优化 `T_ws`、
+原子提交，再决定活动图切换。坐标连接与地图融合拆开：M5 只需统一世界坐标即可输出连续
+轨迹，地图点/KF 去重融合留给独立里程碑，避免一次改动同时承担两种风险。
+
+### 14.6 校正场 C 的发布
+
+完成版本提交、局部坐标和锚定数据后，PGO 结果可发布不可变稀疏校正场：
+
+```cpp
+using CorrectionField = std::unordered_map<KeyframeId, SE3>;
+std::atomic<std::shared_ptr<const CorrectionField>> corrections;
+```
+
+回环线程构造完整新 C，验收后原子交换；Tracking 每帧只 load 一次。该机制替代全量点写回，
+但不替代 revision/Committer：C 本身也必须记录 base revision 并接受 stale 检查。
+
+### 14.7 渐进落地与验收
+
+| 里程碑 | 改动 | 关键验收 |
+|--------|------|----------|
+| M0 | 正常跟踪/重定位统一位姿验收，PGO 防爆 | 恶性边/大跳拒绝后状态不变，连续帧 >10m=0 |
+| M1 | Optimizer Result + Map/Submap revision | stale Local BA/PGO 可重复拒绝 |
+| M2 | BackendCommitter + 只读 TrackingSnapshot | 一帧只观察一个 revision，无部分提交 |
+| M3 | `T_cs/p_s/T_ws` 局部坐标迁移 | 改 `T_ws` 时 KF/点/轨迹一致移动 |
+| M4 | 锚定普通帧和地图点 | 删除全量轨迹插值与全量点搬运 |
+| M5 | Atlas 约束图 | 跨子地图连接不跳变，融合可暂不实现 |
+| M6 | COW 校正场、异步默认恢复 | TSAN/压力测试通过，FPS 提升且精度不退化 |
+
+KITTI 00 第一阶段门槛：时间戳一一关联覆盖率 ≥99%、连续有效帧 >10m 跳变为 0、
+路径长度比 0.9~1.2、子地图重建 ≤3、SE3 ATE ≤30m。RPE 只统计真正连续的有效帧，
+跨 LOST 空洞的位姿对必须单独统计，不能伪装成“一帧 RPE”。

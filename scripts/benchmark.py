@@ -23,10 +23,10 @@ benchmark.py - VSLAM 全程基准测试套件
 """
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 RE_FPS = re.compile(r"Done\. Processed (\d+) frames in ([\d.]+) seconds \(([\d.]+) FPS\)")
 RE_LOST = re.compile(r"Tracking lost")
@@ -38,10 +38,12 @@ RE_BACKEND = re.compile(r"Async backend ENABLED")
 
 def run_once(args, out_path, run_dir):
     """跑一次全程，返回指标 dict。"""
-    log_path = os.path.join(run_dir, "run.log")
+    log_path = str(Path(run_dir) / "run.log")
     cmd = [args.bin, args.dataset, args.config, out_path, "--headless"]
     with open(log_path, "w") as logf:
-        subprocess.run(cmd, cwd=args.cwd, stdout=logf, stderr=subprocess.STDOUT)
+        proc = subprocess.run(cmd, cwd=args.cwd, stdout=logf, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"run_slam 失败(returncode={proc.returncode})，见 {log_path}")
 
     m = {}
     log = open(log_path).read()
@@ -53,25 +55,35 @@ def run_once(args, out_path, run_dir):
     m["submap_reinit"] = len(RE_ANCHOR.findall(log))
     m["loops"] = len(RE_LOOP.findall(log))
     m["async"] = bool(RE_BACKEND.search(log))
+    if m["frames"] <= 0:
+        raise RuntimeError(f"未解析到完整运行统计，见 {log_path}")
+    if args.expected_frames and m["frames"] != args.expected_frames:
+        raise RuntimeError(f"帧数不完整: {m['frames']} != {args.expected_frames}")
 
     # ATE（无真值则跳过）
-    if args.gt and os.path.exists(out_path):
+    if args.gt and Path(out_path).exists():
         ate_out = subprocess.run(
-            [sys.executable, args.evaluate, out_path, args.gt],
-            capture_output=True, text=True).stdout
+            [sys.executable, args.evaluate, out_path, args.gt,
+             "--alignment", args.alignment], capture_output=True, text=True)
+        if ate_out.returncode != 0:
+            raise RuntimeError(f"轨迹评估失败: {ate_out.stderr.strip()}")
+        ate_text = ate_out.stdout
         for key in ("RMSE", "Mean", "Max"):
-            mm = re.search(rf"ATE\s+{key}\s*=\s*([\d.]+)", ate_out)
+            mm = re.search(rf"ATE\s+{key}\s*=\s*([\d.]+)", ate_text)
             m[f"ate_{key.lower()}"] = float(mm.group(1)) if mm else -1.0
+        for name, pattern in {
+            "rpe_trans_rmse": r"RPE\s+Trans RMSE\s*=\s*([\d.]+)",
+            "rpe_rot_rmse": r"RPE\s+Rot RMSE\s*=\s*([\d.]+)",
+            "jumps_10m": r"Step jumps >3m/>5m/>10m\s*=\s*\d+/\d+/(\d+)",
+        }.items():
+            match = re.search(pattern, ate_text)
+            m[name] = float(match.group(1)) if match else -1.0
 
-    # perf.csv（run_slam 退出时 dump 到 cwd；拷贝走避免互相覆盖）
-    perf_path = os.path.join(args.cwd, "perf.csv")
-    if os.path.exists(perf_path):
+    # 性能数据与轨迹同目录输出，避免复制/删除工作区已有 perf.csv。
+    perf_path = out_path + ".perf.csv"
+    if Path(perf_path).exists():
         try:
-            import shutil
-            dst = os.path.join(run_dir, "perf.csv")
-            shutil.copy2(perf_path, dst)
-            os.remove(perf_path)
-            for line in open(dst):
+            for line in open(perf_path):
                 parts = line.strip().split(",")
                 if parts and parts[0] == "opt.ba":
                     m["ba_max_ms"] = float(parts[5])
@@ -108,9 +120,23 @@ def main():
     ap.add_argument("--compare", default=None, help="对比配置（同 runs 次数）")
     ap.add_argument("--bin", default="build/bin/run_slam")
     ap.add_argument("--gt", default=None, help="真值轨迹（TUM），给则评估 ATE")
+    ap.add_argument("--alignment", choices=("se3", "sim3", "none"), default="se3",
+                    help="双目默认 se3；单目请显式选择 sim3")
+    ap.add_argument("--expected-frames", type=int, default=4541,
+                    help="必须完整处理的帧数；0 表示不校验（KITTI00 默认 4541）")
     ap.add_argument("--cwd", default=".", help="工作目录（默认仓库根，perf.csv 在此生成）")
     ap.add_argument("--evaluate", default="scripts/evaluate_ate.py")
     args = ap.parse_args()
+
+    # 子进程 cwd 可能不同；输入、二进制和评估脚本都转换为绝对路径。
+    args.cwd = str(Path(args.cwd).resolve())
+    args.dataset = str(Path(args.dataset).resolve())
+    args.bin = str(Path(args.bin).resolve())
+    args.evaluate = str(Path(args.evaluate).resolve())
+    args.gt = str(Path(args.gt).resolve()) if args.gt else None
+    args.out_dir = str(Path(args.out_dir).resolve())
+    args.config = str(Path(args.config).resolve())
+    args.compare = str(Path(args.compare).resolve()) if args.compare else None
 
     configs = [("A", args.config)]
     if args.compare:
@@ -120,14 +146,14 @@ def main():
     for label, cfg in configs:
         results = []
         for i in range(args.runs):
-            run_dir = os.path.join(args.out_dir, f"{label}_run{i+1}")
-            os.makedirs(run_dir, exist_ok=True)
-            out_path = os.path.join(run_dir, "traj.txt")
+            run_dir = str(Path(args.out_dir) / f"{label}_run{i+1}")
+            Path(run_dir).mkdir(parents=True, exist_ok=True)
+            out_path = str(Path(run_dir) / "traj.txt")
             print(f"[bench] {label} run {i+1}/{args.runs} config={cfg} ...",
                   flush=True)
             results.append(run_once(args, out_path, run_dir))
         all_results[label] = summarize(results)
-        with open(os.path.join(args.out_dir, f"results_{label}.json"), "w") as f:
+        with open(Path(args.out_dir) / f"results_{label}.json", "w") as f:
             json.dump({k: list(v) for k, v in all_results[label].items()}, f,
                       indent=2)
 
@@ -135,7 +161,10 @@ def main():
     metric_names = [
         ("fps", "FPS", "%.2f"), ("seconds", "耗时(s)", "%.1f"),
         ("ate_rmse", "ATE RMSE(m)", "%.2f"), ("ate_mean", "ATE Mean(m)", "%.2f"),
-        ("ate_max", "ATE Max(m)", "%.2f"), ("lost", "LOST 次数", "%.1f"),
+        ("ate_max", "ATE Max(m)", "%.2f"),
+        ("rpe_trans_rmse", "RPE trans(m/f)", "%.2f"),
+        ("rpe_rot_rmse", "RPE rot(deg/f)", "%.2f"),
+        ("jumps_10m", ">10m 跳变", "%.1f"), ("lost", "LOST 次数", "%.1f"),
         ("submap_reinit", "子地图重建", "%.1f"), ("loops", "闭环次数", "%.1f"),
         ("ba_max_ms", "Local BA max(ms)", "%.0f"),
         ("global_ba_max_ms", "全局 BA max(ms)", "%.0f"),

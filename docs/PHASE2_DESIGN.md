@@ -250,8 +250,8 @@ LoopClosure:
 bash scripts/prepare_kitti.sh        # 已有
 ./build/bin/run_vo  datasets/sequences/00 config/default.yaml vo_traj.txt          # 基线（回环关）
 ./build/bin/run_slam datasets/sequences/00 config/default.yaml slam_traj.txt        # 回环开
-evo_ape tum vo_traj.txt   kitti_gt.txt -a    # 对比基线
-evo_ape tum slam_traj.txt kitti_gt.txt -a    # 对比回环版
+evo_ape tum kitti_gt.txt vo_traj.txt   -a    # 双目基线：SE3 对齐，不修尺度
+evo_ape tum kitti_gt.txt slam_traj.txt -a    # 双目回环版：SE3 对齐，不修尺度
 ```
 - 记录：回环检测次数 / 验证通过次数 / 全程 LOST 数 / FPS / 全量 ATE RMSE；
 - 成功标准：§1 验收表（ATE 从 ~133.6m 显著下降）。
