@@ -192,6 +192,8 @@ bool Dataset::loadEUROCImageList(const std::string& path) {
     std::string line;
     while (std::getline(ifs, line)) {
         if (line.empty() || line[0] == '#') continue;
+        // 官方 data.csv 为 CRLF 行尾：剔除 \r，否则文件名拼接失败
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::string ts_str, file;
         std::istringstream ss(line);
         std::getline(ss, ts_str, ',');
