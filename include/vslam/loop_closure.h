@@ -5,7 +5,6 @@
 #include "vslam/camera.h"
 #include "vslam/feature.h"
 #include <memory>
-#include <mutex>
 #include <string>
 
 namespace vslam {
@@ -51,9 +50,6 @@ public:
                     SE3& T_loop_curr);
 
 private:
-    /// DBoW3 数据库/缓存访问互斥（异步后端：主线程 addKeyFrame 与
-    /// 后台线程 detectLoop 并发；verifyLoop 不碰内部状态无需此锁）
-    mutable std::mutex mutex_;
 #ifdef HAS_DBOW3
     class Impl;  // DBoW3 具体状态，在 .cpp 中定义
     std::unique_ptr<Impl> impl_;
