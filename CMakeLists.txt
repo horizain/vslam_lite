@@ -23,10 +23,11 @@ if(VSLAM_ENABLE_PERF)
     add_compile_definitions(VSLAM_ENABLE_PERF)
     message(STATUS "Performance instrumentation ENABLED (VSLAM_ENABLE_PERF=ON)")
 endif()
-# 注意：不能用 -march=native（AVX/32字节对齐）——apt 版 g2o 库按 SSE/16 字节
-# 对齐编译，跨 DSO 传递 Eigen Isometry3d 等固定大小类型时对齐假设不一致，
-# 会导致 EdgeSE3 测量值静默损坏、位姿图优化发散（实测）。用 SSE2 保持
-# 16 字节对齐，与系统 g2o 一致（Eigen 向量化收益几乎不受影响）。
+# 注意：不能用 -march=native（AVX/32字节对齐）——g2o 按 SSE/16 字节
+# 对齐编译（含 thirdparty/g2o 源码，子目录继承本 flags），跨 DSO 传递
+# Eigen Isometry3d 等固定大小类型时若对齐假设不一致，会导致 EdgeSE3
+# 测量值静默损坏、位姿图优化发散（实测）。用 SSE2 保持 16 字节对齐，
+# 与 g2o 一致（Eigen 向量化收益几乎不受影响）。
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -msse2 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG   "-O0 -g -DDEBUG")
 
@@ -58,15 +59,22 @@ endif()
 # --- yaml-cpp (必需，配置) ---
 find_package(yaml-cpp REQUIRED)
 
-# --- g2o (可选，Phase 1 后端优化) ---
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
-find_package(g2o QUIET)
-if(g2o_FOUND)
-    message(STATUS "g2o found - backend optimization enabled")
-    add_definitions(-DHAS_G2O)
-else()
-    message(WARNING "g2o not found - backend optimization disabled (Phase 1 still works)")
-endif()
+# --- g2o (Phase 1 后端优化，源码 vendored) ---
+# g2o 源码位于 thirdparty/g2o（tag 20241228_git，commit
+# eec325a1da1273e87bc97887d49e70570f28570c），随仓库管理、add_subdirectory
+# 直接集成，不依赖系统 apt 的 libg2o-dev，保证各机器离线可复现构建。
+# 只构建本项目需要的核心库，关闭 apps/examples/unit tests/benchmarks、OpenGL
+# （g2o_viewer 不需要）与 spdlog/fmt 日志（GCC 13 + C++23 下与系统 fmt 9
+# 存在 constexpr 兼容性问题，且本项目用 LOG_INFO 自管日志）。
+set(G2O_BUILD_APPS OFF)
+set(G2O_BUILD_EXAMPLES OFF)
+set(G2O_BUILD_BENCHMARKS OFF)
+set(BUILD_UNITTESTS OFF)
+set(G2O_USE_OPENGL OFF)
+set(G2O_USE_LOGGING OFF)
+add_subdirectory(thirdparty/g2o)
+add_definitions(-DHAS_G2O)
+message(STATUS "g2o vendored in thirdparty/g2o - backend optimization enabled")
 
 # --- DBoW3 (可选，Phase 2 回环检测) ---
 find_package(DBoW3 QUIET)
@@ -129,10 +137,20 @@ target_link_libraries(vslam
         ${VSLAM_PANGOLIN_LIBS}
         yaml-cpp)
 
-if(g2o_FOUND)
-    target_link_libraries(vslam PUBLIC ${g2o_LIBRARIES})
-    target_include_directories(vslam PUBLIC ${g2o_INCLUDE_DIRS})
-endif()
+# g2o 的 add_library 目标名不带前缀（core/stuff/...），
+# 这里统一建别名 g2o::* 便于链接与维护。
+add_library(g2o::core ALIAS core)
+add_library(g2o::stuff ALIAS stuff)
+add_library(g2o::solver_eigen ALIAS solver_eigen)
+add_library(g2o::types_slam3d ALIAS types_slam3d)
+add_library(g2o::types_sba ALIAS types_sba)
+target_link_libraries(vslam PUBLIC
+    g2o::core
+    g2o::stuff
+    g2o::solver_eigen
+    g2o::types_slam3d
+    g2o::types_sba)
+# 头文件路径由 g2o target 的 BUILD_INTERFACE 自动传播，无需手动添加。
 
 if(DBoW3_FOUND)
     # DBoW3 的 DBoW3Config.cmake 只导出变量（DBoW3_LIBS/DBoW3_INCLUDE_DIRS），
@@ -170,6 +188,11 @@ if(BUILD_TESTS)
         target_compile_options(test_vo PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_vo COMMAND test_vo)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME test_trajectory_alignment
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_trajectory_alignment.py)
+    endif()
 endif()
 
 # ============================================================
