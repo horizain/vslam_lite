@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
 
     struct TrajectoryRecord {
         double timestamp;
-        vslam::SE3 pose_cw;
+        vslam::SE3 pose_cs;
         vslam::VisualOdometry::Status status;
     };
     // 主 TUM 只写全局有效位姿；完整帧状态另存 debug CSV。
@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
             size_t valid_count = 0;
             for (const auto& record : traj_saved) {
                 if (!record.status.pose_valid) continue;
-                vslam::SE3 Twc = record.pose_cw.inverse();  // T_cw → T_wc
+                vslam::SE3 Twc = record.pose_cs.inverse();  // T_cw → T_wc
                 ofs << record.timestamp << " "
                     << Twc.t.x() << " " << Twc.t.y() << " " << Twc.t.z() << " "
                     << Twc.q.x() << " " << Twc.q.y() << " " << Twc.q.z() << " "
@@ -217,7 +217,7 @@ int main(int argc, char** argv) {
             debug_ofs << std::fixed << std::setprecision(6);
             for (const auto& record : traj_saved) {
                 const auto& st = record.status;
-                const vslam::SE3 Twc = record.pose_cw.inverse();
+                const vslam::SE3 Twc = record.pose_cs.inverse();
                 debug_ofs << record.timestamp << "," << static_cast<int>(st.state) << ","
                           << st.tracking_valid << "," << st.map_connected << ","
                           << st.pose_valid << "," << st.pose_method << ","

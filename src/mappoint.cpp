@@ -33,7 +33,7 @@ MapPoint::Ptr MapPoint::create(unsigned long id,
     // 齐次坐标转 3D
     cv::Mat x = points_4d.col(0);
     x /= x.at<float>(3);
-    mp->pos_w = Vec3(x.at<float>(0), x.at<float>(1), x.at<float>(2));
+    mp->pos_s = Vec3(x.at<float>(0), x.at<float>(1), x.at<float>(2));
 
     return mp;
 }

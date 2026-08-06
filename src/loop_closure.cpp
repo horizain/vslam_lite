@@ -155,13 +155,13 @@ std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
     // 4. 位置先验：估计轨迹自交区域词袋分数常偏低，用世界系距离补召回。
     //    与词袋候选并列返回（放在后面），由调用方的 PnP 双门槛验证兜底。
     if (position_prior_dist_m_ > 0.0) {
-        const Vec3 curr_pos = kf->pose_cw.inverse().t;  // 相机光心（世界系）
+        const Vec3 curr_pos = kf->pose_cs.inverse().t;  // 相机光心（世界系）
         double best_dist = position_prior_dist_m_;
         Frame::Ptr prior_cand;
         for (const auto& [cand_id, cand] : impl_->kf_cache) {
             if (!cand || cand_id >= kf->id ||
                 kf->id - cand_id < (unsigned long)position_prior_gap_) continue;
-            const double dist = (cand->pose_cw.inverse().t - curr_pos).norm();
+            const double dist = (cand->pose_cs.inverse().t - curr_pos).norm();
             if (dist < best_dist) {
                 best_dist = dist;
                 prior_cand = cand;
@@ -210,7 +210,7 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
         auto mp = kf_loop->map_points[matches[i].trainIdx];
         if (!mp) continue;
         const auto& kp = kf_curr->keypoints[matches[i].queryIdx];
-        pts3d.emplace_back(mp->pos_w.x(), mp->pos_w.y(), mp->pos_w.z());
+        pts3d.emplace_back(mp->pos_s.x(), mp->pos_s.y(), mp->pos_s.z());
         pts2d.emplace_back(kp.pt.x, kp.pt.y);
     }
     if (pts3d.size() < 8) {
@@ -237,15 +237,15 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
 
     // 5. solvePnP 的 rvec/tvec 满足 p_c = R·p_w + t（世界→相机），即
     //    matToSE3(rvec, tvec) 是当前帧的 T_cw（与 trackFrame 中直接把
-    //    solvePnP 结果存为 pose_cw 的用法一致）。位姿图边的测量约定为
+    //    solvePnP 结果存为 pose_cs 的用法一致）。位姿图边的测量约定为
     //    Z = X_loop⁻¹ · X_curr（X 为 T_wc，见 loop_closure.h 与
     //    test_vo.cpp 位姿图测试），故需要 T_cw_curr 的逆：
-    //      Z = kf_loop->pose_cw * T_wc_curr = T_cw_loop * T_cw_curr⁻¹。
+    //      Z = kf_loop->pose_cs * T_wc_curr = T_cw_loop * T_cw_curr⁻¹。
     //    注意：6c311d7 曾误判 solvePnP 输出为 T_wc 而删掉此逆，导致
     //    回环约束与里程计矛盾、每次校正把轨迹拉向错误方向（ATE 恶化），
     //    已在 2026-08-04 修正回 T_cw 语义。
     const SE3 T_cw_curr_in_loop = matToSE3(rvec, tvec);
-    T_loop_curr = kf_loop->pose_cw * T_cw_curr_in_loop.inverse();
+    T_loop_curr = kf_loop->pose_cs * T_cw_curr_in_loop.inverse();
     LOG_INFO("LoopClosure: verified! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
              << " inliers=" << inliers.size());
     return true;

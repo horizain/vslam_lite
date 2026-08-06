@@ -346,13 +346,25 @@ std::atomic<std::shared_ptr<const CorrectionField>> corrections;
 
 | 里程碑 | 改动 | 关键验收 |
 |--------|------|----------|
-| M0 | 正常跟踪/重定位统一位姿验收，PGO 防爆 | 恶性边/大跳拒绝后状态不变，连续帧 >10m=0 |
-| M1 | Optimizer Result + Map/Submap revision | stale Local BA/PGO 可重复拒绝 |
-| M2 | BackendCommitter + 只读 TrackingSnapshot | 一帧只观察一个 revision，无部分提交 |
-| M3 | `T_cs/p_s/T_ws` 局部坐标迁移 | 改 `T_ws` 时 KF/点/轨迹一致移动 |
-| M4 | 锚定普通帧和地图点 | 删除全量轨迹插值与全量点搬运 |
-| M5 | Atlas 约束图 | 跨子地图连接不跳变，融合可暂不实现 |
-| M6 | COW 校正场、异步默认恢复 | TSAN/压力测试通过，FPS 提升且精度不退化 |
+| M0 ✅ | 正常跟踪/重定位统一位姿验收，PGO 防爆 | 恶性边/大跳拒绝后状态不变，连续帧 >10m=0 |
+| M1 ✅ | Optimizer Result + Map/Submap revision | stale Local BA/PGO 可重复拒绝 |
+| M2 ✅ | BackendCommitter + 只读 TrackingSnapshot | 一帧只观察一个 revision，无部分提交 |
+| M3 ✅ | `T_cs/p_s/T_ws` 局部坐标迁移 | 改 `T_ws` 时 KF/点/轨迹一致移动 |
+| M4 ✅ | 锚定普通帧和地图点 | 删除全量轨迹插值与全量点搬运 |
+| M5 ✅ | Atlas 约束图 | 跨子地图连接不跳变，融合可暂不实现 |
+| M6 ✅ | COW 校正场、异步默认恢复 | TSAN/压力测试通过，FPS 提升且精度不退化 |
+
+> 2026-08-06 落地记录（§3.20）：M0 统一验收 + 同步 BA 跳过活动参考写回；
+> M1/M2 快照/Result/Committer/帧级快照；M3 子地图局部坐标（对齐只改
+> `T_ws`）；M4 锚定轨迹（删除全量插值，修正"回环校正世界系共轭"与
+> "KF 帧锚定陈旧 ref"两个回归）；M5 Atlas 约束图（TrackingBridge +
+> Relocalization 事务式约束，失败回滚）；M6 Committer 追加 rebase 协议
+> （几何版本唯一硬判据）+ 异步默认恢复。
+>
+> M4/M6 的 `sampled-GBA`（每 3 个 KF 采样）与锚定轨迹不兼容（三周期
+> 锯齿，§3.18 预测），已默认关闭（`global_ba_iterations: 0`）；全量
+> GBA 留给后续异步后端（分钟级任务）恢复。回环验证召回率（DBoW 候选
+> 的地图点被 cull 后 3D-2D 对应不足）是 ATE ≤30m 目标的剩余瓶颈。
 
 KITTI 00 第一阶段门槛：时间戳一一关联覆盖率 ≥99%、连续有效帧 >10m 跳变为 0、
 路径长度比 0.9~1.2、子地图重建 ≤3、SE3 ATE ≤30m。RPE 只统计真正连续的有效帧，

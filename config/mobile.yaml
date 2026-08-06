@@ -50,7 +50,7 @@ Optimizer:
   local_window_size: 6
   local_ba_iterations: 3
   enable_local_ba: true
-  global_ba_iterations: 20
+  global_ba_iterations: 0   # M4 暂关：sampled-GBA 与锚定轨迹不兼容
 
 LoopClosure:
   enable_loop_closure: true

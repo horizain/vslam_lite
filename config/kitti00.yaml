@@ -58,7 +58,7 @@ Optimizer:
   local_window_size: 12    # 共视窗口略增大, 提升局部 BA 的约束数量
   local_ba_iterations: 10
   enable_local_ba: true
-  global_ba_iterations: 20  # 全局 BA 迭代（位姿采样控制规模）  # 回环后全局 BA 迭代（位姿顶点采样后单次开销可控）
+  global_ba_iterations: 0   # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
 
 # ---- 回环检测 (run_vo 强制关闭, 供 run_slam 使用) ----
 LoopClosure:
@@ -77,7 +77,7 @@ LoopClosure:
 # ---- 运行时 ----
 Runtime:
   opencv_threads: 0
-  async_backend: false  # 异步后端（实验性，默认关）：见 DEVELOPMENT_LOG §3.15
+  async_backend: true   # M6：Committer 追加 rebase 协议后默认开启
 
 # ---- 可视化 ----
 Viewer:

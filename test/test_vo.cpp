@@ -21,6 +21,7 @@
 #include "vslam/atlas.h"
 #include "vslam/mappoint.h"
 #include "vslam/optimizer.h"
+#include "vslam/backend_committer.h"
 #include "vslam/loop_closure.h"
 
 #include <opencv2/imgproc.hpp>
@@ -34,6 +35,8 @@
 #include <numeric>
 #include <algorithm>
 #include <filesystem>
+#include <set>
+#include <map>
 
 // 简单的测试辅助宏
 #define TEST(name) \
@@ -206,7 +209,7 @@ void test_vo_initialization() {
 // ============================================================
 // 位姿语义回归测试
 // 用已知真实位姿生成点对，走与 vo.cpp 初始化完全相同的序列
-// （findEssentialMat → recoverPose → pose_cw = recoverPose 输出），
+// （findEssentialMat → recoverPose → pose_cs = recoverPose 输出），
 // 验证 T_cw 方向正确：旋转精确、平移方向一致、三角化深度为正。
 // 修复前的取逆方向会让三角化 0% 深度正确。
 // ============================================================
@@ -265,7 +268,7 @@ void test_pose_semantics() {
             auto mp = vslam::MapPoint::create((unsigned long)i,
                 vslam::Vec2(p1[i].x, p1[i].y), vslam::Vec2(p2[i].x, p2[i].y),
                 vslam::SE3(), T_cw2, K);
-            if ((T_cw2 * mp->pos_w).z() > 0) depth_ok++;
+            if ((T_cw2 * mp->pos_s).z() > 0) depth_ok++;
         }
         assert(depth_ok > (int)pts_w.size() * 0.9);
         std::cout << " (rot_err=" << r_err << " trans_cos=" << cos_t
@@ -431,7 +434,7 @@ void test_local_ba() {
         std::vector<vslam::Frame::Ptr> kfs;
         for (int i = 0; i < 3; i++) {
             auto kf = std::make_shared<vslam::Frame>((unsigned long)i, i * 0.1);
-            kf->pose_cw = Twc[i].inverse();
+            kf->pose_cs = Twc[i].inverse();
             kfs.push_back(kf);
             map->insertKeyFrame(kf);
         }
@@ -440,25 +443,53 @@ void test_local_ba() {
         std::uniform_real_distribution<double> dx(-2, 2), dy(-2, 2), dz(4, 8);
         for (int i = 0; i < 20; i++) {
             auto mp = std::make_shared<vslam::MapPoint>((unsigned long)i);
-            mp->pos_w = vslam::Vec3(dx(gen), dy(gen), dz(gen));
+            mp->pos_s = vslam::Vec3(dx(gen), dy(gen), dz(gen));
             mp->observed_count = 3;
             map->insertMapPoint(mp);
             for (int f = 0; f < 3; f++) {
-                vslam::Vec2 px = cam->world2pixel(mp->pos_w, kfs[f]->pose_cw);
+                vslam::Vec2 px = cam->world2pixel(mp->pos_s, kfs[f]->pose_cs);
                 cv::KeyPoint kp;
                 kp.pt = cv::Point2f((float)px.x(), (float)px.y());
                 kfs[f]->keypoints.push_back(kp);
                 kfs[f]->map_points.push_back(mp);
             }
         }
-        auto disp = [&](int a, int b) {
-            return (kfs[b]->pose_cw.inverse().t - kfs[a]->pose_cw.inverse().t).norm();
-        };
-        vslam::Optimizer::localBundleAdjustment(cam, map, kfs, 10);
+
+        // M1：构建只读快照 → 纯计算 → 结果携带候选增量
+        vslam::OptimizationSnapshot snap;
+        std::set<unsigned long> seen_mp;
+        for (auto& kf : kfs) {
+            vslam::KeyframeState ks;
+            ks.id = kf->id;
+            ks.pose_cs = kf->pose_cs;
+            for (size_t i = 0; i < kf->keypoints.size(); i++) {
+                ks.keypoints.push_back(kf->keypoints[i]);
+                ks.map_points.push_back(kf->map_points[i] ? kf->map_points[i]->id : 0);
+                if (kf->map_points[i]) seen_mp.insert(kf->map_points[i]->id);
+            }
+            snap.keyframes.push_back(std::move(ks));
+        }
+        for (auto id : seen_mp) {
+            auto mp = map->getMapPoint(id);
+            if (mp) snap.landmarks.push_back({id, mp->pos_s, mp->observed_count});
+        }
+        snap.fixed_kf_ids = {0, 1};  // 帧 0/1 固定（基线锚定）
+
+        auto result = vslam::Optimizer::solveLocalBA(cam, snap, 10);
+        assert(result.valid);
         // 点固定（motion-only）+ 帧 0/1 固定：尺度必须保持 1m/帧
+        std::map<unsigned long, vslam::SE3> opt_pose;
+        for (auto& u : result.poses) opt_pose[u.id] = u.pose_cs;
+        auto disp = [&](int a, int b) {
+            return (opt_pose[(unsigned long)b].inverse().t
+                    - opt_pose[(unsigned long)a].inverse().t).norm();
+        };
         assert(std::abs(disp(0, 1) - 1.0) < 0.2);
         assert(std::abs(disp(1, 2) - 1.0) < 0.2);
         std::cout << " (disp01=" << disp(0, 1) << " disp12=" << disp(1, 2) << ")";
+        // 快照 API 不修改任何实时对象
+        for (auto& kf : kfs)
+            assert((kf->pose_cs.matrix() - Twc[kf->id].inverse().matrix()).norm() < 1e-12);
     } TEST_PASS();
 }
 
@@ -563,6 +594,336 @@ void test_rotation_ambiguity() {
             max_drift = std::max(max_drift, (wpos(i) - ref_pos).norm());
         std::cout << " (远点 yaw 旋转 45 帧最大漂移 " << max_drift
                   << "m —— 单目歧义本质，记录现象不作断言)";
+    } TEST_PASS();
+}
+
+// ============================================================
+// M0 统一位姿验收测试：正常跟踪与重定位共用几何 + 连续性门限。
+// 回归 §3.19：重定位曾只查内点/RMSE，把跟踪刚拒绝的 258m 坏解重新接受。
+// ============================================================
+void test_pose_acceptance() {
+    using vslam::SE3;
+    using vslam::Vec3;
+    using PoseQuality = vslam::VisualOdometry::PoseQuality;
+    using vslam::VisualOdometry;
+    constexpr int    kMinInliers = 15;
+    constexpr double kMinRatio   = 0.3;
+    constexpr double kMaxRmse    = 2.5;
+    constexpr double kRelocRot   = 60.0 * M_PI / 180.0;
+
+    TEST("正常跟踪：2m 位移通过、4m 位移被拒绝（3m 门限）") {
+        const SE3 baseline_twc;  // 相机在原点
+        PoseQuality q;
+        // 相机前进 2m（T_cw.t = -2）
+        const SE3 ok_pose(Eigen::Quaterniond::Identity(), Vec3(-2, 0, 0));
+        assert(VisualOdometry::acceptPoseCandidate(
+            ok_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
+            baseline_twc, 3.0, 0.35, q));
+        assert(q.geometric_ok && q.motion_ok);
+        assert(std::abs(q.translation - 2.0) < 1e-9);
+        // 相机前进 4m → 超 3m 门限
+        const SE3 bad_pose(Eigen::Quaterniond::Identity(), Vec3(-4, 0, 0));
+        assert(!VisualOdometry::acceptPoseCandidate(
+            bad_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
+            baseline_twc, 3.0, 0.35, q));
+        assert(q.geometric_ok && !q.motion_ok);
+        assert(std::abs(q.translation - 4.0) < 1e-9);
+    } TEST_PASS();
+
+    TEST("正常跟踪：0.2rad 旋转通过、0.5rad 被拒绝（0.35rad 门限）") {
+        const SE3 baseline_twc;
+        PoseQuality q;
+        const SE3 ok_pose(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.2, Vec3::UnitZ())), Vec3::Zero());
+        assert(VisualOdometry::acceptPoseCandidate(
+            ok_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
+            baseline_twc, 3.0, 0.35, q));
+        const SE3 bad_pose(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.5, Vec3::UnitZ())), Vec3::Zero());
+        assert(!VisualOdometry::acceptPoseCandidate(
+            bad_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
+            baseline_twc, 3.0, 0.35, q));
+        assert(q.geometric_ok && !q.motion_ok);
+    } TEST_PASS();
+
+    TEST("重定位：远离外推基线的 258m 假位姿被拒绝（§3.19 回归）") {
+        // 丢失 4 帧、每步 2.5m → 外推基线 T_wc.t=(10,0,0)，expected=10m，
+        // 平移门限 = max(50, 3×10) = 50m。几何全优（30/40 内点、rmse 0.5）
+        // 但相机实际在 268m 处（距基线 258m）→ 必须拒绝。
+        const SE3 baseline_twc(Eigen::Quaterniond::Identity(), Vec3(10, 0, 0));
+        PoseQuality q;
+        const SE3 far_pose(Eigen::Quaterniond::Identity(), Vec3(-268, 0, 0));
+        assert(!VisualOdometry::acceptPoseCandidate(
+            far_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 50.0, kRelocRot, q));
+        assert(q.geometric_ok && !q.motion_ok);
+        assert(std::abs(q.translation - 258.0) < 1e-6);
+    } TEST_PASS();
+
+    TEST("重定位：贴近外推基线的好位姿通过") {
+        const SE3 baseline_twc(Eigen::Quaterniond::Identity(), Vec3(10, 0, 0));
+        PoseQuality q;
+        // 相机在 12m 处（距基线 2m）
+        const SE3 near_pose(Eigen::Quaterniond::Identity(), Vec3(-12, 0, 0));
+        assert(VisualOdometry::acceptPoseCandidate(
+            near_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 50.0, kRelocRot, q));
+        assert(q.geometric_ok && q.motion_ok);
+    } TEST_PASS();
+
+    TEST("重定位：长丢失后门限随外推位移放宽（20 帧×2.5m → 150m）") {
+        // expected = 50m → limit = max(50, 3×50) = 150m
+        const SE3 baseline_twc(Eigen::Quaterniond::Identity(), Vec3(50, 0, 0));
+        PoseQuality q;
+        // 相机在 130m（距基线 80m）→ 通过
+        const SE3 ok_pose(Eigen::Quaterniond::Identity(), Vec3(-130, 0, 0));
+        assert(VisualOdometry::acceptPoseCandidate(
+            ok_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 150.0, kRelocRot, q));
+        // 相机在 250m（距基线 200m）→ 拒绝
+        const SE3 bad_pose(Eigen::Quaterniond::Identity(), Vec3(-250, 0, 0));
+        assert(!VisualOdometry::acceptPoseCandidate(
+            bad_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 150.0, kRelocRot, q));
+    } TEST_PASS();
+
+    TEST("重定位：旋转超 60° 被拒绝、45° 通过") {
+        const SE3 baseline_twc;
+        PoseQuality q;
+        const SE3 ok_pose(
+            Eigen::Quaterniond(Eigen::AngleAxisd(45.0 * M_PI / 180.0, Vec3::UnitY())),
+            Vec3(0, 0, 0));
+        assert(VisualOdometry::acceptPoseCandidate(
+            ok_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 50.0, kRelocRot, q));
+        const SE3 bad_pose(
+            Eigen::Quaterniond(Eigen::AngleAxisd(90.0 * M_PI / 180.0, Vec3::UnitY())),
+            Vec3(0, 0, 0));
+        assert(!VisualOdometry::acceptPoseCandidate(
+            bad_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 50.0, kRelocRot, q));
+    } TEST_PASS();
+
+    TEST("几何不达标直接拒绝（重定位不得绕过内点/RMSE）") {
+        const SE3 baseline_twc(Eigen::Quaterniond::Identity(), Vec3(10, 0, 0));
+        PoseQuality q;
+        // rmse 5.0 > 2.5：即使运动贴近基线也拒绝
+        const SE3 near_pose(Eigen::Quaterniond::Identity(), Vec3(-12, 0, 0));
+        assert(!VisualOdometry::acceptPoseCandidate(
+            near_pose, 30, 40, 5.0, 20, 0.4, kMaxRmse,
+            baseline_twc, 50.0, kRelocRot, q));
+        // 内点 5 < 20
+        assert(!VisualOdometry::acceptPoseCandidate(
+            near_pose, 5, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 50.0, kRelocRot, q));
+        // 比例 0.1 < 0.4
+        assert(!VisualOdometry::acceptPoseCandidate(
+            near_pose, 4, 40, 0.5, 20, 0.4, kMaxRmse,
+            baseline_twc, 50.0, kRelocRot, q));
+        assert(!q.geometric_ok);
+    } TEST_PASS();
+
+    TEST("无运动基线时几何达标即通过（初始化首帧/单目）") {
+        const std::optional<SE3> no_baseline;
+        PoseQuality q;
+        const SE3 pose(Eigen::Quaterniond::Identity(), Vec3(-300, 0, 0));
+        assert(VisualOdometry::acceptPoseCandidate(
+            pose, 30, 40, 0.5, 20, 0.4, kMaxRmse, no_baseline, 0.0, 0.0, q));
+        assert(q.geometric_ok && q.motion_ok);
+        assert(!VisualOdometry::acceptPoseCandidate(
+            pose, 3, 40, 0.5, 20, 0.4, kMaxRmse, no_baseline, 0.0, 0.0, q));
+    } TEST_PASS();
+}
+
+// ============================================================
+// M1 版本模型测试：Map topology/geometry revision 语义
+// ============================================================
+void test_map_revision() {
+    TEST("Map revision：集合变更 bump topology、坐标变更 bump geometry") {
+        auto map = std::make_shared<vslam::Map>();
+        assert(map->topologyRevision() == 0);
+        assert(map->geometryRevision() == 0);
+
+        auto kf = std::make_shared<vslam::Frame>(0, 0.0);
+        map->insertKeyFrame(kf);
+        assert(map->topologyRevision() == 1);
+        assert(map->geometryRevision() == 0);
+
+        auto mp = std::make_shared<vslam::MapPoint>(0);
+        map->insertMapPoint(mp);
+        assert(map->topologyRevision() == 2);
+
+        // 坐标变更（仅 BackendCommitter 发布，测试直接调用）
+        map->bumpGeometry();
+        assert(map->geometryRevision() == 1);
+        assert(map->topologyRevision() == 2);
+
+        // 剔除触发 topology
+        auto mp2 = std::make_shared<vslam::MapPoint>(1);
+        map->insertMapPoint(mp2);
+        map->cullMapPoints(2);  // observed_count=0 < 2 → 全部剔除
+        assert(map->topologyRevision() == 4);
+
+        // 快照版本绑定 + stale 检测（M2 提交器的前置）
+        vslam::OptimizationSnapshot snap;
+        snap.topology_revision = map->topologyRevision();
+        snap.geometry_revision = map->geometryRevision();
+        assert(snap.topology_revision == map->topologyRevision());
+        // 快照后地图又插入 KF → 快照过期（stale）
+        map->insertKeyFrame(std::make_shared<vslam::Frame>(1, 0.1));
+        assert(snap.topology_revision != map->topologyRevision());
+    } TEST_PASS();
+}
+
+// ============================================================
+// M2 BackendCommitter 测试：stale/质量验收/原子提交/skip 保护
+// ============================================================
+void test_backend_committer() {
+    using vslam::BackendCommitter;
+    using vslam::CommitStatus;
+
+    TEST("M3 子地图坐标组合不变量：T_cw = T_cs·T_ws⁻¹，p_w = T_ws·p_s") {
+        const vslam::SE3 T_ws(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.3, vslam::Vec3::UnitY())),
+            vslam::Vec3(10, -2, 5));
+        const vslam::SE3 T_cs(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.1, vslam::Vec3::UnitZ())),
+            vslam::Vec3(0.5, 0.2, -1.0));
+        const vslam::Vec3 p_s(2, 3, 8);
+
+        // p_c = T_cs·p_s；p_w = T_ws·p_s；T_cw = T_cs·T_ws⁻¹ → p_c = T_cw·p_w
+        const vslam::Vec3 p_w = T_ws * p_s;
+        const vslam::Vec3 p_c_direct = T_cs * p_s;
+        const vslam::SE3 T_cw = T_cs * T_ws.inverse();
+        assert((T_cw * p_w - p_c_direct).norm() < 1e-9);
+
+        // 相机光心世界位置：C_w = T_ws · (T_cs⁻¹ 平移) = T_cw.camera_position()
+        const vslam::Vec3 c_w = T_ws * T_cs.inverse().t;
+        assert((T_cw.camera_position() - c_w).norm() < 1e-9);
+
+        // 同一局部运动在世界/局部系下增量一致（连续性验收跨系不变）
+        const vslam::SE3 T_cs2(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.12, vslam::Vec3::UnitZ())),
+            vslam::Vec3(0.6, 0.2, -1.2));
+        const vslam::SE3 T_cw2 = T_cs2 * T_ws.inverse();
+        const double d_local = (T_cs2.inverse().t - T_cs.inverse().t).norm();
+        const double d_world = (T_cw2.inverse().t - T_cw.inverse().t).norm();
+        assert(std::abs(d_local - d_world) < 1e-9);
+    } TEST_PASS();
+
+    TEST("M5 Atlas 约束图：Relocalization 边对齐子地图锚点") {
+        // 子地图 A 固定（T_ws=(10,0,0)），B 锚点差 30m（T_ws=(40,0,0)）。
+        // 相机在两子地图局部系均为原点（T_cs_a=T_cs_b=I）→ 一致性要求
+        // T_ws_a == T_ws_b；约束 T_rel = T_cs_a⁻¹ ∘ T_cs_b = I。
+        vslam::OptimizationSnapshot snap;
+        vslam::KeyframeState ka;
+        ka.id = 0;
+        ka.pose_cs = vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(10, 0, 0));
+        vslam::KeyframeState kb;
+        kb.id = 1;
+        kb.pose_cs = vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(40, 0, 0));
+        snap.keyframes = {ka, kb};
+        // 旧 TrackingBridge（锚点差 30m，低权重）+ 新 Relocalization（0m，高权重）
+        snap.constraints.push_back({
+            0, 1, vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(30, 0, 0)),
+            0.3, true});
+        snap.constraints.push_back({
+            0, 1, vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3::Zero()),
+            1.0, true});  // T_ws_b = T_ws_a · T_rel
+
+        auto result = vslam::Optimizer::solvePoseGraph(snap);
+        assert(result.valid);
+        vslam::SE3 T_ws_a, T_ws_b;
+        for (const auto& u : result.poses) {
+            if (u.id == 0) T_ws_a = u.pose_cs;
+            if (u.id == 1) T_ws_b = u.pose_cs;
+        }
+        // A 固定不动；B 被高权重 reloc 约束拉回 A（Huber 下桥边被降权，
+        // 30m 锚点差收敛到几米内——跨子地图连接不跳变）
+        assert((T_ws_a.t - vslam::Vec3(10, 0, 0)).norm() < 1e-9);
+        assert(std::abs(T_ws_b.t.x() - 10.0) < 8.0);
+        std::cout << " (B.x=" << T_ws_b.t.x() << ")";
+    } TEST_PASS();
+
+    TEST("BackendCommitter：正常提交 COMMITTED + geometry++ + 写回生效") {
+        auto map = std::make_shared<vslam::Map>();
+        auto kf = std::make_shared<vslam::Frame>(0, 0.0);
+        map->insertKeyFrame(kf);
+        auto mp = std::make_shared<vslam::MapPoint>(0);
+        map->insertMapPoint(mp);
+
+        vslam::OptimizationResult r;
+        r.base_topology_revision = map->topologyRevision();
+        r.base_geometry_revision = map->geometryRevision();
+        r.valid = true;
+        r.metrics.max_correction = 0.5;
+        const vslam::SE3 new_pose(Eigen::Quaterniond::Identity(), vslam::Vec3(1, 2, 3));
+        r.poses.push_back({0, new_pose});
+        r.points.push_back({0, vslam::Vec3(4, 5, 6)});
+
+        const uint64_t geo_before = map->geometryRevision();
+        assert(BackendCommitter::commit(map, r) == CommitStatus::COMMITTED);
+        assert(map->geometryRevision() == geo_before + 1);
+        assert((map->getKeyFrame(0)->pose_cs.matrix() - new_pose.matrix()).norm() < 1e-12);
+        assert((map->getMapPoint(0)->pos_s - vslam::Vec3(4, 5, 6)).norm() < 1e-12);
+    } TEST_PASS();
+
+    TEST("BackendCommitter：几何过期 STALE 且地图逐项不变；拓扑过期允许追加 rebase") {
+        auto map = std::make_shared<vslam::Map>();
+        auto kf = std::make_shared<vslam::Frame>(0, 0.0);
+        map->insertKeyFrame(kf);
+        const auto pose_before = kf->pose_cs;
+
+        vslam::OptimizationResult r;
+        r.base_topology_revision = map->topologyRevision() - 1;  // 拓扑过期
+        r.base_geometry_revision = map->geometryRevision();
+        r.valid = true;
+        r.poses.push_back({0, vslam::SE3(Eigen::Quaterniond::Identity(),
+                                         vslam::Vec3(9, 9, 9))});
+        // M6：几何未变 → 追加 rebase 允许提交（异步后端核心）
+        assert(BackendCommitter::commit(map, r) == CommitStatus::COMMITTED);
+        // 几何过期 → 整笔丢弃，地图逐项不变
+        r.base_topology_revision = map->topologyRevision();
+        r.base_geometry_revision = map->geometryRevision() - 1;
+        const auto pose_after = kf->pose_cs;
+        assert(BackendCommitter::commit(map, r) == CommitStatus::STALE);
+        assert((kf->pose_cs.matrix() - pose_after.matrix()).norm() < 1e-12);
+        // isStale 纯函数
+        assert(BackendCommitter::isStale(r, map));
+        r.base_geometry_revision = map->geometryRevision();
+        assert(!BackendCommitter::isStale(r, map));
+    } TEST_PASS();
+
+    TEST("BackendCommitter：无效结果/超大校正被拒绝 INVALID") {
+        auto map = std::make_shared<vslam::Map>();
+        vslam::OptimizationResult r;
+        r.base_topology_revision = map->topologyRevision();
+        r.base_geometry_revision = map->geometryRevision();
+        r.valid = false;
+        assert(BackendCommitter::commit(map, r) == CommitStatus::INVALID);
+        r.valid = true;
+        r.metrics.max_correction = 50.0;  // > 10m 上限
+        assert(BackendCommitter::commit(map, r) == CommitStatus::INVALID);
+        assert(!BackendCommitter::passesQuality(r, 10.0));
+    } TEST_PASS();
+
+    TEST("BackendCommitter：skip_pose 保护活动参考帧") {
+        auto map = std::make_shared<vslam::Map>();
+        map->insertKeyFrame(std::make_shared<vslam::Frame>(0, 0.0));
+        map->insertKeyFrame(std::make_shared<vslam::Frame>(1, 0.1));
+        const auto pose0 = map->getKeyFrame(0)->pose_cs;
+
+        vslam::OptimizationResult r;
+        r.base_topology_revision = map->topologyRevision();
+        r.base_geometry_revision = map->geometryRevision();
+        r.valid = true;
+        r.poses.push_back({0, vslam::SE3(Eigen::Quaterniond::Identity(),
+                                         vslam::Vec3(9, 9, 9))});
+        r.poses.push_back({1, vslam::SE3(Eigen::Quaterniond::Identity(),
+                                         vslam::Vec3(3, 3, 3))});
+        assert(BackendCommitter::commit(map, r, {0}) == CommitStatus::COMMITTED);
+        assert((map->getKeyFrame(0)->pose_cs.matrix() - pose0.matrix()).norm() < 1e-12);
+        assert((map->getKeyFrame(1)->pose_cs.t - vslam::Vec3(3, 3, 3)).norm() < 1e-12);
     } TEST_PASS();
 }
 
@@ -767,7 +1128,7 @@ void test_mini_atlas() {
         vslam::SE3 anchor(Eigen::Quaterniond::Identity(), vslam::Vec3(10, 2, -3));
         auto& second = atlas.createSubmap(anchor);
         assert(second.id == 1);
-        assert(second.origin_Twc.t.isApprox(anchor.t));
+        assert(second.T_ws.t.isApprox(anchor.t));
         assert(first.frozen);
         assert(atlas.activeMap() == second.map);
         assert(atlas.submapCount() == 2);
@@ -904,11 +1265,11 @@ void test_pose_graph() {
             est.push_back(cur);
         }
 
-        // 建图：关键帧 pose_cw = T_wc⁻¹
+        // 建图：关键帧 pose_cs = T_wc⁻¹
         auto map = std::make_shared<vslam::Map>();
         for (int i = 0; i < N; i++) {
             auto kf = std::make_shared<vslam::Frame>((unsigned long)i, (double)i);
-            kf->pose_cw = est[i].inverse();
+            kf->pose_cs = est[i].inverse();
             map->insertKeyFrame(kf);
         }
 
@@ -916,24 +1277,38 @@ void test_pose_graph() {
         double err_before = (est[N - 1].t - gt[N - 1].t).norm();
         assert(err_before > 1.0);
 
-        // 冻结每个 KF 插入时得到的里程计相对测量。
-        std::vector<vslam::LoopEdge> odometry_edges;
-        for (int i = 1; i < N; i++) {
-            odometry_edges.push_back({
-                (unsigned long)(i - 1), (unsigned long)i,
-                est[i - 1].inverse() * est[i], 1.0});
+        // M1：构建只读快照（位姿 + 约束），纯计算
+        vslam::OptimizationSnapshot snap;
+        snap.topology_revision = map->topologyRevision();
+        snap.geometry_revision = map->geometryRevision();
+        for (int i = 0; i < N; i++) {
+            vslam::KeyframeState ks;
+            ks.id = (unsigned long)i;
+            ks.pose_cs = map->getKeyFrame((unsigned long)i)->pose_cs;
+            snap.keyframes.push_back(std::move(ks));
         }
-
+        // 冻结每个 KF 插入时得到的里程计相对测量。
+        for (int i = 1; i < N; i++) {
+            snap.constraints.push_back({
+                (unsigned long)(i - 1), (unsigned long)i,
+                est[i - 1].inverse() * est[i], 1.0, false});
+        }
         // 回环边：末帧 → 首帧（已知真实回环约束，高置信）
-        vslam::LoopEdge le;
-        le.a = 0;
-        le.b = (unsigned long)(N - 1);
-        le.T_rel = gt[0].inverse() * gt[N - 1];  // X_0⁻¹·X_{N-1} 的期望值
-        le.weight = 10.0;
-        assert(vslam::Optimizer::poseGraphOptimization(map, odometry_edges, {le}));
+        snap.constraints.push_back({
+            0, (unsigned long)(N - 1),
+            gt[0].inverse() * gt[N - 1], 10.0, true});
 
-        // 优化后末帧误差应显著下降
-        vslam::SE3 Twc_after = map->getKeyFrame((unsigned long)(N - 1))->pose_cw.inverse();
+        auto result = vslam::Optimizer::solvePoseGraph(snap);
+        assert(result.valid);
+
+        // 应用候选增量后，末帧误差应显著下降
+        vslam::SE3 Twc_after;
+        for (auto& u : result.poses) {
+            if (u.id == (unsigned long)(N - 1)) {
+                Twc_after = u.pose_cs.inverse();
+                break;
+            }
+        }
         double err_after = (Twc_after.t - gt[N - 1].t).norm();
         std::cout << " (drift_before=" << err_before << "m after=" << err_after << "m)";
         assert(err_after < err_before * 0.2);
@@ -943,38 +1318,40 @@ void test_pose_graph() {
     TEST("位姿图拒绝百万米错误回环且不修改地图") {
         constexpr int N = 10;
         auto map = std::make_shared<vslam::Map>();
-        std::vector<vslam::LoopEdge> odometry_edges;
+        vslam::OptimizationSnapshot snap;
         for (int i = 0; i < N; i++) {
             auto kf = std::make_shared<vslam::Frame>((unsigned long)i, (double)i);
             const vslam::SE3 Twc(Eigen::Quaterniond::Identity(), vslam::Vec3(i, 0, 0));
-            kf->pose_cw = Twc.inverse();
+            kf->pose_cs = Twc.inverse();
             map->insertKeyFrame(kf);
+            vslam::KeyframeState ks;
+            ks.id = (unsigned long)i;
+            ks.pose_cs = kf->pose_cs;
+            snap.keyframes.push_back(std::move(ks));
             if (i > 0) {
-                odometry_edges.push_back({
+                snap.constraints.push_back({
                     (unsigned long)(i - 1), (unsigned long)i,
                     vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(1, 0, 0)),
-                    1.0});
+                    1.0, false});
             }
         }
+        snap.constraints.push_back({
+            0, (unsigned long)(N - 1),
+            vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(1e6, 0, 0)),
+            10.0, true});
 
-        vslam::LoopEdge bad_loop;
-        bad_loop.a = 0;
-        bad_loop.b = N - 1;
-        bad_loop.T_rel = vslam::SE3(
-            Eigen::Quaterniond::Identity(), vslam::Vec3(1e6, 0, 0));
-        bad_loop.weight = 10.0;
-
-        assert(!vslam::Optimizer::poseGraphOptimization(
-            map, odometry_edges, {bad_loop}));
+        auto result = vslam::Optimizer::solvePoseGraph(snap);
+        assert(!result.valid);   // 恶性边被防护拒绝，无候选增量
+        assert(result.poses.empty());
         for (int i = 0; i < N; i++) {
-            const auto Twc = map->getKeyFrame((unsigned long)i)->pose_cw.inverse();
+            const auto Twc = map->getKeyFrame((unsigned long)i)->pose_cs.inverse();
             assert((Twc.t - vslam::Vec3(i, 0, 0)).norm() < 1e-12);
         }
     } TEST_PASS();
 #else
     TEST("位姿图优化：回环约束校正累积漂移") {
-        auto map = std::make_shared<vslam::Map>();
-        assert(!vslam::Optimizer::poseGraphOptimization(map, {}, {}));
+        vslam::OptimizationSnapshot snap;
+        assert(!vslam::Optimizer::solvePoseGraph(snap).valid);
         std::cout << "SKIPPED (built without g2o)";
     } TEST_PASS();
 #endif
@@ -1056,7 +1433,7 @@ void test_loop_closure() {
             poses.push_back(vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(0, (10 - i) * step, 0)));
         // 末帧故意偏离原点（非单位位姿，T_cw ≠ T_wc）：若 verifyLoop 把
         // solvePnP 输出的 T_cw 误当 T_wc 而漏掉求逆，回环边测量会反号，
-        // 下面的期望断言（cand->pose_cw * T_wc_curr）必然失败——覆盖 6c311d7
+        // 下面的期望断言（cand->pose_cs * T_wc_curr）必然失败——覆盖 6c311d7
         // 回归（当时末帧恰为单位位姿，正反求逆结果相同，测试无法区分）。
         // 偏移取 0.15m 级：足够区分（反号误差 2×||t||≈0.36m >> 0.1m 容差），
         // 又尽量保持合成圆点特征的 ORB 匹配内点比例（0.3m 时跌到 0.67）。
@@ -1076,7 +1453,7 @@ void test_loop_closure() {
             auto kf = std::make_shared<vslam::Frame>(kf_id, (double)kf_id);
             kf->image = img;
             kf->image_gray = img;
-            kf->pose_cw = T_wc.inverse();
+            kf->pose_cs = T_wc.inverse();
             matcher.extract(kf);
 
             // 关键点 → 最近圆点 → 世界坐标（3px 内才关联）
@@ -1092,7 +1469,7 @@ void test_loop_closure() {
                 }
                 if (best_i >= 0) {
                     auto mp = std::make_shared<vslam::MapPoint>((unsigned long)j);
-                    mp->pos_w = pw[best_i];
+                    mp->pos_s = pw[best_i];
                     kf->map_points[j] = mp;
                 }
             }
@@ -1112,10 +1489,10 @@ void test_loop_closure() {
 
         // 几何验证：PnP 直接输出 loop→curr 的位姿图 SE3 测量。
         // 它应与无漂移合成真值一致，不依赖 last_kf 中保存的 VO 漂移位姿。
-        last_kf->pose_cw.t += vslam::Vec3(3.0, -2.0, 1.0);
+        last_kf->pose_cs.t += vslam::Vec3(3.0, -2.0, 1.0);
         vslam::SE3 T_loop_curr;
         assert(lc.verifyLoop(last_kf, cands.front(), T_loop_curr));
-        const vslam::SE3 expected = cands.front()->pose_cw * poses.back();
+        const vslam::SE3 expected = cands.front()->pose_cs * poses.back();
         // isApprox 是相对精度（|a-b|² ≤ prec²·min(|a|²,|b|²)），期望平移为零时
         // 分母恒为 0，任何非零误差都会失败，故用绝对范数判据。
         assert((T_loop_curr.t - expected.t).norm() < 0.1);
@@ -1145,6 +1522,15 @@ int main() {
 
     std::cout << "\n[Camera Projection]\n";
     test_camera_projection();
+
+    std::cout << "\n[Pose Acceptance (M0)]\n";
+    test_pose_acceptance();
+
+    std::cout << "\n[Map Revision (M1)]\n";
+    test_map_revision();
+
+    std::cout << "\n[BackendCommitter (M2)]\n";
+    test_backend_committer();
 
     std::cout << "\n[Stereo Camera]\n";
     test_stereo_camera();

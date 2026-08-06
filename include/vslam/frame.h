@@ -11,13 +11,17 @@ struct MapPoint;
 struct Feature;
 
 /// 帧：VO/SLAM 的基本处理单元
+/// M3：位姿存"子地图局部坐标"（pose_cs，T_cs：子地图→相机）。
+/// 全局位姿只能由 T_ws（Submap::T_ws）派生：T_cw = T_cs · T_ws⁻¹。
+/// 除轨迹输出/跨子地图验收外，跟踪、BA、回环全部在局部系内进行。
 struct Frame {
     using Ptr = std::shared_ptr<Frame>;
 
     unsigned long id        = 0;   // 帧序号
     double timestamp        = 0.0; // 时间戳（秒）
-    SE3   pose_cw;                  // 世界到相机的变换（T_cw）：p_c = pose_cw * p_w
-                                   // 注意：PnP/三角化/BA 全部统一使用此 T_cw 语义
+    SE3   pose_cs;                  // 子地图系到相机的变换（T_cs）：p_c = pose_cs * p_s
+                                   // M3 前为 pose_cs（世界系）；子地图内部运算不变，
+                                   // 只在世界边界组合 Submap::T_ws。
     cv::Mat image;                  // 主目（左目）原始图像（可选，可仅保留灰度图）
     cv::Mat image_gray;             // 主目灰度图（所有特征操作都用这个）
     cv::Mat image_right;            // 右目原始图像（双目；单目为空）

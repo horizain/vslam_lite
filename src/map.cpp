@@ -8,6 +8,7 @@ void Map::insertMapPoint(MapPoint::Ptr mp) {
     if (map_points_.find(mp->id) == map_points_.end()) {
         map_points_[mp->id] = mp;
         mp_count_.fetch_add(1, std::memory_order_relaxed);
+        bumpTopology();
     }
 }
 
@@ -40,6 +41,7 @@ void Map::cullMapPoints(int min_observations) {
             for (auto& mp : kf->map_points)
                 if (mp && removed.count(mp->id)) mp.reset();
         }
+        bumpTopology();
     }
 }
 
@@ -48,6 +50,7 @@ void Map::insertKeyFrame(Frame::Ptr kf) {
         kf->is_keyframe = true;
         keyframes_[kf->id] = kf;
         kf_count_.fetch_add(1, std::memory_order_relaxed);
+        bumpTopology();
     }
 }
 
@@ -77,6 +80,8 @@ void Map::clear() {
     keyframes_.clear();
     mp_count_.store(0, std::memory_order_relaxed);
     kf_count_.store(0, std::memory_order_relaxed);
+    bumpTopology();
+    bumpGeometry();
 }
 
 } // namespace vslam

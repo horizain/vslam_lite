@@ -4,7 +4,10 @@
 #include "vslam/camera.h"
 #include "vslam/map.h"
 
+#include <opencv2/features2d.hpp>
 #include <optional>
+#include <unordered_set>
+#include <vector>
 
 namespace vslam {
 
@@ -16,45 +19,102 @@ struct LoopEdge {
     double weight = 1.0;      // 信息权重（共视多 → 置信高）
 };
 
-/// 图优化后端（基于 g2o）
-/// Phase 1: 提供局部 Bundle Adjustment
-/// Phase 2: 增加 Pose Graph Optimization 和 Global BA
+// ============================================================
+// M1：Optimizer 只读快照/Result 契约（§14.1/§14.2）
+//
+// 强制不变量：Optimizer 永远不接收可写的实时 Map::Ptr，只在不可变
+// OptimizationSnapshot 上做纯计算，返回 OptimizationResult（候选增量 +
+// 质量指标）。调用方（唯一 BackendCommitter，M2）负责 stale 检查与
+// 原子提交；优化失败/结果过期/验收失败时实时状态逐项保持不变。
+// ============================================================
+
+/// 快照关键帧：位姿 + 观测（keypoints[i] 对应 map_points[i] 的地图点 id）
+struct KeyframeState {
+    unsigned long id = 0;
+    SE3 pose_cs;                          // T_cw（与全局项目语义一致）
+    std::vector<cv::KeyPoint> keypoints;  // BA 重投影观测（像素）
+    std::vector<unsigned long> map_points;  // 每特征点对应的地图点 id（无点 = 0）
+    std::vector<Vec3> pts_c;              // 双目/RGB-D 相机系观测（深度加权用）
+};
+
+/// 快照地图点：坐标 + 观测数
+struct LandmarkState {
+    unsigned long id = 0;
+    Vec3 pos_s;
+    int observations = 0;
+};
+
+/// 位姿图约束（里程计边 / 回环边统一表达）
+struct Constraint {
+    unsigned long a = 0;
+    unsigned long b = 0;
+    SE3 T_rel;               // X_b = X_a * T_rel
+    double weight = 1.0;
+    bool is_loop = false;    // 回环边：Huber 核 + 残差预检（M0 防爆）
+};
+
+/// 优化输入：不可变快照（绑定子地图与版本）
+struct OptimizationSnapshot {
+    unsigned long submap_id = 0;
+    uint64_t topology_revision = 0;
+    uint64_t geometry_revision = 0;
+    std::vector<KeyframeState> keyframes;
+    std::vector<LandmarkState> landmarks;
+    std::vector<Constraint> constraints;
+    std::vector<unsigned long> fixed_kf_ids;  // BA 锚定（窗口最早 2 帧等）
+};
+
+struct PoseUpdate {
+    unsigned long id = 0;
+    SE3 pose_cs;
+};
+struct PointUpdate {
+    unsigned long id = 0;
+    Vec3 pos_s;
+};
+
+/// 优化质量指标（供提交器验收）
+struct OptimizationMetrics {
+    int iterations = 0;
+    double initial_chi2 = 0.0;
+    double final_chi2 = 0.0;
+    double max_correction = 0.0;   // 最大位姿校正（m）
+    double max_neighbor_step = 0.0;  // 相邻关键帧最大步长（m）
+    size_t vertices = 0;
+    size_t edges = 0;
+    bool converged = false;        // chi2 未发散（final ≤ initial*1.01）
+};
+
+/// 优化输出：候选增量 + 质量指标。valid=false 表示优化失败/保护拒绝，
+/// 调用方不得提交任何内容。
+struct OptimizationResult {
+    unsigned long submap_id = 0;
+    uint64_t base_topology_revision = 0;  // 快照基准版本（stale 检查用）
+    uint64_t base_geometry_revision = 0;
+    std::vector<PoseUpdate> poses;
+    std::vector<PointUpdate> points;
+    OptimizationMetrics metrics;
+    bool valid = false;
+};
+
+/// 图优化后端（基于 g2o）——纯计算，只读快照，不修改任何实时地图对象
 class Optimizer {
 public:
-    /// 局部 Bundle Adjustment：优化当前关键帧及其共视帧 + 地图点
-    /// @param camera          相机内参
-    /// @param map             地图
-    /// @param active_kfs      参与优化的关键帧列表（滑动窗口，第一帧固定）
-    /// @param max_iterations  g2o 最大迭代次数
-    /// @param fix_points      地图点是否固定（motion-only）；默认按传感器自动选择：
-    ///                        单目固定（三角化尺度由 recoverPose 决定，点自由会引入
-    ///                        尺度 gauge 发散），双目/RGB-D 放开（视差绝对尺度可观测）
-    /// @param max_points      参与优化的地图点数量上限（按观测数降序截断；
-    ///                        地图膨胀后控制 BA 规模，防止单次 LM 到分钟级）
-    static void localBundleAdjustment(
+    /// 局部 Bundle Adjustment（快照上）：优化窗口关键帧 + 地图点。
+    /// 返回结果含全部位姿/点候选增量；fixed_kf_ids 内位姿固定（锚定）。
+    /// @param max_points  参与优化的地图点数量上限（按观测数降序截断）
+    static OptimizationResult solveLocalBA(
         const Camera& camera,
-        Map::Ptr map,
-        const std::vector<Frame::Ptr>& active_kfs,
+        const OptimizationSnapshot& snap,
         int max_iterations = 10,
         std::optional<bool> fix_points = std::nullopt,
         size_t max_points = 4000);
 
-    /// 全局 BA：优化所有关键帧（+ 地图点，双目下按 fix_points 自动放开）
-    static void globalBundleAdjustment(const Camera& camera, Map::Ptr map,
-                                       int max_iterations = 20,
-                                       std::optional<bool> fix_points = std::nullopt,
-                                       size_t max_points = 4000);
-
-    /// (Phase 2) 位姿图优化：相邻边（里程计约束）+ 回环边校正全局漂移。
-    /// 顶点为所有关键帧（T_wc 语义，与 g2o EdgeSE3 群运算一致）；
-    /// 第一个关键帧固定锚定坐标系；地图点在调用方按参考关键帧同步。
-    /// @param odometry_edges  关键帧插入时冻结的里程计边
-    /// @param loop_edges      累积保留的回环边
-    /// 返回 false 表示后端不可用、约束不足或未执行优化。
-    static bool poseGraphOptimization(
-        Map::Ptr map,
-        const std::vector<LoopEdge>& odometry_edges,
-        const std::vector<LoopEdge>& loop_edges = {});
+    /// 位姿图优化（快照上）：约束 = 里程计边（无鲁棒核）+ 回环边（Huber）。
+    /// 内置防护（M0）：回环边残差预检、chi2 收敛、有限值、最大校正/相邻步长
+    /// 检查——任一失败 → valid=false，调用方不得提交。
+    static OptimizationResult solvePoseGraph(
+        const OptimizationSnapshot& snap);
 };
 
 } // namespace vslam

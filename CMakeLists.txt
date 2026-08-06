@@ -114,6 +114,7 @@ set(VSLAM_SOURCES
     src/dataset.cpp
     src/mappoint.cpp
     src/map.cpp
+    src/backend_committer.cpp
     src/atlas.cpp
     src/feature.cpp
     src/vo.cpp

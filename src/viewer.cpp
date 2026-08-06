@@ -25,7 +25,7 @@ void Viewer::stop() {
 void Viewer::updateFrame(const cv::Mat& image,
                          const std::vector<cv::KeyPoint>& keypoints,
                          const std::vector<Vec3>& trajectory,
-                         const SE3& pose_cw,
+                         const SE3& pose_cs,
                          const cv::Mat& image_right) {
     std::lock_guard<std::mutex> lock(data_mutex_);
 
@@ -110,7 +110,7 @@ void Viewer::updateFrame(const cv::Mat& image,
     }
 
     trajectory_ = trajectory;
-    camera_pose_wc_ = pose_cw.inverse();
+    camera_pose_wc_ = pose_cs.inverse();
 }
 
 void Viewer::setStatus(const std::string& text) {

@@ -23,7 +23,7 @@ public:
     void updateFrame(const cv::Mat& image,
                      const std::vector<cv::KeyPoint>& keypoints,
                      const std::vector<Vec3>& trajectory,
-                     const SE3& pose_cw,
+                     const SE3& pose_cs,
                      const cv::Mat& image_right = cv::Mat());
 
     /// 更新状态文本（叠加在图像上）

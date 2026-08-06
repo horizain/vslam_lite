@@ -31,7 +31,9 @@ Runtime:
   opencv_threads: 16       # OpenCV/TBB 线程数。0=库默认（=全部逻辑核，32 核机器实测进程
                            # 63 线程、超订无益）；设物理核数（本机 16）实测 FPS 最高且线程
                            # 减到 47（§3.16 A/B）；移动端建议 2~4
-  async_backend: false     # 异步后端仍在完善事务式写回；可靠评估默认同步。
+  async_backend: true      # M6：Committer 追加 rebase 协议完成后恢复默认开启
+                           # （Local BA/回环后台执行，前端只跟踪；§3.16 收益
+                           # FPS+23%/LOST-97%，M1-M6 事务式写回兜底）。
                            # §3.15 曾因"BA 滞后致前端用陈旧点、LOST +130%"默认关闭；
                            # §3.16 覆盖式队列 + 跳过活动参考帧写回后净收益转正：
                            # 历史性能实验曾有 FPS +23%，但异步回环快照可能与前端新增
@@ -62,7 +64,7 @@ Optimizer:
   local_window_size: 10    # 局部 BA 窗口大小
   local_ba_iterations: 10  # 局部 BA 迭代次数
   enable_local_ba: true    # 局部 BA 开关（false 时仅前端跟踪，用于对比实验）
-  global_ba_iterations: 20  # 全局 BA 迭代次数（回环闭合后触发；位姿采样控制规模）
+  global_ba_iterations: 0  # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
 
 # ---- 回环检测 (Phase 2) ----
 LoopClosure:

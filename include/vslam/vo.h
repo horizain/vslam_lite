@@ -8,10 +8,12 @@
 #include "vslam/feature.h"
 #include "vslam/loop_closure.h"
 #include "vslam/optimizer.h"
+#include "vslam/backend_committer.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <string>
@@ -152,10 +154,21 @@ public:
     /// 获取估计轨迹中的相机位置（世界系 C_w）
     std::vector<Vec3> getTrajectory() const;
 
-    /// 获取有效帧的完整位姿轨迹（T_cw，与 getTrajectory 顺序一致）
+    /// M4：轨迹记录——普通帧不再保存全局 T_cw，只记录相对锚定关键帧的
+    /// 局部运动；世界位姿读时组合 T_cw = T_ca · (anchor pose_cs · T_ws⁻¹)。
+    /// 回环/子地图对齐只更新锚点（KF 局部位姿 / T_ws），轨迹自动跟随，
+    /// 无需全量插值重写（删除 §3.16 的轨迹重写路径）。
+    struct FramePoseRecord {
+        unsigned long frame_id = 0;     // 帧号（轨迹帧号与评估对齐）
+        unsigned long submap_id = 0;    // 所属子地图（T_ws 查找）
+        unsigned long anchor_kf_id = 0; // 锚定关键帧（关键帧自身 = 自己）
+        SE3 T_ca;                       // 相对锚定关键帧的局部运动（T_ca：anchor→camera）
+        bool valid = false;
+    };
+
+    /// 获取有效帧的完整位姿轨迹（世界系 T_cw，由锚定记录组合）
     std::vector<SE3> getPoseTrajectory() const {
-        std::lock_guard<std::mutex> lock(traj_mutex_);  // 后端回环校正重写轨迹
-        return pose_trajectory_;
+        return composePoseTrajectory();
     }
 
     /// 是否应该创建新的关键帧
@@ -174,25 +187,86 @@ public:
     /// (Phase 2) 已闭合的回环次数（状态栏/评估用）
     unsigned long loopClosureCount() const { return loop_closure_count_; }
 
+    /// M2：前端只读快照（§14.1-6）——每帧开头捕获一次，整帧使用同一版本数据。
+    /// 跟踪不再在途中读实时地图点坐标（避免跨版本/部分提交观测）。
+    struct TrackingSnapshot {
+        uint64_t topology_revision = 0;   // 捕获时的地图版本（诊断/审计用）
+        uint64_t geometry_revision = 0;
+        unsigned long submap_id = 0;
+        SE3 T_ws;                         // 活动子地图锚（M3：世界组合唯一权威）
+        bool has_ref = false;             // 是否有参考帧
+        unsigned long ref_kf_id = 0;      // 参考关键帧 id（M4：轨迹锚点）
+        SE3 ref_pose_cs;                  // 参考帧位姿（子地图局部系 T_cs）
+        std::vector<std::shared_ptr<MapPoint>> ref_mps;  // 参考帧 map_points（索引对齐）
+        std::vector<Vec3> ref_points_s;   // 对应局部坐标拷贝（版本绑定）
+    };
+
     /// 等待异步后端队列排空并停止线程。批量评估必须先调用，再读取最终轨迹/统计。
     void finishPendingBackendWork();
+
+    /// M0：位姿验收结果（正常跟踪/重定位共用，供状态栏与日志）
+    struct PoseQuality {
+        double inlier_ratio = 0.0;
+        double pose_rmse    = 0.0;
+        double translation  = 0.0;   // 相对运动基线的平移 (m)
+        double rotation     = 0.0;   // 相对运动基线的旋转 (rad)
+        bool   geometric_ok = false; // 内点/比例/RMSE 达标
+        bool   motion_ok    = false; // 连续性达标（无运动基线时恒 true）
+    };
+
+    /// M0 位姿验收纯函数：几何（内点/比例/RMSE）+ 连续性（相对运动基线平移/旋转）。
+    /// baseline_twc 为空 → 跳过连续性（无运动模型场景，如初始化首帧/单目）。
+    /// 验收失败由调用方保证实时状态完全不变（不写位姿、不换子地图）。
+    [[nodiscard]] static bool acceptPoseCandidate(
+        const SE3& candidate_pose_cs, int inliers, size_t total, double rmse,
+        int min_inliers, double min_ratio, double max_rmse,
+        const std::optional<SE3>& baseline_twc,
+        double max_translation, double max_rotation,
+        PoseQuality& quality);
 
 private:
     void updateStatus(int matches, int inliers, double parallax);
     SE3 addFrameImpl(const cv::Mat& left, const cv::Mat& right, double timestamp);
-    /// 双目/RGB-D：用视差（或深度）为每特征点计算相机系 3D 观测 pts_c
+    /// M0：统一位姿验收（正常跟踪 reloc_mode=false / 重定位 reloc_mode=true）。
+    /// 重定位基线 = 丢失期匀速外推的期望位姿（与 createSubmap 同一外推规则），
+    /// 平移门限随外推位移放宽至 max(50m, 3×位移)、旋转门限 60°；正常跟踪基线 =
+    /// 上一有效位姿（max_frame_translation/max_frame_rotation）。单目（尺度归一化，
+    /// 位移无物理意义）或无上一有效位姿 → 跳过连续性，仅几何验收。
+    bool acceptPose(const SE3& candidate_pose_world, int inliers, size_t total,
+                    double rmse, bool reloc_mode, PoseQuality& quality,
+                    int min_inliers_override = -1,
+                    double min_ratio_override = -1.0,
+                    double max_rmse_override = -1.0) const;
+    /// M5：重定位运动基线（世界系 T_wc，丢失期匀速外推）。const：
+    /// 只读 last_valid_pose_world_/per_frame_motion_ 等成员，供 const
+    /// acceptPose 与 tryRelocalize 共用。
+    SE3 relocBaselineWorld() const;
+    /// M5：求解 Atlas 子地图约束图——节点 = 子地图 T_ws，边 = 约束
+    /// （T_ws_b = T_ws_a · T_rel）；首个子地图固定锚定世界系。
+    /// 成功时更新全部子地图 T_ws 并返回 true。
+    bool solveAtlasConstraints();
+    /// 跟踪/重定位共用：计算候选位姿相对运动基线的平移/旋转（角度），
+    /// 并判定是否在 [max_translation, max_rotation] 门限内（validateMotion 的通用版）。
+    static bool checkMotionContinuity(const SE3& candidate_pose_cs,
+                                      const SE3& baseline_twc,
+                                      double max_translation, double max_rotation,
+                                      double& translation, double& rotation);
+    /// 双目/RGB-D：为当前帧的每个特征点计算相机系 3D 观测 pts_c
     void computeStereoDepths();
     /// 双目/RGB-D：从当前帧 pts_c 直接创建地图点（单帧绝对尺度建点）
     void createMapPointsFromStereo(const Frame::Ptr& frame);
+    /// M4：组合锚定轨迹为世界系 T_cw（getPoseTrajectory 的实现；
+    /// 无并发时（评估）也可直接使用）
+    std::vector<SE3> composePoseTrajectory() const;
+    /// 组合单条锚定记录为世界位姿（调用方必须已持 map_mutex_ 读/写锁）
+    SE3 composeRecordWorld(const FramePoseRecord& rec) const;
     bool tryInitialize();
     SE3 trackFrame();
     /// LK 光流跟踪（feature_method=1）：基于索引对齐的 map_points 做 PnP，失败回退 ORB
     SE3 trackFrameLK();
     /// 双目/RGB-D：3D-3D 位姿估计（ref 世界系点 vs 当前帧 pts_c，绝对尺度、旋转鲁棒）。
-    /// PnP 失败或旋转-平移歧义（假平移跳变）时使用；成功返回 true 并写入 pose_cw
+    /// PnP 失败或旋转-平移歧义（假平移跳变）时使用；成功返回 true 并写入 pose_cs
     bool tryTrack3D3D(const std::vector<cv::DMatch>& matches);
-    /// 检查双目相邻有效帧运动是否合理，并返回平移/旋转增量。
-    bool validateMotion(const SE3& pose_cw, double& translation, double& rotation) const;
     /// 计算 PnP 内点的重投影 RMSE。
     double pnpReprojectionRmse(const std::vector<cv::Point3f>& pts3d,
                                const std::vector<cv::Point2f>& pts2d,
@@ -221,7 +295,23 @@ private:
     void submitBackendTask(BackendTask task);
     void startBackend();
     void stopBackend();
-    /// 快照一个关键帧：pose_cw 拷贝；keep_points 为空则全部 map_points 深拷贝，
+
+    // ---- M1：Optimizer 只读快照 / Result / 提交 ----
+    /// 构建 Local BA 只读快照（调用方需持 map_mutex_ 读锁；窗口内已被
+    /// 清理/地图重建的 KF 自动剔除）。不深拷贝任何实时对象。
+    OptimizationSnapshot buildLocalBASnapshot(
+        const std::vector<Frame::Ptr>& window) const;
+    /// 应用 Local BA 结果：唯一提交路径（BackendCommitter::commit，M2）——
+    /// stale 检查 + 质量验收 + 锁内原子写回（跳过 skip_pose 活动参考帧）。
+    /// 返回是否提交成功；stale/验收失败 → 不提交，实时状态逐项不变。
+    bool applyLocalBAResult(const OptimizationResult& result,
+                            const std::unordered_set<unsigned long>& skip_pose);
+
+    // ---- M2：前端只读快照 ----
+    /// 捕获前端只读快照（调用方需持 map_mutex_ 读锁；每帧开头一次）
+    TrackingSnapshot captureTrackingSnapshot() const;
+
+    /// 快照一个关键帧：pose_cs 拷贝；keep_points 为空则全部 map_points 深拷贝，
     /// 否则只深拷贝 keep_points 中的点（其余置 nullptr，与 keypoints 索引对齐）。
     /// with_descriptors=false 用于 BA 快照：g2o 只消费关键点像素与点位姿，
     /// 不读描述子——全图回环快照省掉 ~70MB 描述子拷贝（P1，见 §3.16）。
@@ -250,9 +340,9 @@ private:
 
     FeatureMatcher feature_matcher_;
 
-    // 轨迹记录：保存完整 T_cw，Viewer 需要时再提取相机光心 C_w
-    std::vector<SE3> pose_trajectory_;       // 有效帧 T_cw（回环后同步修正）
-    std::vector<unsigned long> traj_frame_ids_;  // 轨迹点对应帧号（回环校正用）
+    // 轨迹记录（M4）：锚定关键帧 + 局部运动，世界位姿读时组合。
+    // 回环校正/子地图对齐只更新锚点，轨迹自动跟随，无需全量插值重写。
+    std::vector<FramePoseRecord> pose_records_;
     std::vector<LoopEdge> odometry_edges_;   // KF 插入时冻结，不能从优化后位姿重算
     std::vector<LoopEdge> loop_edges_;       // 累积保留历史回环约束
 
@@ -267,7 +357,7 @@ private:
     // 后端 BA 写回与前端 KF 插入持独占锁——读路径并发、写路径独占，缩短前端等待。
     // 写者饥饿由前端周期性独占锁（insertKeyFrame）天然消解。
     mutable std::shared_mutex map_mutex_;  // 保护地图集合/KF 位姿/点坐标/edges 的读写
-    mutable std::mutex traj_mutex_;  // 保护 pose_trajectory_/traj_frame_ids_（getter 为 const）
+    mutable std::mutex traj_mutex_;  // 保护 pose_records_（getter 为 const）
     std::mutex backend_mutex_;   // 保护任务队列（锁顺序：backend → map/traj，无嵌套持锁）
     std::condition_variable backend_cv_;
     std::deque<BackendTask> backend_tasks_;
@@ -277,7 +367,7 @@ private:
 
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）
-    SE3 last_valid_pose_cw_;
+    SE3 last_valid_pose_world_;
     bool has_last_valid_pose_ = false;
     SE3 per_frame_motion_;              // 相邻有效帧相对运动（Twc：X_cur = X_last·T_rel），
                                         // LOST 期匀速外推新子地图锚点用
@@ -286,6 +376,7 @@ private:
     int tracking_failures_ = 0;
     int relocalization_frames_ = 0;
     Status status_;  // 当前详细状态（初始化/跟踪/丢失信息）
+    TrackingSnapshot snap_;  // 前端只读快照（M2，每帧开头捕获）
 };
 
 } // namespace vslam
