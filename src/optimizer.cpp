@@ -441,6 +441,32 @@ OptimizationResult Optimizer::solvePoseGraph(const OptimizationSnapshot& snap) {
         return result;
     }
 
+    // 回环方向性验证：优化后回环两端必须被拉近（回环的意义 = 消除漂移）。
+    // 静止段/退化场景的 PnP 验证可能内点高但 T_rel 方向错误（旋转-平移
+    // 歧义），把端点拉向错误方向——KITTI 00 实测：kf#153->1597 校正
+    // 44m 后两端距离反而从 44m 增大到 52.7m，轨迹被拉歪（abcd18）。
+    {
+        std::unordered_map<unsigned long, size_t> id_idx;
+        for (size_t i = 0; i < snap.keyframes.size(); i++)
+            id_idx.emplace(snap.keyframes[i].id, i);
+        for (const auto& c : snap.constraints) {
+            if (!c.is_loop) continue;
+            auto it_a = id_idx.find(c.a);
+            auto it_b = id_idx.find(c.b);
+            if (it_a == id_idx.end() || it_b == id_idx.end()) continue;
+            const double d_old = (old_twc[it_a->second].t - old_twc[it_b->second].t).norm();
+            const double d_new = (optimized_twc[it_a->second].t
+                                  - optimized_twc[it_b->second].t).norm();
+            // 允许轻微增大（数值误差），显著拉远 = 方向错误 → 拒绝
+            if (d_new > d_old * 1.5 && d_old > 5.0) {
+                LOG_WARN("Pose graph rejected divergent loop kf#" << c.a
+                         << " -> kf#" << c.b << ": dist " << d_old
+                         << "m -> " << d_new << "m (loop must converge)");
+                return result;
+            }
+        }
+    }
+
     result.poses.reserve(snap.keyframes.size());
     for (size_t i = 0; i < snap.keyframes.size(); i++) {
         result.poses.push_back({snap.keyframes[i].id, optimized_twc[i].inverse()});

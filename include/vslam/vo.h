@@ -79,9 +79,9 @@ struct VOConfig {
     int    detection_interval    = 10;      // 每 N 个关键帧检测一次回环
     double pnp_inlier_ratio      = 0.7;     // 几何验证最小内点比例
     int    min_loop_inliers      = 30;      // 几何验证最小内点数
-    int    loop_cooldown_kfs     = 20;      // 回环校正冷却（关键帧数）：防止同区域连续校正
+    int    loop_cooldown_kfs     = 20;      // 回环校正冷却（关键帧数）：防止同区域连续校正（D 曾改 12，实测同区域 43 KF 内连续回环叠加拉扯变形，回退）
     int    loop_top_candidates   = 20;      // 词袋查询候选数（Top-N，提高召回）
-    double loop_position_prior_dist = 25.0; // 位置先验距离阈值(m)：轨迹自交区域补召回
+    double loop_position_prior_dist = 40.0; // 位置先验距离阈值(m)：轨迹自交区域补召回（A3 放宽）
     int    loop_position_prior_gap   = 100; // 位置先验最小关键帧间隔
     int    global_ba_iterations  = 20;      // 回环后全局 BA 迭代次数
 
@@ -299,8 +299,14 @@ private:
     // ---- M1：Optimizer 只读快照 / Result / 提交 ----
     /// 构建 Local BA 只读快照（调用方需持 map_mutex_ 读锁；窗口内已被
     /// 清理/地图重建的 KF 自动剔除）。不深拷贝任何实时对象。
+    /// @param min_observed  只收集观测数 ≥ 该值的点（C：弱观测垃圾点过滤，
+    ///                       0 = 不过滤）
     OptimizationSnapshot buildLocalBASnapshot(
-        const std::vector<Frame::Ptr>& window) const;
+        const std::vector<Frame::Ptr>& window, int min_observed = 0) const;
+    /// 执行窗口 Local BA（唯一入口）：快照 → 求解 → 提交（跳过活动参考帧）。
+    /// C：提交被质量门限拒绝（大校正 = 弱观测点拖偏）时，剔除 observed<3
+    /// 的点重建快照重试一次——垃圾段不再长期不被修复。
+    void runWindowLocalBA(const std::vector<Frame::Ptr>& window);
     /// 应用 Local BA 结果：唯一提交路径（BackendCommitter::commit，M2）——
     /// stale 检查 + 质量验收 + 锁内原子写回（跳过 skip_pose 活动参考帧）。
     /// 返回是否提交成功；stale/验收失败 → 不提交，实时状态逐项不变。

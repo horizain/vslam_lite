@@ -95,6 +95,19 @@ bool LoopClosure::loadVocabulary(const std::string& vocab_path) {
 #endif
 }
 
+std::unordered_set<unsigned long> LoopClosure::protectedKeyFrames() const {
+#ifdef HAS_DBOW3
+    std::unordered_set<unsigned long> out;
+    if (impl_) {
+        out.reserve(impl_->kf_db_id.size());
+        for (const auto& [id, eid] : impl_->kf_db_id) out.insert(id);
+    }
+    return out;
+#else
+    return {};
+#endif
+}
+
 void LoopClosure::addKeyFrame(Frame::Ptr kf) {
 #ifndef HAS_DBOW3
     (void)kf;
@@ -196,7 +209,9 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
     if (!camera_ || !kf_curr || !kf_loop) return false;
 
     // 1. ORB 匹配：knn + ratio（queryIdx 属于 kf_curr，trainIdx 属于 kf_loop）
-    auto matches = matcher_.match(kf_curr, kf_loop, 0.7, false);
+    // A2：验证匹配 ratio 放宽（0.7->0.8）——回环场景尺度/光照差异大，
+    // 严格比率漏掉真对应；内点判定仍由下方 PnP 双门槛把关
+    auto matches = matcher_.match(kf_curr, kf_loop, 0.8, false);
     if (matches.size() < 8) {
         LOG_WARN("LoopClosure: too few matches (" << matches.size() << ")");
         return false;
@@ -204,10 +219,21 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
 
     // 2. 收集 3D-2D 对应：3D = kf_loop 侧已关联的地图点（回环尺度），
     //    2D = kf_curr 侧特征点像素
+    //    A1：地图点被 cull 断链的候选 KF 特征，用其双目观测 pts_c
+    //    （相机系，保留在 KF 上）转局部系补 3D——回环召回不再依赖
+    //    cull 保留点（实测候选 KF 空点 → "too few 3D-2D" 直接失败）。
     std::vector<cv::Point3f> pts3d;
     std::vector<cv::Point2f> pts2d;
     for (size_t i = 0; i < matches.size(); i++) {
-        auto mp = kf_loop->map_points[matches[i].trainIdx];
+        const size_t ti = matches[i].trainIdx;
+        auto mp = (ti < kf_loop->map_points.size()) ? kf_loop->map_points[ti] : nullptr;
+        if (!mp && ti < kf_loop->pts_c.size() && kf_loop->pts_c[ti].z() > 0) {
+            const Vec3 p_s = kf_loop->pose_cs.inverse() * kf_loop->pts_c[ti];
+            const auto& kp = kf_curr->keypoints[matches[i].queryIdx];
+            pts3d.emplace_back((float)p_s.x(), (float)p_s.y(), (float)p_s.z());
+            pts2d.emplace_back(kp.pt.x, kp.pt.y);
+            continue;
+        }
         if (!mp) continue;
         const auto& kp = kf_curr->keypoints[matches[i].queryIdx];
         pts3d.emplace_back(mp->pos_s.x(), mp->pos_s.y(), mp->pos_s.z());
@@ -223,7 +249,7 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
     cv::Mat rvec, tvec;
     std::vector<int> inliers;
     bool ok = cv::solvePnPRansac(pts3d, pts2d, K, cv::Mat(), rvec, tvec,
-                                 false, 100, ransac_pixel_threshold_, 0.99,
+                                 false, 200, ransac_pixel_threshold_, 0.99,
                                  inliers, cv::SOLVEPNP_ITERATIVE);
     if (!ok || inliers.empty()) return false;
 

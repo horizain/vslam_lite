@@ -1,4 +1,6 @@
 #include "vslam/mappoint.h"
+#include <algorithm>
+#include <cmath>
 #include <opencv2/calib3d.hpp>
 
 namespace vslam {
@@ -34,6 +36,18 @@ MapPoint::Ptr MapPoint::create(unsigned long id,
     cv::Mat x = points_4d.col(0);
     x /= x.at<float>(3);
     mp->pos_s = Vec3(x.at<float>(0), x.at<float>(1), x.at<float>(2));
+
+    // B2：最小视差角检查——两光心到点的射线夹角过小（近共线）时三角化
+    // 退化，深度的数值误差放大成垃圾点（污染 PnP/BA）。0.1° 只拒绝
+    // 严重退化（匹配误差导致的爆炸深度点）；实测 0.5° 会误伤 KITTI
+    // 正常三角化（Triangulated -72%，ATE 42.8→91.5 回归）。
+    const Vec3 c1 = -(T1.q.inverse() * T1.t);
+    const Vec3 c2 = -(T2.q.inverse() * T2.t);
+    const Vec3 d1 = (mp->pos_s - c1).normalized();
+    const Vec3 d2 = (mp->pos_s - c2).normalized();
+    const double cos_angle = std::clamp(d1.dot(d2), -1.0, 1.0);
+    const double angle_deg = std::acos(cos_angle) * 180.0 / M_PI;
+    if (angle_deg < 0.1) return nullptr;  // 退化三角化拒绝
 
     return mp;
 }

@@ -75,9 +75,9 @@ LoopClosure:
   detection_interval: 10      # 每 N 个关键帧检测一次回环
   pnp_inlier_ratio: 0.85      # 几何验证最小内点比例（提高，过滤弱验证）
   min_loop_inliers: 50        # 几何验证最小内点数（提高，过滤弱验证）
-  loop_cooldown_kfs: 60       # 回环校正冷却（关键帧数）：挡同区域重复命中
+  loop_cooldown_kfs: 20       # 回环校正冷却（关键帧数）：挡同区域重复命中
   top_candidates: 20          # 词袋查询候选数（Top-N，提高召回）
-  position_prior_dist: 25.0   # 位置先验距离阈值(m)：轨迹自交区域词袋分低时补召回
+  position_prior_dist: 40.0   # 位置先验距离阈值(m)：轨迹自交区域词袋分低时补召回
   position_prior_gap: 100     # 位置先验最小关键帧间隔（防刚走过的路误报）
 
 # ---- 可视化 ----
