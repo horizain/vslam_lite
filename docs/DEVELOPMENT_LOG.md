@@ -1,7 +1,10 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-06 (编译/评估修复 §3.18；优化失效审计与后端重构计划 §3.19)
+> 最后更新: 2026-08-07（Phase 0/1 收口与跨数据集完整基准 §3.22-3.23）
+>
+> 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
+> 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
 
 ---
 
@@ -9,7 +12,7 @@
 
 从零构建教学级 VSLAM 系统，遵循第一性原理，只保留核心逻辑，适合初学者逐文件阅读学习。
 
-**技术栈:** C++23 / OpenCV / Eigen3 / Pangolin / g2o / DBoW3(Phase2)
+**技术栈:** C++23 / OpenCV / Eigen3 / Pangolin / vendored g2o / DBoW3（可选回环）
 
 ---
 
@@ -19,18 +22,18 @@
 
 | 检查项 | 状态 | 说明 |
 |--------|------|------|
-| 依赖安装 | ✅ | OpenCV 4.10 + Eigen 3.4 + yaml-cpp 0.8 + g2o (apt) |
+| 依赖安装 | ✅ | OpenCV 4.10 + Eigen 3.4 + yaml-cpp 0.8 + vendored g2o；DBoW3 可选 |
 | Pangolin | ✅ | gitee 镜像源码编译 (v0.6) |
 | CMake 编译 | ✅ | 100% 通过 |
-| 单元测试 | ✅ | 4 个用例 7 项断言全部 PASSED（2026-08-01 修复编译后） |
+| 单元测试 | ✅ | 当前 `test_vo` 与 `test_trajectory_alignment` 均通过；早期数量见历史提交 |
 | WSL2 摄像头 | ✅ | usbipd-win → /dev/video0 |
-| KITTI 实测 | ⚠️ | 数据下载受阻（见 4.2），已提供 `scripts/prepare_kitti.sh` 待用户自行下载 |
+| 数据集实测 | ✅ | KITTI 00 与 EuRoC V1_01_easy 双轮完整基准见 §3.23 |
 
 ### 2.1 项目基础设施
 
 | 文件 | 状态 | 说明 |
 |------|------|------|
-| `CMakeLists.txt` | ✅ 完成 | C++17, 自动检测 g2o/DBoW3(可选), Release/Debug 模式 |
+| `CMakeLists.txt` | ✅ 完成 | C++23, vendored g2o, 自动检测 DBoW3(可选), Release/Debug 模式 |
 | `cmake/Findg2o.cmake` | ✅ 完成 | g2o 查找模块 |
 | `config/default.yaml` | ✅ 完成 | KITTI 内参 + ORB/PNP/关键帧/BA 参数（已全量接入代码） |
 | `.gitignore` | ✅ 完成 | 忽略 build/、debug.txt 等 |
@@ -44,9 +47,9 @@
 | `include/vslam/camera.h` | ✅ 完成 | 针孔模型(单目/双目/RGBD 接口), Yaml加载, world2pixel, pixel2camera |
 | `src/camera.cpp` | ✅ 完成 | Yaml解析, 投影/反投影实现 |
 | `include/vslam/frame.h` | ✅ 完成 | Frame(Ptr), 图像/灰度图/关键点/描述子/位姿/地图点关联 |
-| `include/vslam/mappoint.h` | ✅ 完成 | MapPoint(Ptr), 3D位置/描述子/观测计数, 三角化工厂方法 |
+| `include/vslam/mappoint.h` | ✅ 完成 | MapPoint(Ptr), `pos_s`/描述子/正式 Observation, 三角化工厂方法 |
 | `src/mappoint.cpp` | ✅ 完成 | cv::triangulatePoints 三角化实现 |
-| `include/vslam/map.h` | ✅ 完成 | Map: 关键帧+地图点集合, 增删查, cullMapPoints, 全局 id 分配 |
+| `include/vslam/map.h` | ✅ 完成 | Map: 关键帧+地图点集合, Observation/covisibility, revision 与图内 id 分配 |
 | `src/map.cpp` | ✅ 完成 | 所有集合操作实现 |
 
 ### 2.3 视觉里程计前端
@@ -62,7 +65,8 @@
 
 **位姿语义（2026-08-01 统一修复）:**
 
-统一约定 `pose_cw` 为 **T_cw（世界→相机）**：`p_c = pose_cw * p_w`
+当前关键帧字段为 `pose_cs` = **T_cs（子地图→相机）**；全局 `T_cw` 由
+`T_cs * T_ws.inverse()` 派生，`p_c = T_cw * p_w`。
 
 ```
 初始化 (INITIALIZING):
@@ -102,20 +106,20 @@
 | 文件 | 状态 | 说明 |
 |------|------|------|
 | `include/vslam/dataset.h` | ✅ 完成 | Dataset: KITTI/TUM/EuRoC/CAMERA 四类型 |
-| `src/dataset.cpp` | ✅ 完成 | **KITTI**: ✅ 完成(彩色读取→VO 内转灰度)<br>**TUM**: ✅ 完成(解析 `rgb.txt` 时间戳 + 路径)<br>**EUROC**: ✅ 完成(解析 `cam0/data.csv`)<br>**CAMERA**: ✅ 完成(cv::VideoCapture) |
+| `src/dataset.cpp` | ✅ 完成 | **KITTI**: 双目目录与标定<br>**TUM**: `rgb.txt` 时间戳<br>**EuRoC**: `cam0/data.csv` + `sensor.yaml` 标定/去畸变<br>**CAMERA**: `cv::VideoCapture` |
 
 ### 2.6 应用入口
 
 | 文件 | 状态 | 说明 |
 |------|------|------|
 | `app/run_vo.cpp` | ✅ 完成 | 命令行入口, 自动识别数据集路径 vs 摄像头索引, 加载 yaml 配置, 主循环(读取→VO→Viewer→FPS统计), **结束后保存 TUM 格式轨迹**(时间戳+tx ty tz qx qy qz qw, T_wc, 供 EVO 评估) |
-| `app/run_slam.cpp` | 🔜 Phase 2 | 已注释在 CMakeLists.txt 中 |
+| `app/run_slam.cpp` | ✅ 完成 | 可选 DBoW3 回环入口；缺词典时会降级 |
 
 ### 2.7 测试
 
 | 文件 | 状态 | 说明 |
 |------|------|------|
-| `test/test_vo.cpp` | ✅ 通过 | 4 个用例 7 项断言全部 PASSED: SE3运算(3), Camera投影(2), ORB提取(1), VO初始化(1, 合成场景23地图点)。**2026-08-01 修复编译**(TEST宏语法/vslam::Eigen/imgproc缺失/字段名) |
+| `test/test_vo.cpp` | ✅ 通过 | `test_vo` 与 `test_trajectory_alignment` 均通过；Observation、BA、回环和一致性回归覆盖见最新提交记录 |
 
 ### 2.8 文档
 
@@ -1240,3 +1244,91 @@ PGO 校正方向正确——1597 从 (51.1,-16.8,114.1) 拉回 (17.5,-1.9,90.0)�
 +独有点（传播方向/范围错误 → 85m 跳变）；③ commit 非 COMMITTED 跳过
 传播（85m 仍在）。下一步疑点：传播校正量 `C=new⁻¹·old` 左乘语义与
 位姿/点坐标系组合，或传播范围应限于回环端点附近漂移段。
+
+### 3.22 Phase 0/1 回环与 Observation 收口（2026-08-07）
+
+本轮修复收口了回环/异步写回和 Observation 生产路径：移除旧的硬编码 KF
+过滤与快照外 KF 传播路径；回环提交严格绑定 Map、submap、topology/geometry
+revision 及当前/候选 KF 对象身份；Local BA 快照显式绑定 anchor KF id；普通
+跟踪帧不再写正式观测，双目建点/三角化/KF 插入统一维护双向 Observation，并在
+建点关联失败时完整回滚新点。Local BA 只消费正式观测并按 `observationCount()`
+执行 `min_observed` 过滤，持久共视计数用于窗口和里程计权重。
+
+验证边界：`cmake --build build -j2`、`ctest --test-dir build --output-on-failure`
+（2/2）及 `git diff --check` 已通过；测试覆盖单目/双目初始化、双目 LK 关键帧、
+Observation 一致性、id=0 BA 与地图点删除回滚基础语义。Phase 2/3 的真实 KITTI
+闭环质量、全局 BA 及跨子地图融合仍未完成，不能以本轮单测替代数据集验收。
+
+### 3.23 事务化收口、目录迁移与 KITTI/EuRoC 完整基准（2026-08-07）
+
+本轮在 §3.22 基础上完成最终对抗审查与性能收口：回环从“快照计算后分段写回”改为
+持有目标 Map 独占锁的可串行化事务，提交前重新验证候选并原子写回全部 KF 位姿和点；
+移除硬编码 KF、快照外传播及重复 Local BA 重试。Map 批量 cull 从“每删一点扫描全图
+KF slots”降为“撤销被删点 Observation + 全图 slots 单次扫描”；1000 帧同配置对比
+FPS 5.35→17.02、`kf.cull` 最大耗时 15.89s→39ms，ATE/RPE 保持到输出精度一致。
+
+完整基准还复现了两个不能由 revision 数值单独解决的并发缺口：① 旧子地图的异步 Local BA
+可能与新 Map 的相同 KF id/revision 撞号；任务现绑定 Map/Submap，并在快照、KF 指针与提交
+三处验身份。② 后端在一帧跟踪后、KF 插入前提交 PGO 时，旧几何帧会漏出 PGO 快照；实测
+在 162.0→162.1s 产生 41.231m 相邻跳变。KF 插入现在在独占锁内做帧首 geometry gate，
+过期时保持 `T_ca` 重基到 live reference 并跳过本帧 KF；普通帧收尾的运动基线也改为与
+持久轨迹相同的 live-anchor 世界位姿。最终双轮 gate 各实际触发 1 次。
+
+数据目录统一为 `datasets/kitti/{sequences,poses}` 与 `datasets/euroc/<sequence>/mav0`。
+EuRoC 输入会读取 `cam0/sensor.yaml` 的 pinhole + radial-tangential 标定并去畸变；新增
+`euroc_gt_to_tum.py` 把 200Hz 状态真值转换为 cam0 世界位姿，评估时按图像时间戳匹配。
+
+**验证环境**：WSL2，Intel Core i7-10700（8C/16T），独立 Release 构建，headless，
+vendored g2o + DBoW3；每个数据集连续运行两次。原始日志、轨迹和 perf CSV 写到 `/tmp`，
+未把约 1GB 级运行产物继续提交到 `data/eval/`。
+
+最终 Debug/Release CTest 均 2/2 通过；ASan+UBSan（`halt_on_error=1`）在关闭泄漏检测后
+2/2 通过。LeakSanitizer 在本受管 ptrace 环境不能启动，因此本轮没有宣称完成泄漏扫描；
+TSan 同样受 WSL 地址映射限制，真实并发证据来自锁语义回归与 KITTI 双轮运行。
+
+```bash
+python3 scripts/benchmark.py datasets/kitti/sequences/00 config/kitti00.yaml \
+    /tmp/vslam_kitti_reloc_release --runs 2 \
+    --bin /tmp/vslam_benchmark_release/bin/run_slam \
+    --gt datasets/kitti/poses/00.tum --alignment se3 \
+    --format kitti --expected-frames 4541
+
+python3 scripts/euroc_gt_to_tum.py datasets/euroc/V1_01_easy/mav0 \
+    /tmp/euroc_v101_cam0_gt.tum
+python3 scripts/benchmark.py datasets/euroc/V1_01_easy/mav0 config/default.yaml \
+    /tmp/vslam_euroc_gate_release --runs 2 \
+    --bin /tmp/vslam_benchmark_release/bin/run_slam \
+    --gt /tmp/euroc_v101_cam0_gt.tum --alignment sim3 \
+    --format euroc --expected-frames 2912
+```
+
+**KITTI 00 双轮结果（双目，SE3）**：
+
+| 指标 | run 1 | run 2 | 均值 ± 半差 |
+|---|---:|---:|---:|
+| 完成帧 / 有效轨迹 | 4541 / 4502 | 4541 / 4484 | 98.94% ± 0.20% |
+| FPS / 耗时 | 12.56 / 361.59s | 15.02 / 302.36s | 13.79 ± 1.23 |
+| ATE RMSE / Mean / Max | 13.445 / 9.827 / 47.475m | 38.662 / 28.808 / 117.778m | 26.054 ± 12.609m RMSE |
+| RPE 平移 / 旋转 | 0.142m / 0.153deg | 0.441m / 0.316deg | 0.292m / 0.235deg |
+| 路径长度比 | 0.9995 | 1.0307 | 1.0151 ± 0.0156 |
+| LOST / 子地图重建 / 回环 | 5 / 2 / 1 | 14 / 3 / 0 | 9.5 / 2.5 / 0.5 |
+| 最终点 / KF | 16190 / 82 | 16190 / 82 | 16190 / 82 |
+
+两轮 >10m step 为 2/3 次，全部跨 2.0s LOST 时间洞；相邻有效帧 >10m 为 0，最大值
+分别为 3.558m/8.356m。run 1 在 `kf#449 -> kf#3452` 命中一次回环，回环后没有
+相邻帧大跳变，构成最终代码的真实事件级复验；两轮也各真实触发一次 in-flight gate。
+但 run 2 未命中回环且 ATE 退化到 38.662m，表明回环召回和最终精度仍受后端调度影响，
+不能用 26.054m 均值掩盖。双轮命令总 wall time 669.25s，进程峰值 RSS 约 1.70GiB。
+
+**EuRoC V1_01_easy 双轮结果（单目，Sim3）**：2912 帧均全部完成，
+有效轨迹 2780（95.47%），与 cam0 真值匹配 2761，0 LOST / 0 子地图重建 / 0 回环；
+57.08 ± 4.97 FPS，ATE RMSE/Mean/Max = 1.634±0.011/1.472±0.019/
+3.185±0.007m，RPE = 0.021m/frame、0.596±0.007deg/frame，>10m step 为 0。
+两轮总 wall time 113.81s，峰值 RSS 约 876MiB。原始 EuRoC 真值是 200Hz，不能把
+“匹配数/28712 真值行”误当图像覆盖率；
+单目原始路径长度比同样不具绝对尺度意义。
+
+**仍需正视的架构边界**：活动 Map 的点/KF 缺少硬资源预算，长序列峰值内存仍偏高；
+Atlas 当前只对齐子地图坐标系，尚未融合跨子地图重复点；
+全局 BA 默认关闭；EuRoC 暂只支持 pinhole + radial-tangential 模型。上述是后续框架级
+工作，不应再用 KITTI 00 专项阈值去掩盖。

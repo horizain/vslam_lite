@@ -22,6 +22,7 @@ Dataset::Dataset(const std::string& path, Type type)
         loadTUMImageList(path);
     } else if (type_ == Type::EUROC) {
         loadEUROCImageList(path);
+        loadEUROCCalibration(euroc_root_.empty() ? path : euroc_root_);
     }
 }
 
@@ -183,10 +184,15 @@ bool Dataset::loadTUMImageList(const std::string& path) {
 }
 
 bool Dataset::loadEUROCImageList(const std::string& path) {
-    // EuRoC 官方结构：<path>/cam0/data.csv，每行 "timestamp,<file>"
-    std::ifstream ifs(path + "/cam0/data.csv");
+    // EuRoC 官方结构：<mav0>/cam0/data.csv；也接受直接传入数据集根目录。
+    euroc_root_ = path;
+    if (!fs::is_regular_file(euroc_root_ + "/cam0/data.csv")
+        && fs::is_regular_file(euroc_root_ + "/mav0/cam0/data.csv")) {
+        euroc_root_ += "/mav0";
+    }
+    std::ifstream ifs(euroc_root_ + "/cam0/data.csv");
     if (!ifs.is_open()) {
-        LOG_WARN("EuRoC: cannot open " << path << "/cam0/data.csv");
+        LOG_WARN("EuRoC: cannot open " << euroc_root_ << "/cam0/data.csv");
         return false;
     }
     std::string line;
@@ -199,12 +205,29 @@ bool Dataset::loadEUROCImageList(const std::string& path) {
         std::getline(ss, ts_str, ',');
         std::getline(ss, file, ',');
         if (file.empty()) continue;
-        image_paths_.push_back(path + "/cam0/data/" + file);
-        timestamps_.push_back(std::stod(ts_str));
+        try {
+            image_paths_.push_back(euroc_root_ + "/cam0/data/" + file);
+            // EuRoC CSV 的时间戳单位为纳秒，统一转换为 VO 使用的秒。
+            timestamps_.push_back(std::stod(ts_str) * 1e-9);
+        } catch (const std::exception&) {
+            image_paths_.pop_back();
+            LOG_WARN("EuRoC: invalid timestamp in " << euroc_root_ << "/cam0/data.csv");
+        }
     }
     total_frames_ = static_cast<int>(image_paths_.size());
     LOG_INFO("Loaded " << total_frames_ << " EuRoC images from " << path);
     return !image_paths_.empty();
+}
+
+bool Dataset::loadEUROCCalibration(const std::string& path) {
+    const std::string sensor_path = path + "/cam0/sensor.yaml";
+    camera_ = MonocularCamera::fromEurocSensorYaml(sensor_path);
+    if (!camera_) {
+        camera_ = std::make_shared<MonocularCamera>();
+        return false;
+    }
+    calib_loaded_ = true;
+    return true;
 }
 
 bool Dataset::nextFrame(cv::Mat& left, cv::Mat& right, double& timestamp) {
@@ -227,6 +250,12 @@ bool Dataset::nextFrame(cv::Mat& left, cv::Mat& right, double& timestamp) {
     right = right_image_paths_.empty()
         ? cv::Mat()
         : cv::imread(right_image_paths_[current_index_], cv::IMREAD_COLOR);
+    // EuRoC 的 cam0 图像是原始畸变图；在进入 VO 前统一用数据集相机模型去畸变。
+    // KITTI 已校正且畸变系数为零，TUM 未加载数据集相机模型，均保持原样。
+    if (!left.empty() && camera_ && camera_->hasDistortion())
+        left = camera_->undistort(left);
+    if (!right.empty() && camera_ && camera_->hasDistortion())
+        right = camera_->undistort(right);
     // 时间戳：TUM/EuRoC 用数据集自带时间戳；KITTI 假设 10fps
     timestamp = !timestamps_.empty()
         ? timestamps_[current_index_]

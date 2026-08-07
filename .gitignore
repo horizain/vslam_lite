@@ -1,5 +1,6 @@
 # 构建产物
 build/
+build-*/
 *.o
 *.a
 *.so
@@ -26,6 +27,9 @@ thirdparty/*/build/
 *traj*.csv
 *traj*.png
 kitti_gt.txt
-build-asan/
 perf.csv
 perf.csv.history.csv
+
+# Python 缓存
+__pycache__/
+*.pyc

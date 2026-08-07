@@ -12,8 +12,137 @@
 #include <algorithm>
 #include <ranges>
 #include <limits>
+#include <numeric>
 
 namespace vslam {
+
+namespace {
+
+bool triangulateNormalizedPoint(const Vec2& p1, const Vec2& p2,
+                                const Mat33& R, const Vec3& t,
+                                Vec3& point_c1) {
+    Eigen::Matrix4d A;
+    const Eigen::Vector4d P1_r0(1.0, 0.0, 0.0, 0.0);
+    const Eigen::Vector4d P1_r1(0.0, 1.0, 0.0, 0.0);
+    const Eigen::Vector4d P1_r2(0.0, 0.0, 1.0, 0.0);
+    Eigen::Matrix<double, 1, 4> P2[3];
+    P2[0].head<3>() = R.row(0);
+    P2[0](3) = t.x();
+    P2[1].head<3>() = R.row(1);
+    P2[1](3) = t.y();
+    P2[2].head<3>() = R.row(2);
+    P2[2](3) = t.z();
+
+    A.row(0) = p1.x() * P1_r2.transpose() - P1_r0.transpose();
+    A.row(1) = p1.y() * P1_r2.transpose() - P1_r1.transpose();
+    A.row(2) = p2.x() * P2[2] - P2[0];
+    A.row(3) = p2.y() * P2[2] - P2[1];
+
+    const Eigen::JacobiSVD<Eigen::Matrix4d> svd(
+        A, Eigen::ComputeFullV);
+    const Eigen::Vector4d X_h = svd.matrixV().col(3);
+    if (!X_h.allFinite() || std::abs(X_h.w()) < 1e-12) return false;
+    point_c1 = X_h.head<3>() / X_h.w();
+    return point_c1.allFinite();
+}
+
+} // namespace
+
+MonocularInitializationQuality assessMonocularInitialization(
+    const std::vector<Vec2>& normalized_ref,
+    const std::vector<Vec2>& normalized_curr,
+    const Mat33& relative_rotation,
+    const Vec3& relative_translation,
+    double min_parallax_rad,
+    double min_positive_depth_ratio) {
+    MonocularInitializationQuality quality;
+    if (normalized_ref.size() != normalized_curr.size() ||
+        normalized_ref.empty() || !relative_rotation.allFinite() ||
+        !relative_translation.allFinite() ||
+        // recoverPose 通常将 t 归一化为 1；这里仍拒绝明确的近零输入，
+        // 以保护纯函数调用和异常求解结果。
+        relative_translation.norm() <= 1e-6) {
+        return quality;
+    }
+
+    std::vector<double> parallax_angles;
+    parallax_angles.reserve(normalized_ref.size());
+    int positive_depths = 0;
+    for (size_t i = 0; i < normalized_ref.size(); ++i) {
+        const Vec3 ray1(normalized_ref[i].x(), normalized_ref[i].y(), 1.0);
+        const Vec3 ray2_c2(normalized_curr[i].x(), normalized_curr[i].y(), 1.0);
+        if (!ray1.allFinite() || !ray2_c2.allFinite()) continue;
+
+        // 两条光线统一表达在第一帧坐标系：d1 与 R^T d2 的夹角就是
+        // 真实三角化角。纯旋转/近零基线时该角接近 0。
+        const Vec3 d1 = ray1.normalized();
+        const Vec3 d2 = (relative_rotation.transpose() * ray2_c2).normalized();
+        const double cos_angle = std::clamp(d1.dot(d2), -1.0, 1.0);
+        const double angle = std::acos(cos_angle);
+        if (!std::isfinite(angle)) continue;
+        Vec3 point_c1;
+        if (!triangulateNormalizedPoint(normalized_ref[i], normalized_curr[i],
+                                        relative_rotation, relative_translation,
+                                        point_c1)) {
+            continue;
+        }
+        parallax_angles.push_back(angle);
+        const Vec3 point_c2 = relative_rotation * point_c1 + relative_translation;
+        if (point_c1.z() > 1e-9 && point_c2.z() > 1e-9) positive_depths++;
+    }
+
+    if (parallax_angles.empty()) return quality;
+    const auto middle = parallax_angles.begin() + parallax_angles.size() / 2;
+    std::nth_element(parallax_angles.begin(), middle, parallax_angles.end());
+    quality.parallax_rad = *middle;
+    quality.triangulated_points = static_cast<int>(parallax_angles.size());
+    quality.positive_depth_ratio = quality.triangulated_points > 0
+        ? static_cast<double>(positive_depths) / quality.triangulated_points : 0.0;
+    quality.accepted = quality.parallax_rad >= min_parallax_rad &&
+                       quality.positive_depth_ratio >= min_positive_depth_ratio;
+    return quality;
+}
+
+bool includeLocalBALandmark(int observation_count, int min_observed) {
+    return observation_count >= min_observed;
+}
+
+SE3 rebaseAnchoredFramePose(
+    const SE3& frame_pose_cs,
+    const SE3& old_ref_pose_cs,
+    const SE3& new_ref_pose_cs) {
+    const SE3 T_ca = frame_pose_cs * old_ref_pose_cs.inverse();
+    return T_ca * new_ref_pose_cs;
+}
+
+void appendFormalObservations(
+    const Frame::Ptr& keyframe,
+    std::vector<ObservationState>& observations,
+    const std::unordered_set<MapPointId>* allowed_points = nullptr) {
+    if (!keyframe) return;
+    for (size_t i = 0; i < keyframe->map_points.size(); ++i) {
+        const auto& map_point = keyframe->map_points[i];
+        if (!map_point || i > std::numeric_limits<FeatureIndex>::max()) continue;
+        const Observation observation{
+            keyframe->id, static_cast<FeatureIndex>(i)};
+        if (!map_point->hasObservation(observation)) continue;
+        if (allowed_points && !allowed_points->contains(map_point->id)) continue;
+
+        ObservationState state;
+        state.keyframe_id = keyframe->id;
+        state.feature_index = static_cast<FeatureIndex>(i);
+        state.map_point_id = map_point->id;
+        if (i < keyframe->keypoints.size()) {
+            state.pixel = Vec2(keyframe->keypoints[i].pt.x,
+                               keyframe->keypoints[i].pt.y);
+        }
+        if (i < keyframe->pts_c.size() && keyframe->pts_c[i].allFinite() &&
+            keyframe->pts_c[i].z() > 0.0) {
+            state.camera_point = keyframe->pts_c[i];
+        }
+        observations.push_back(std::move(state));
+    }
+}
 
 VOConfig VOConfig::fromYaml(const std::string& path) {
     VOConfig cfg;
@@ -33,7 +162,9 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
         }
         if (auto v = root["VO"]) {
             if (v["method"])              cfg.feature_method       = v["method"].as<int>();
+            if (v["min_parallax"])        cfg.min_parallax           = v["min_parallax"].as<double>();
             if (v["min_matches_init"])    cfg.min_matches_init     = v["min_matches_init"].as<int>();
+            if (v["min_init_inliers"])    cfg.min_init_inliers     = v["min_init_inliers"].as<int>();
             if (v["min_matches_track"])   cfg.min_matches_track    = v["min_matches_track"].as<int>();
             if (v["pnp_min_inliers"])     cfg.pnp_min_inliers      = v["pnp_min_inliers"].as<int>();
             if (v["pnp_min_inlier_ratio"]) cfg.pnp_min_inlier_ratio = v["pnp_min_inlier_ratio"].as<double>();
@@ -206,7 +337,13 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     }
     if (curr_frame_->keypoints.empty()) {
         LOG_WARN("No features extracted, skipping frame");
-        if (state_ != State::INITIALIZING && ref_frame_) {
+        // 即使本帧没有特征，也要先在地图读锁内捕获一致的参考位姿/锚点；
+        // 早退路径不得直接读取可能被回环提交改写的 live ref_frame_。
+        {
+            std::shared_lock<std::shared_mutex> lock(map_mutex_);
+            snap_ = captureTrackingSnapshot();
+        }
+        if (state_ != State::INITIALIZING && snap_.has_ref) {
             tracking_failures_++;
             state_ = tracking_failures_ >= cfg_.max_tracking_failures
                 ? State::LOST : State::RECOVERING;
@@ -214,7 +351,7 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
             // M3：last_valid_pose_world_ 是世界系，存回局部系需组合 T_ws
             curr_frame_->pose_cs = has_last_valid_pose_
                 ? last_valid_pose_world_ * snap_.T_ws
-                : ref_frame_->pose_cs;
+                : (snap_.has_ref ? snap_.ref_pose_cs : SE3());
         }
         updateStatus(0, 0, 0.0);
         return (state_ != State::INITIALIZING)
@@ -300,43 +437,57 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     }
 
     prev_frame_ = curr_frame_;
-    if (state_ == State::TRACKING && status_.tracking_valid) {
-        if (has_last_valid_pose_) {
-            // 记录逐帧相对运动（世界系 Twc 语义，M3：由局部位姿组合 T_ws 得到），
-            // LOST 期匀速外推锚点用——基线必须与世界系轨迹一致
-            const SE3 X_cur = (curr_frame_->pose_cs * snap_.T_ws.inverse()).inverse();
-            const SE3 X_last = last_valid_pose_world_.inverse();
-            per_frame_motion_ = X_last.inverse() * X_cur;
-            has_per_frame_motion_ = true;
-        }
-        // 世界系 T_cw（轨迹/验收基线与轨迹条目同一坐标系）
-        last_valid_pose_world_ = curr_frame_->pose_cs * snap_.T_ws.inverse();
-        has_last_valid_pose_ = true;
-        tracking_failures_ = 0;
-    }
     updateStatus(status_.matches, status_.inliers, status_.parallax);
     status_.pose_valid = status_.tracking_valid && status_.map_connected;
-    // pose_cs.t 是子地图原点在相机系中的坐标，不是相机位置。
-    // 轨迹必须记录世界系相机光心（由 T_ws 组合，M3 唯一世界边界之一）。
-    if (status_.pose_valid) {
-        // M4：只记录锚定关键帧 + 局部运动；世界位姿由
-        // composePoseTrajectory 读时组合（回环/对齐自动跟随锚点）。
-        // 关键帧帧：锚定自己（T_ca = I）——帧首快照的 ref 是"上一关键帧"，
-        // 若本帧处理期间发生回环校正（PGO 挪动本帧 KF 位姿），快照 ref 与
-        // 本帧位姿的差会被误记为 26m 级 T_ca，产生锚定跳变（KITTI 实测）。
-        // 子地图重建帧（snap_.has_ref=false）：同样锚定自己。
-        std::lock_guard<std::mutex> lock(traj_mutex_);
+    SE3 output_pose;
+    {
+        // 回环提交与前端收尾共享同一地图快照；锁序固定为 map → traj，
+        // 且此临界区不调用会再次获取 map_mutex_ 的函数。
+        std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
+        // 先构造与持久轨迹完全相同的锚定记录，再从 live anchor 组合本帧
+        // 世界位姿。后端若在普通帧跟踪期间校正参考 KF，不能继续用旧
+        // snap_.ref_pose_cs 更新 last_valid_pose_world_，否则下一帧会把整次
+        // 回环校正误判成相邻运动并进入 LOST。
         FramePoseRecord rec;
-        rec.frame_id = curr_frame_->id;
-        rec.submap_id = snap_.submap_id;
-        const bool self_anchor = !snap_.has_ref || ref_frame_ == curr_frame_;
-        rec.anchor_kf_id = self_anchor ? curr_frame_->id : snap_.ref_kf_id;
-        rec.T_ca = self_anchor ? SE3()
-            : curr_frame_->pose_cs * snap_.ref_pose_cs.inverse();
-        rec.valid = true;
-        pose_records_.push_back(rec);
+        bool has_record = false;
+        if (status_.pose_valid) {
+            const bool self_anchor = !snap_.has_ref || ref_frame_ == curr_frame_;
+            rec.frame_id = curr_frame_->id;
+            rec.submap_id = snap_.submap_id;
+            rec.anchor_kf_id = self_anchor ? curr_frame_->id : snap_.ref_kf_id;
+            rec.T_ca = self_anchor ? SE3()
+                : curr_frame_->pose_cs * snap_.ref_pose_cs.inverse();
+            rec.valid = true;
+            has_record = true;
+        }
+        const SE3 frame_pose_world = has_record
+            ? composeRecordWorld(rec)
+            : curr_frame_->pose_cs * snap_.T_ws.inverse();
+        if (state_ == State::TRACKING && status_.tracking_valid) {
+            if (has_last_valid_pose_) {
+                // 记录逐帧相对运动（世界系 Twc 语义，M3：由局部位姿组合 T_ws 得到），
+                // LOST 期匀速外推锚点用——基线必须与世界系轨迹一致
+                const SE3 X_cur = frame_pose_world.inverse();
+                const SE3 X_last = last_valid_pose_world_.inverse();
+                per_frame_motion_ = X_last.inverse() * X_cur;
+                has_per_frame_motion_ = true;
+            }
+            // 世界系 T_cw（轨迹/验收基线与轨迹条目同一坐标系）
+            last_valid_pose_world_ = frame_pose_world;
+            has_last_valid_pose_ = true;
+            tracking_failures_ = 0;
+        }
+        // pose_cs.t 是子地图原点在相机系的坐标，不是相机位置；轨迹必须
+        // 在同一 map 读快照下记录锚定信息并计算输出世界位姿。
+        if (has_record) {
+            // M4：只记录锚定关键帧 + 局部运动；世界位姿由
+            // composePoseTrajectory 读时组合（回环/对齐自动跟随锚点）。
+            std::lock_guard<std::mutex> traj_lock(traj_mutex_);
+            pose_records_.push_back(rec);
+        }
+        output_pose = frame_pose_world;
     }
-    return curr_frame_->pose_cs * snap_.T_ws.inverse();
+    return output_pose;
 }
 
 // ============================================================
@@ -400,7 +551,9 @@ void VisualOdometry::createMapPointsFromStereo(const Frame::Ptr& frame) {
     if (!camera_->hasPerFrameDepth()) return;
 
     int cnt = 0;
+    const bool registered = map_->getKeyFrame(frame->id) == frame;
     for (size_t i = 0; i < frame->keypoints.size(); i++) {
+        if (i >= frame->pts_c.size()) continue;
         if (frame->pts_c[i].z() > 0 && frame->map_points[i] == nullptr) {
             // M3：p_s = T_sc * p_c（pose_cs 的逆把相机系点转到子地图局部系）
             Vec3 p_s = frame->pose_cs.inverse() * frame->pts_c[i];
@@ -408,10 +561,18 @@ void VisualOdometry::createMapPointsFromStereo(const Frame::Ptr& frame) {
             mp->pos_s = p_s;
             if (!frame->descriptors.empty())
                 mp->descriptor = frame->descriptors.row((int)i).clone();
-            mp->observed_count = 1;  // 仅当前帧观测，后续跟踪帧会累加
             map_->insertMapPoint(mp);
-            frame->map_points[i] = mp;
-            cnt++;
+            // 已注册 KF 必须通过 Map 维护双向正式观测；初始化阶段的
+            // 未注册帧先写 slot，随后 insertKeyFrame 会统一 sync。
+            if (registered) {
+                if (!map_->setObservation(frame, static_cast<FeatureIndex>(i), mp)) {
+                    map_->removeMapPoint(mp->id);
+                    continue;
+                }
+            } else {
+                frame->map_points[i] = mp;
+            }
+            ++cnt;
         }
     }
     if (cnt > 0) LOG_INFO("Stereo map points created: " << cnt);
@@ -494,6 +655,7 @@ void VisualOdometry::createSubmap() {
         }
         map_ = submap->map;
         curr_frame_->pose_cs = SE3();
+        snap_.map = map_;
         snap_.T_ws = submap->T_ws;      // 刷新帧内快照锚（轨迹推/返回用）
         snap_.submap_id = submap->id;
         snap_.has_ref = false;          // 新子地图无参考帧
@@ -515,6 +677,8 @@ void VisualOdometry::createSubmap() {
 // 重定位只连坐标、不融合地图，连接处不跳变。
 // ============================================================
 bool VisualOdometry::solveAtlasConstraints() {
+    // 调用方必须持有 map_mutex_ 独占锁；这里故意不再获取该锁，避免
+    // 跨子地图重定位事务发生 shared_mutex 重入。
     const auto& subs = atlas_->submaps();
     if (subs.size() < 2) return false;
 
@@ -522,7 +686,9 @@ bool VisualOdometry::solveAtlasConstraints() {
     for (const auto& sub : subs) {
         KeyframeState ks;
         ks.id = sub.id;
-        ks.pose_cs = sub.T_ws;  // 位姿图数学与坐标系无关：X_b = X_a · T_rel
+        // solvePoseGraph 的节点契约是 T_cw，并在内部取逆为优化变量 T_wc；
+        // Atlas 节点本身就是 T_ws（局部系→世界系），故输入必须取逆。
+        ks.pose_cs = sub.T_ws.inverse();
         snap.keyframes.push_back(std::move(ks));
     }
     for (const auto& c : atlas_->constraints()) {
@@ -535,7 +701,8 @@ bool VisualOdometry::solveAtlasConstraints() {
     bool updated = false;
     for (const auto& u : result.poses) {
         if (auto* sub = atlas_->getSubmap(u.id)) {
-            sub->T_ws = u.pose_cs;
+            // 优化结果仍遵循 pose_cs/T_cw 契约，写回 Atlas 时恢复为 T_ws。
+            sub->T_ws = u.pose_cs.inverse();
             updated = true;
         }
     }
@@ -644,9 +811,12 @@ bool VisualOdometry::tryInitialize() {
                 updateStatus(0, 0, 0.0);
                 return false;
             }
-            ref_frame_ = curr_frame_;
-            createMapPointsFromStereo(ref_frame_);
-            map_->insertKeyFrame(ref_frame_);
+            {
+                std::unique_lock<std::shared_mutex> lock(map_mutex_);
+                ref_frame_ = curr_frame_;
+                createMapPointsFromStereo(ref_frame_);
+                map_->insertKeyFrame(ref_frame_);
+            }
             last_kf_frame_id_ = curr_frame_->id;
             LOG_INFO("Stereo init OK! (first frame, absolute scale) mp="
                      << map_->mapPointCount());
@@ -674,14 +844,63 @@ bool VisualOdometry::tryInitialize() {
     std::vector<cv::Point2f> pts1, pts2;
     FeatureMatcher::getMatchedPoints(ref_frame_, curr_frame_, matches, pts1, pts2);
 
+    cv::Mat essential_mask;
     cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_->K(),
-                                     cv::RANSAC, 0.999, 1.0);
+                                     cv::RANSAC, 0.999, 1.0,
+                                     essential_mask);
     cv::Mat R, t;
-    int inliers = cv::recoverPose(E, pts1, pts2, camera_->K(), R, t);
-    double parallax = cv::norm(t);
+    int inliers = E.empty() ? 0 : cv::recoverPose(
+        E, pts1, pts2, camera_->K(), R, t, essential_mask);
 
-    if (parallax < 0.1) {
-        LOG_INFO("Init: insufficient parallax (" << parallax << ")");
+    std::vector<Vec2> normalized_ref, normalized_curr;
+    std::vector<cv::DMatch> inlier_matches;
+    normalized_ref.reserve(pts1.size());
+    normalized_curr.reserve(pts2.size());
+    inlier_matches.reserve(matches.size());
+    for (size_t i = 0; i < pts1.size(); ++i) {
+        bool is_inlier = essential_mask.empty();
+        if (!essential_mask.empty()) {
+            is_inlier = essential_mask.rows == 1
+                ? essential_mask.at<uchar>(0, static_cast<int>(i)) != 0
+                : essential_mask.at<uchar>(static_cast<int>(i), 0) != 0;
+        }
+        if (!is_inlier) continue;
+        inlier_matches.push_back(matches[i]);
+        normalized_ref.emplace_back(
+            (pts1[i].x - camera_->cx) / camera_->fx,
+            (pts1[i].y - camera_->cy) / camera_->fy);
+        normalized_curr.emplace_back(
+            (pts2[i].x - camera_->cx) / camera_->fx,
+            (pts2[i].y - camera_->cy) / camera_->fy);
+    }
+
+    const int geometry_inliers = static_cast<int>(inlier_matches.size());
+    if (geometry_inliers < cfg_.min_init_inliers) {
+        LOG_INFO("Init: too few geometric inliers (" << geometry_inliers
+                 << ", need " << cfg_.min_init_inliers << ")");
+        ref_frame_ = curr_frame_;
+        updateStatus((int)matches.size(), inliers, 0.0);
+        return false;
+    }
+
+    Mat33 R_eigen = Mat33::Identity();
+    Vec3 t_eigen = Vec3::Zero();
+    if (!R.empty() && !t.empty()) {
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                R_eigen(i, j) = R.at<double>(i, j);
+        t_eigen = Vec3(t.at<double>(0), t.at<double>(1), t.at<double>(2));
+    }
+    const auto init_quality = assessMonocularInitialization(
+        normalized_ref, normalized_curr, R_eigen, t_eigen,
+        cfg_.min_parallax);
+    const double parallax = init_quality.parallax_rad;
+
+    if (!init_quality.accepted) {
+        LOG_INFO("Init: degenerate geometry (parallax=" << parallax
+                 << " rad, positive_depth_ratio="
+                 << init_quality.positive_depth_ratio << ", points="
+                 << init_quality.triangulated_points << ")");
         ref_frame_ = curr_frame_;
         updateStatus((int)matches.size(), inliers, parallax);
         return false;
@@ -691,21 +910,21 @@ bool VisualOdometry::tryInitialize() {
     // 后续子地图则继承全局位姿，避免重建后轨迹跳回原点。
     // recoverPose 返回的相对变换 T_rel 满足 p_c2 = T_rel * p_c1。
     SE3 anchor_cw = ref_frame_->pose_cs;
-    Eigen::Matrix3d R_eigen;
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-            R_eigen(i, j) = R.at<double>(i, j);
-    SE3 T_cw2(Eigen::Quaterniond(R_eigen),
-              Vec3(t.at<double>(0), t.at<double>(1), t.at<double>(2)));
+    SE3 T_cw2(Eigen::Quaterniond(R_eigen), t_eigen);
     curr_frame_->pose_cs = T_cw2 * anchor_cw;
 
-    triangulateNewPoints(ref_frame_, curr_frame_, matches);
-
-    map_->insertKeyFrame(ref_frame_);
-    map_->insertKeyFrame(curr_frame_);
-    odometry_edges_.push_back({
-        ref_frame_->id, curr_frame_->id,
-        ref_frame_->pose_cs * curr_frame_->pose_cs.inverse(), 1.0});
+    {
+        std::unique_lock<std::shared_mutex> lock(map_mutex_);
+        triangulateNewPoints(ref_frame_, curr_frame_, inlier_matches);
+        map_->insertKeyFrame(ref_frame_);
+        map_->insertKeyFrame(curr_frame_);
+        const auto shared_points = map_->sharedObservationCount(
+            ref_frame_->id, curr_frame_->id);
+        odometry_edges_.push_back({
+            ref_frame_->id, curr_frame_->id,
+            ref_frame_->pose_cs * curr_frame_->pose_cs.inverse(),
+            1.0 + std::log2(1.0 + static_cast<double>(shared_points))});
+    }
     last_kf_frame_id_ = curr_frame_->id;   // 初始化插入的两个关键帧也参与冷却
 
     LOG_INFO("Init OK! parallax=" << parallax << " inliers=" << inliers
@@ -905,7 +1124,6 @@ SE3 VisualOdometry::trackFrame() {
                     if (idx < 0 || idx >= (int)match_idx.size()) continue;
                     auto& mp = snap_.ref_mps[matches[match_idx[idx]].queryIdx];
                     if (mp) {
-                        mp->observed_count++;
                         curr_frame_->map_points[matches[match_idx[idx]].trainIdx] = mp;
                     }
                 }
@@ -927,30 +1145,31 @@ SE3 VisualOdometry::trackFrame() {
     // 对极几何回退（仅单目：recoverPose 的 t 归一化，双目有绝对尺度不可用）
     // recoverPose 返回 T_rel 满足 p_c2 = T_rel * p_c1 → T_cw2 = T_rel * T_cw1
     if (!camera_->hasPerFrameDepth() && matches.size() >= (size_t)cfg_.min_matches_track) {
+        const SE3 ref_pose_cs = snap_.ref_pose_cs;
         std::vector<cv::Point2f> pts1, pts2;
         FeatureMatcher::getMatchedPoints(ref_frame_, curr_frame_, matches, pts1, pts2);
         cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_->K(), cv::RANSAC, 0.999, 1.0);
         cv::Mat R, t;
         cv::recoverPose(E, pts1, pts2, camera_->K(), R, t);
         SE3 T_rel = matToSE3(R, t);
-        curr_frame_->pose_cs = T_rel * ref_frame_->pose_cs;
+        curr_frame_->pose_cs = T_rel * ref_pose_cs;
         inliers_cnt = (int)matches.size();
         // 对极恢复的 t 只有方向无尺度，组合后可能跳变 → 同样做跳变保护
         SE3 Twc_new = curr_frame_->pose_cs.inverse();
-        SE3 Twc_ref = ref_frame_->pose_cs.inverse();
+        SE3 Twc_ref = ref_pose_cs.inverse();
         if ((Twc_new.t - Twc_ref.t).norm() > 30.0) {
             LOG_WARN("Epipolar fallback pose jump (" << (Twc_new.t - Twc_ref.t).norm()
                      << "m), tracking lost");
-            curr_frame_->pose_cs = ref_frame_->pose_cs;
+            curr_frame_->pose_cs = ref_pose_cs;
             state_ = State::RECOVERING;
             updateStatus((int)matches.size(), 0, 0.0);
-            return ref_frame_->pose_cs;
+            return ref_pose_cs;
         }
         status_.tracking_valid = true;
         status_.pose_method = "EPIPOLAR";
     } else {
         // 匹配太少 → LOST
-        curr_frame_->pose_cs = ref_frame_->pose_cs;
+        curr_frame_->pose_cs = snap_.ref_pose_cs;
         state_ = State::RECOVERING;
         LOG_WARN("Tracking lost! matches=" << matches.size()
                  << " pts3d=" << pts3d.size()
@@ -1071,7 +1290,7 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
     status_.pose_rmse = quality.pose_rmse;
     status_.translation_delta = quality.translation;
     status_.rotation_delta = quality.rotation;
-    // 关联内点（共视统计 + observed_count）
+    // 关联内点：普通跟踪帧只保留临时 map_points 指针，不产生正式观测。
     int inl_cnt = 0;
     for (size_t i = 0; i < inliers.total() && i < idx3.size(); i++) {
         if (!inliers.at<uchar>(i)) continue;
@@ -1079,7 +1298,6 @@ bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
         int k = idx3[i];
         auto& mp = snap_.ref_mps[matches[k].queryIdx];
         if (mp) {
-            mp->observed_count++;
             curr_frame_->map_points[matches[k].trainIdx] = mp;
         }
     }
@@ -1137,12 +1355,8 @@ SE3 VisualOdometry::trackFrameLK() {
                 status_.pose_rmse = quality.pose_rmse;
                 status_.translation_delta = quality.translation;
                 status_.rotation_delta = quality.rotation;
-                for (int idx : inliers) {
-                    if (idx >= 0 && idx < (int)kp_idx.size()) {
-                        auto& mp = curr_frame_->map_points[kp_idx[idx]];
-                        if (mp) mp->observed_count++;
-                    }
-                }
+                // 普通 LK 跟踪帧只继承临时地图点指针；正式观测仅由
+                // 关键帧插入/Map::setObservation 记录。
                 updateStatus((int)pts3d.size(), inliers_cnt, 0.0);
                 return curr_frame_->pose_cs;
             }
@@ -1192,6 +1406,8 @@ bool VisualOdometry::tryRelocalize() {
     size_t best_total = 0;
     SE3 best_pose;
     Frame::Ptr best_kf;
+    Map::Ptr best_map;
+    uint64_t best_geometry_revision = 0;
     unsigned long best_submap_id = 0;
 
     // 对单个关键帧做 PnP 匹配，内点达标(20)即返回 true
@@ -1205,8 +1421,17 @@ bool VisualOdometry::tryRelocalize() {
 
         std::vector<cv::Point3f> pts3d;
         std::vector<cv::Point2f> pts2d;
+        Map::Ptr candidate_map;
+        uint64_t candidate_geometry_revision = 0;
         {
             std::shared_lock<std::shared_mutex> lock(map_mutex_);  // P1：读路径共享锁
+            const auto* submap = atlas_->getSubmap(submap_id);
+            if (!submap || !submap->map ||
+                submap->map->getKeyFrame(kf->id).get() != kf.get()) {
+                return false;
+            }
+            candidate_map = submap->map;
+            candidate_geometry_revision = candidate_map->geometryRevision();
             for (auto& m : matches) {
                 auto& mp = kf->map_points[m.queryIdx];
                 if (mp) {
@@ -1235,6 +1460,8 @@ bool VisualOdometry::tryRelocalize() {
             best_total = pts3d.size();
             best_pose = matToSE3(cv::Mat(rvec), tvec);
             best_kf = kf;
+            best_map = candidate_map;
+            best_geometry_revision = candidate_geometry_revision;
             best_submap_id = submap_id;
             best_rmse = rmse;
         }
@@ -1268,28 +1495,59 @@ bool VisualOdometry::tryRelocalize() {
         // 候选保持 LOST（不写位姿、不换子地图、状态完全不变）。
         // M3：best_pose 是候选子地图局部系（T_cs），必须组合该子地图 T_ws
         // 到世界系再与基线（世界系）比较——跨子地图坐标差异不再被当作跳变。
-        const auto* cur_sub = atlas_->activeSubmap();
-        const unsigned long cur_sub_id = cur_sub ? cur_sub->id : best_submap_id;
-        const bool cross_submap = cur_sub && best_submap_id != cur_sub->id;
+        // PnP 在锁外计算；最终接受必须重新绑定同一 Map/Submap/KF 与几何版本。
+        // 否则后台 BA/回环可在 PnP 期间更新点/KF，旧 best_pose 会被错误地
+        // 绑定到 live 新参考帧。锁保持到 Atlas 求解、activate 和帧写入完成。
+        std::unique_lock<std::shared_mutex> reloc_lock(map_mutex_);
+        const auto* locked_candidate = atlas_->getSubmap(best_submap_id);
+        const auto locked_best_kf = locked_candidate && locked_candidate->map
+            ? locked_candidate->map->getKeyFrame(best_kf->id) : nullptr;
+        if (!best_map || !locked_candidate || locked_candidate->map != best_map ||
+            !locked_best_kf || locked_best_kf.get() != best_kf.get() ||
+            best_map->geometryRevision() != best_geometry_revision) {
+            LOG_WARN("Relocation candidate geometry became stale, dropped");
+            reloc_lock.unlock();
+            updateStatus(0, 0, 0.0);
+            return false;
+        }
+
+        unsigned long cur_sub_id = best_submap_id;
+        bool cross_submap = false;
         SE3 best_T_ws;
         bool found_tws = false;
-        for (const auto& sub : atlas_->submaps()) {
-            if (sub.id == best_submap_id) {
-                best_T_ws = sub.T_ws;
-                found_tws = true;
-                break;
-            }
+        const auto* cur_sub = atlas_->activeSubmap();
+        cur_sub_id = cur_sub ? cur_sub->id : best_submap_id;
+        cross_submap = cur_sub && best_submap_id != cur_sub->id;
+        if (locked_candidate) {
+            best_T_ws = locked_candidate->T_ws;
+            found_tws = true;
         }
         // M5：跨子地图重定位——先生成 Relocalization 约束、优化 Atlas 锚点、
         // 再验收（§14.5：不立即 activate + 覆盖位姿）。事务式：失败回滚。
         std::vector<SE3> saved_tws;
         size_t saved_constraints = 0;
+        SE3 saved_snap_tws = snap_.T_ws;
+        PoseQuality quality;
+        bool quality_ok = false;
         if (cross_submap && found_tws && has_last_valid_pose_) {
+            // 约束新增、T_ws 快照、求解写回全部在同一 Atlas 写事务中。
+            const auto* locked_cur_sub = atlas_->activeSubmap();
+            if (!locked_cur_sub || locked_cur_sub->id != cur_sub_id ||
+                !locked_candidate) {
+                LOG_WARN("Atlas relocation became stale before constraint solve");
+                reloc_lock.unlock();
+                updateStatus(0, 0, 0.0);
+                return false;
+            }
+            saved_tws.reserve(atlas_->submaps().size());
             for (const auto& sub : atlas_->submaps()) saved_tws.push_back(sub.T_ws);
             saved_constraints = atlas_->constraints().size();
+            saved_snap_tws = snap_.T_ws;
+            best_T_ws = locked_candidate->T_ws;
             // 约束：T_ws_cand = T_ws_cur · T_rel，T_rel = T_cs_cur⁻¹ · T_cs_cand
             //（相机同一世界位姿：T_cs_cur ∘ T_ws_cur⁻¹ = T_cs_cand ∘ T_ws_cand⁻¹）
-            const SE3 T_cs_cur = relocBaselineWorld().inverse() * cur_sub->T_ws;
+            const SE3 T_cs_cur = relocBaselineWorld().inverse()
+                * locked_cur_sub->T_ws;
             AtlasConstraint rc;
             rc.a = cur_sub_id;
             rc.b = best_submap_id;
@@ -1297,68 +1555,80 @@ bool VisualOdometry::tryRelocalize() {
             rc.weight = 1.0;
             rc.type = AtlasConstraintType::Relocalization;
             atlas_->addConstraint(rc);
-            if (solveAtlasConstraints()) {
-                for (const auto& sub : atlas_->submaps()) {
-                    if (sub.id == best_submap_id) best_T_ws = sub.T_ws;
-                    if (sub.id == cur_sub_id) snap_.T_ws = sub.T_ws;
-                }
-            } else {
+            if (!solveAtlasConstraints()) {
                 LOG_WARN("Atlas constraint solve failed, rolling back reloc");
                 atlas_->removeConstraintsFrom(saved_constraints);
                 size_t k = 0;
-                for (auto& sub : atlas_->submaps()) {
-                    if (auto* s = atlas_->getSubmap(sub.id)) s->T_ws = saved_tws[k];
-                    k++;
+                for (const auto& sub : atlas_->submaps()) {
+                    if (auto* saved_sub = atlas_->getSubmap(sub.id))
+                        saved_sub->T_ws = saved_tws[k];
+                    ++k;
                 }
+                snap_.T_ws = saved_snap_tws;
+                reloc_lock.unlock();
                 updateStatus(0, 0, 0.0);
                 return false;
             }
-        }
-        PoseQuality quality;
-        if (!acceptPose(
+            for (const auto& sub : atlas_->submaps()) {
+                if (sub.id == best_submap_id) best_T_ws = sub.T_ws;
+                if (sub.id == cur_sub_id) snap_.T_ws = sub.T_ws;
+            }
+            // 验收也必须在同一写事务中完成，避免失败结果短暂暴露给
+            // 轨迹/Viewer 读者；拒绝时在释放锁前恢复全部 Atlas 状态。
+            quality_ok = acceptPose(
+                best_pose * best_T_ws.inverse(), best_inliers, best_total,
+                best_rmse, true /* reloc_mode */, quality);
+            if (!quality_ok) {
+                LOG_WARN("Reloc rejected after Atlas solve, rolling back reloc");
+                atlas_->removeConstraintsFrom(saved_constraints);
+                size_t k = 0;
+                for (const auto& sub : atlas_->submaps()) {
+                    if (auto* saved_sub = atlas_->getSubmap(sub.id))
+                        saved_sub->T_ws = saved_tws[k];
+                    ++k;
+                }
+                snap_.T_ws = saved_snap_tws;
+                reloc_lock.unlock();
+                updateStatus(0, 0, 0.0);
+                return false;
+            }
+        } else {
+            quality_ok = acceptPose(
                 found_tws ? best_pose * best_T_ws.inverse() : best_pose,
                 best_inliers, best_total, best_rmse,
-                true /* reloc_mode */, quality)) {
+                true /* reloc_mode */, quality);
+        }
+        if (!quality_ok) {
             LOG_WARN("Reloc rejected by unified acceptance: inliers="
                      << best_inliers << " ratio=" << quality.inlier_ratio
                      << " dtrans=" << quality.translation
                      << "m drot=" << quality.rotation * 180.0 / M_PI << "deg");
-            // M5：约束求解已改动 Atlas → 事务回滚（§14.1-7）
-            if (cross_submap && found_tws && has_last_valid_pose_) {
-                atlas_->removeConstraintsFrom(saved_constraints);
-                size_t k = 0;
-                for (const auto& sub : atlas_->submaps()) {
-                    if (auto* s = atlas_->getSubmap(sub.id)) s->T_ws = saved_tws[k];
-                    k++;
-                }
-            }
+            reloc_lock.unlock();
             updateStatus(0, 0, 0.0);
             return false;
         }
-        // 换地图需与后端写回互斥（后端校正期间写的是旧 map_）
-        // 注意：块内不得调用 updateStatus（它内部会再次 lock(map_mutex_)，
-        // 非递归锁重入会死锁——实测卡死复现点）
-        {
-            std::unique_lock<std::shared_mutex> lock(map_mutex_);  // P1：换地图为写路径（独占）
-            atlas_->activate(best_submap_id);
-            map_ = atlas_->activeMap();
-            curr_frame_->pose_cs = best_pose;
-            ref_frame_ = best_kf;
-            // M3：本帧轨迹推/返回与验收基线需要新子地图锚
-            snap_.T_ws = best_T_ws;
-            snap_.submap_id = best_submap_id;
-            snap_.topology_revision = map_->topologyRevision();
-            snap_.geometry_revision = map_->geometryRevision();
-            snap_.has_ref = true;
-            snap_.ref_kf_id = best_kf->id;   // M4：轨迹锚点
-            snap_.ref_pose_cs = best_kf->pose_cs;
-            snap_.ref_mps = best_kf->map_points;
-            snap_.ref_points_s.resize(best_kf->map_points.size(), Vec3::Zero());
-            for (size_t i = 0; i < best_kf->map_points.size(); i++) {
-                if (best_kf->map_points[i])
-                    snap_.ref_points_s[i] = best_kf->map_points[i]->pos_s;
-            }
+        // 同一独占事务中切换地图并绑定 live 参考 KF，旧 PnP 结果不能跨
+        // geometry revision 暴露给轨迹或下一帧。
+        atlas_->activate(best_submap_id);
+        map_ = atlas_->activeMap();
+        curr_frame_->pose_cs = best_pose;
+        ref_frame_ = best_kf;
+        // M3：本帧轨迹推/返回与验收基线需要新子地图锚
+        snap_.T_ws = best_T_ws;
+        snap_.map = map_;
+        snap_.submap_id = best_submap_id;
+        snap_.topology_revision = map_->topologyRevision();
+        snap_.geometry_revision = map_->geometryRevision();
+        snap_.has_ref = true;
+        snap_.ref_kf_id = best_kf->id;   // M4：轨迹锚点
+        snap_.ref_pose_cs = best_kf->pose_cs;
+        snap_.ref_mps = best_kf->map_points;
+        snap_.ref_points_s.resize(best_kf->map_points.size(), Vec3::Zero());
+        for (size_t i = 0; i < best_kf->map_points.size(); i++) {
+            if (best_kf->map_points[i])
+                snap_.ref_points_s[i] = best_kf->map_points[i]->pos_s;
         }
+        reloc_lock.unlock();
         status_.tracking_valid = true;
         status_.pose_method = "RELOCALIZE";
         status_.inlier_ratio = quality.inlier_ratio;
@@ -1380,12 +1650,41 @@ bool VisualOdometry::tryRelocalize() {
 // ============================================================
 // 关键帧插入 + 三角化 + Local BA
 // ============================================================
-void VisualOdometry::insertKeyFrame() {
+bool VisualOdometry::insertKeyFrame() {
     const Frame::Ptr prev_kf = ref_frame_;
 
     // 地图集合/建点/edges 写入统一持独占锁（异步后端与后台线程互斥）
     {
         std::unique_lock<std::shared_mutex> lock(map_mutex_);  // P1：写路径（独占）
+
+        const auto* active_submap = atlas_->activeSubmap();
+        const bool same_identity = snap_.map == map_ && active_submap &&
+                                   active_submap->id == snap_.submap_id;
+        if (!same_identity || snap_.geometry_revision != map_->geometryRevision()) {
+            // 后端可能在本帧 PnP 之后、KF 插入之前完成回环。把旧几何帧直接
+            // 插入会冻结成不在 PGO 快照内的新锚点，下一条轨迹产生 40m 级跳变。
+            // 保留旧 T_ca，把本帧重基到已校正参考 KF；本帧只作为普通帧记录，
+            // 下一帧基于新几何重新跟踪并决定是否插 KF。
+            if (same_identity && snap_.has_ref) {
+                const auto live_ref = map_->getKeyFrame(snap_.ref_kf_id);
+                if (live_ref && live_ref.get() == ref_frame_.get()) {
+                    curr_frame_->pose_cs = rebaseAnchoredFramePose(
+                        curr_frame_->pose_cs, snap_.ref_pose_cs,
+                        live_ref->pose_cs);
+                    snap_ = captureTrackingSnapshot();
+                }
+            }
+            LOG_WARN("Keyframe insertion skipped: tracking geometry changed in-flight");
+            return false;
+        }
+
+        // LK 普通帧的 keypoints/map_points 只是临时跟踪索引。关键帧必须先
+        // 重提 ORB，再按新索引重算双目深度，之后才能注册 slot/正式观测；
+        // 否则先 insertKeyFrame 或先建点都会在 extract 后留下反向 stale obs。
+        if (cfg_.feature_method == 1) {
+            feature_matcher_.extract(curr_frame_);
+            computeStereoDepths();
+        }
         map_->insertKeyFrame(curr_frame_);
 
         // 子地图重建后延迟对齐：等新子地图有 ≥3 个关键帧（拟合最低点数），
@@ -1395,10 +1694,8 @@ void VisualOdometry::insertKeyFrame() {
             submap_needs_alignment_ = false;
         }
 
-        // 定期清理观测不足的地图点（每 20 个关键帧一次），防止地图无限增长。
-        // 必须在建新点之前执行：若在建点后剔除，本轮 createMapPointsFromStereo
-        // 刚创建的点（observed_count=1）会被 cullMapPoints(2) 当场删除，参考
-        // 关键帧瞬间失去全部新点，后续帧 PnP 可用 3D 点骤减 → 垃圾解 → LOST。
+        // 定期清理正式观测不足的地图点（每 20 个关键帧一次），防止地图无限增长。
+        // 必须在建新点之前，避免本轮新点在正式观测尚未补齐时被清理。
         {
             PERF_SCOPE("kf.cull");
             if (map_->keyFrameCount() % 20 == 0)
@@ -1409,11 +1706,6 @@ void VisualOdometry::insertKeyFrame() {
         {
             PERF_SCOPE("kf.build_points");
             createMapPointsFromStereo(curr_frame_);
-            // LK 模式：关键帧用干净的 ORB 特征重建（LK 关键点无方向，描述子无法与
-            // 历史关键帧匹配），保证与上一关键帧的 ORB 匹配/三角化可靠；
-            // 普通帧仍用 LK 光流跟踪（从关键帧 ORB 特征出发）
-            if (cfg_.feature_method == 1)
-                feature_matcher_.extract(curr_frame_);
             triangulateNewPoints(ref_frame_, curr_frame_,
                 feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
         }
@@ -1421,16 +1713,12 @@ void VisualOdometry::insertKeyFrame() {
         // Local BA 和新点关联完成后冻结相邻 KF 测量；后续位姿图不得从已优化
         // 轨迹重算它，否则会把上一次闭环结果误当成新的里程计观测。
         if (prev_kf) {
-            std::set<unsigned long> prev_mp_ids;
-            for (const auto& mp : prev_kf->map_points)
-                if (mp) prev_mp_ids.insert(mp->id);
-            int covisibility = 0;
-            for (const auto& mp : curr_frame_->map_points)
-                if (mp && prev_mp_ids.count(mp->id)) covisibility++;
+            const auto covisibility = map_->sharedObservationCount(
+                prev_kf->id, curr_frame_->id);
             odometry_edges_.push_back({
                 prev_kf->id, curr_frame_->id,
                 prev_kf->pose_cs * curr_frame_->pose_cs.inverse(),
-                1.0 + std::log2(1.0 + covisibility)});
+                1.0 + std::log2(1.0 + static_cast<double>(covisibility))});
         }
     }
     ref_frame_ = curr_frame_;
@@ -1441,18 +1729,24 @@ void VisualOdometry::insertKeyFrame() {
     if (cfg_.async_backend) {
         // ---- 异步路径：Local BA / 回环检测+校正 提交后台线程 ----
         if (cfg_.enable_local_ba) {
-            std::vector<Frame::Ptr> window;
-            {
-                std::shared_lock<std::shared_mutex> lock(map_mutex_);  // P1：选窗为读路径
-                window = selectLocalWindow(cfg_.local_window_size);
-            }
             BackendTask task;
             task.type = BackendTask::Type::LocalBA;
-            task.window = std::move(window);
+            {
+                std::shared_lock<std::shared_mutex> lock(map_mutex_);  // P1：选窗为读路径
+                task.window = selectLocalWindow(cfg_.local_window_size);
+                task.map = map_;
+                const auto* active_submap = atlas_->activeSubmap();
+                task.submap_id = active_submap ? active_submap->id : 0;
+            }
+            task.anchor_kf_id = curr_frame_->id;
             submitBackendTask(std::move(task));
         }
         if (loop_closure_enabled_ && loop_closure_) {
-            loop_closure_->addKeyFrame(curr_frame_);
+            // LoopClosure 读取 KF 的 pose/descriptor；保持 map → loop 锁序。
+            {
+                std::shared_lock<std::shared_mutex> lock(map_mutex_);
+                loop_closure_->addKeyFrame(curr_frame_);
+            }
             if (map_->keyFrameCount() % (unsigned long)std::max(1, cfg_.detection_interval) == 0) {
                 const bool cooled = map_->keyFrameCount() - last_loop_kf_count_.load()
                     >= (unsigned long)cfg_.loop_cooldown_kfs;
@@ -1473,7 +1767,7 @@ void VisualOdometry::insertKeyFrame() {
             // 同步模式下每帧都可能插 KF，BA 若无跳过保护会把刚验收并记入轨迹的
             // 位姿挪动数米（地图质量差时可达 ~10m），连续轨迹条目随即产生
             // 10m 级跳变（KITTI 00 实测 205 次 >10m 跳变的直接来源，M0 修复）。
-            runWindowLocalBA(window);
+            runWindowLocalBA(window, curr_frame_->id);
         }
 
         // ============================================================
@@ -1481,7 +1775,11 @@ void VisualOdometry::insertKeyFrame() {
         // 放在 Local BA 之后，避免两处位姿修改互相干扰。
         // ============================================================
         if (loop_closure_enabled_ && loop_closure_) {
-            loop_closure_->addKeyFrame(curr_frame_);
+            // LoopClosure 读取 KF 的 pose/descriptor；保持 map → loop 锁序。
+            {
+                std::shared_lock<std::shared_mutex> lock(map_mutex_);
+                loop_closure_->addKeyFrame(curr_frame_);
+            }
             if (map_->keyFrameCount() % (unsigned long)std::max(1, cfg_.detection_interval) == 0) {
                 // 回环校正冷却：上次校正后至少间隔 N 个关键帧才允许再次校正。
                 // 同一区域会被词袋反复命中（分数高），连续校正会让 S_global
@@ -1489,20 +1787,36 @@ void VisualOdometry::insertKeyFrame() {
                 const bool cooled = map_->keyFrameCount() - last_loop_kf_count_.load()
                     >= (unsigned long)cfg_.loop_cooldown_kfs;
                 if (cooled) {
-                    auto cands = loop_closure_->detectLoop(curr_frame_);
+                    std::vector<Frame::Ptr> cands;
+                    {
+                        // 保持 map → LoopClosure 锁序；候选发现本身不构成提交，
+                        // 最终验证/快照/写回由 handleLoopCorrection 事务重做。
+                        std::shared_lock<std::shared_mutex> lock(map_mutex_);
+                        cands = loop_closure_->detectLoop(curr_frame_);
+                    }
                     for (auto& cand : cands) {
                         // DBoW3 数据库跨 Atlas 子地图缓存；当前尚未实现跨尺度
                         // 子地图融合，不能把另一张 map 的候选伪装成本图闭环。
-                        if (!map_->getKeyFrame(cand->id)) {
-                            LOG_WARN("LoopClosure: cross-submap candidate kf#"
-                                     << cand->id << " rejected");
-                            continue;
+                        LoopCorrectionContext context;
+                        {
+                            std::shared_lock<std::shared_mutex> lock(map_mutex_);
+                            const auto live_curr = map_->getKeyFrame(curr_frame_->id);
+                            const auto live_loop = map_->getKeyFrame(cand->id);
+                            const auto* active_submap = atlas_->activeSubmap();
+                            if (!live_curr || live_curr.get() != curr_frame_.get() ||
+                                !live_loop || live_loop.get() != cand.get() ||
+                                !active_submap) continue;
+                            context.map = map_;
+                            context.submap_id = active_submap->id;
+                            context.topology_revision = map_->topologyRevision();
+                            context.geometry_revision = map_->geometryRevision();
+                            context.curr_kf_id = curr_frame_->id;
+                            context.loop_kf_id = cand->id;
+                            context.curr_kf = curr_frame_;
+                            context.loop_kf = cand;
                         }
-                        SE3 T_loop_curr;
-                        if (loop_closure_->verifyLoop(curr_frame_, cand, T_loop_curr)) {
-                            handleLoopCorrection(T_loop_curr, curr_frame_, cand);
-                            break;  // 第一个验证通过的候选即回环
-                        }
+                        if (context.map && handleLoopCorrection(context))
+                            break;  // 第一个成功提交的候选即回环
                     }
                 }
             }
@@ -1510,30 +1824,60 @@ void VisualOdometry::insertKeyFrame() {
     }
 
     updateStatus(status_.matches, status_.inliers, status_.parallax);
+    return true;
 }
 
 // ============================================================
 // Phase 2 回环校正：位姿图优化 → 地图点同步 → 全局 BA → 逐帧轨迹同步
-// 三阶段设计（异步后端 P2-1）：
-//   阶段 1 锁内收集工作集（快照 KF/点/edges/轨迹，深拷贝隔离）
-//   阶段 2 锁外计算（位姿图 / 点同步 / 全局 BA / 轨迹插值——不触碰地图数据）
-//   阶段 3 锁内写回（真 KF 位姿 / 真点坐标 / 轨迹替换）
-// 同步路径（async_backend=false）由主线程直接调用同一实现，锁无竞争。
+// 单事务设计：身份确认、verifyLoop、全图快照、PGO/GBA 与写回均持有同一
+// map_mutex_ 独占锁；优化只消费锁内创建的深拷贝，避免阶段间 stale 饥饿。
+// 同步/异步路径都走同一事务，回环期间前端写入短暂阻塞。
 // ============================================================
-void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
-                                          const Frame::Ptr& kf_curr,
-                                          const Frame::Ptr& kf_loop) {
-    // ---- 阶段 1：锁内收集只读快照（M1 纯数据，不深拷贝对象）----
+bool VisualOdometry::handleLoopCorrection(
+    const LoopCorrectionContext& context) {
+    // 回环是全图事务：锁从最终身份确认一直持有到 PGO/GBA 与原子提交完成。
+    // 这会短暂阻塞前端 KF/Local BA 写入，但消除了“验证→快照→提交”之间的
+    // topology/geometry 版本饥饿；锁序固定为 map → LoopClosure，禁止反向回调。
+    std::unique_lock<std::shared_mutex> map_lock(map_mutex_);
+
+    const auto* active_submap = atlas_->activeSubmap();
+    const auto live_curr = context.map
+        ? context.map->getKeyFrame(context.curr_kf_id) : nullptr;
+    const auto live_loop = context.map
+        ? context.map->getKeyFrame(context.loop_kf_id) : nullptr;
+    if (!context.map || map_ != context.map || !active_submap ||
+        active_submap->id != context.submap_id ||
+        !live_curr || live_curr.get() != context.curr_kf.get() ||
+        !live_loop || live_loop.get() != context.loop_kf.get()) {
+        LOG_WARN("Loop correction identity changed before transaction");
+        return false;
+    }
+
+    // 候选可能在锁外发现后经历 Local BA/新增 KF；不能复用旧 T_loop_curr。
+    // 在同一 map 独占锁下重新验证，LoopClosure 只取得自己的 mutex，故无反向
+    // map 锁重入，且验证使用的 KF/地图点状态与下方全图快照完全一致。
+    SE3 T_loop_curr;
+    if (!loop_closure_ || !loop_closure_->verifyLoop(
+            live_curr, live_loop, T_loop_curr)) {
+        LOG_WARN("Loop correction verification failed in transaction");
+        return false;
+    }
+
+    // ---- 阶段 1：在同一事务锁内收集只读快照（M1 纯数据）----
     std::vector<KeyframeState> kf_states;                 // 全部 KF（id 升序，pose_cs）
     std::unordered_map<unsigned long, SE3> old_pose;      // KF id → 优化前 pose_cs
     std::unordered_map<unsigned long, unsigned long> mp_ref_kf;  // 点 id → 参考 KF id
     std::vector<LandmarkState> points;                    // 全量点快照（坐标 + 观测数）
+    std::vector<ObservationState> observations;           // 全量正式观测快照
     std::vector<Constraint> constraints;                  // 里程计边 + 累计回环边 + 新边
     uint64_t snap_topology = 0, snap_geometry = 0;
+    unsigned long submap_id = 0;
+    Map::Ptr snap_map;
     {
-        std::shared_lock<std::shared_mutex> lock(map_mutex_);
+        snap_map = map_;
         auto all_kfs = map_->getAllKeyFrames();
-        if (all_kfs.size() < 2) return;
+        if (all_kfs.size() < 2) return false;
+        submap_id = context.submap_id;
         snap_topology = map_->topologyRevision();
         snap_geometry = map_->geometryRevision();
         kf_states.reserve(all_kfs.size());
@@ -1542,21 +1886,21 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
             KeyframeState ks;
             ks.id = kf->id;
             ks.pose_cs = kf->pose_cs;
-            // 观测（keypoints + 点 id）：PGO 不用，但回环后的全局 BA 需要
-            // 重投影边（M1 回归修复：此前 GBA 恒 0 边被跳过）
-            ks.keypoints = kf->keypoints;
-            ks.map_points.resize(kf->map_points.size(), 0);
-            for (size_t i = 0; i < kf->map_points.size(); i++)
-                if (kf->map_points[i]) ks.map_points[i] = kf->map_points[i]->id;
             kf_states.push_back(std::move(ks));
+            appendFormalObservations(kf, observations);
         }
-        // 点参考 KF 映射（最早观测）+ 全量点快照
-        for (const auto& kf : all_kfs) {
-            for (const auto& mp : kf->map_points)
-                if (mp) mp_ref_kf.emplace(mp->id, kf->id);
+        // 点参考 KF 映射（最早观测）+ 全量点快照。observations 已由
+        // appendFormalObservations 单遍生成；这里再单遍取最小 KF id，避免
+        // 在全图独占事务锁内做 KF×Observation 的灾难性嵌套扫描。
+        for (const auto& observation : observations) {
+            auto [it, inserted] = mp_ref_kf.emplace(
+                observation.map_point_id, observation.keyframe_id);
+            if (!inserted && observation.keyframe_id < it->second)
+                it->second = observation.keyframe_id;
         }
         for (auto& mp : map_->getAllMapPoints())
-            points.push_back({mp->id, mp->pos_s, mp->observed_count});
+            points.push_back({mp->id, mp->pos_s,
+                              static_cast<int>(mp->observationCount())});
         // 位姿图边：里程计边（无核）+ 累计回环边 + 本次新边（Huber + 预检）
         constraints.reserve(odometry_edges_.size() + loop_edges_.size() + 1);
         for (const auto& e : odometry_edges_)
@@ -1570,27 +1914,29 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
             bool dup = false;
             for (const auto& e : constraints) {
                 if (!e.is_loop) continue;
-                const bool a_close = std::abs((long long)e.a - (long long)kf_loop->id) < 200;
-                const bool b_close = std::abs((long long)e.b - (long long)kf_curr->id) < 200;
+                const bool a_close = std::abs((long long)e.a -
+                                               (long long)context.loop_kf_id) < 200;
+                const bool b_close = std::abs((long long)e.b -
+                                               (long long)context.curr_kf_id) < 200;
                 if (a_close && b_close) { dup = true; break; }
             }
             if (dup) {
                 LOG_WARN("Loop closure rejected: duplicate region (kf#"
-                         << kf_loop->id << " -> kf#" << kf_curr->id << ")");
-                return;
+                         << context.loop_kf_id << " -> kf#"
+                         << context.curr_kf_id << ")");
+                return false;
             }
         }
-        constraints.push_back({kf_loop->id, kf_curr->id, T_loop_curr, 10.0, true});
+        constraints.push_back({context.loop_kf_id, context.curr_kf_id,
+                               T_loop_curr, 10.0, true});
     }
-    // ---- 阶段 2：锁外纯计算（Optimizer 只读快照，绝不触碰实时地图）----
-    const auto* active_submap = atlas_->activeSubmap();
-    const unsigned long submap_id = active_submap ? active_submap->id : 0;
-
+    // ---- 阶段 2：事务锁内纯计算（只消费深拷贝快照，不触碰实时对象）----
     OptimizationSnapshot pgo_snap;
     pgo_snap.submap_id = submap_id;
     pgo_snap.topology_revision = snap_topology;
     pgo_snap.geometry_revision = snap_geometry;
     pgo_snap.keyframes = kf_states;
+    pgo_snap.observations = observations;
     pgo_snap.constraints = constraints;
 
     // final_pose：KF id → 最终位姿（PGO 结果，GBA 后部分精修）
@@ -1601,7 +1947,7 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
         auto pgo = Optimizer::solvePoseGraph(pgo_snap);
         if (!pgo.valid) {
             LOG_WARN("Loop correction skipped: pose graph backend unavailable or constraints invalid");
-            return;  // 不保留失败的回环边（未提交）
+            return false;  // 不保留失败的回环边（未提交）
         }
         final_pose.reserve(pgo.poses.size());
         for (const auto& u : pgo.poses)
@@ -1637,6 +1983,12 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
             if (it != final_pose.end()) gs.pose_cs = it->second;
             gba_snap.keyframes.push_back(std::move(gs));
         }
+        std::unordered_set<KeyframeId> gba_keyframes;
+        for (const auto& kf : gba_snap.keyframes) gba_keyframes.insert(kf.id);
+        for (const auto& observation : observations) {
+            if (gba_keyframes.contains(observation.keyframe_id))
+                gba_snap.observations.push_back(observation);
+        }
         gba_snap.landmarks = points;  // 观测数保留（≥3 过滤）
         for (auto& lm : gba_snap.landmarks) {
             auto it = synced.find(lm.id);
@@ -1666,20 +2018,29 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
         // KF 局部位姿，轨迹自动跟随——插值残留/锯齿类缺陷整体消失。
     }
 
-    // ---- 阶段 3：锁内原子提交（stale 检查 → 唯一提交路径 → 保留回环边）----
-    {
-        std::unique_lock<std::shared_mutex> lock(map_mutex_);
-        // stale：几何版本已变（其他提交/对齐发布新几何）→ 过期结果整笔丢弃。
-        // 拓扑版本不再硬检查：异步下快照后前端持续追加 KF/点（拓扑常变），
-        // 但 PGO 校正作用于快照时刻已存在的 KF——追加的 KF 不在结果中、
-        // 不会被覆盖，校正依然有效（与 M6 Local BA 追加 rebase 协议一致）。
+    // ---- 阶段 3：同一事务锁内原子提交（唯一提交路径）----
+        // 子地图切换不是可 rebase 的尾部追加：即使两个 Map 恰好拥有
+        // 相同的 geometry/topology revision，也不能把旧子地图结果写进新图。
+        if (map_ != snap_map || !active_submap || active_submap->id != submap_id) {
+            LOG_WARN("Loop correction stale: active submap/map changed, dropped");
+            return false;
+        }
+        // 回环是全图事务：结果包含整张图的位姿/点同步，快照后任何 KF/点
+        // 增删都会改变其语义，不能靠 geometry-only stale 或尾部传播补救。
+        if (snap_topology != map_->topologyRevision()) {
+            LOG_WARN("Loop correction stale (snap topology " << snap_topology
+                     << " vs live " << map_->topologyRevision()
+                     << "), dropped");
+            return false;
+        }
+        // 几何版本已变（其他提交/对齐发布新几何）→ 过期结果整笔丢弃。
         // 实测 3 次 verified(408/306/304 inliers) 全部因此被丢，旋转漂移
         // 无法被回环拉平（async 下 ATE 57.9 vs sync 42.8）。
         if (snap_geometry != map_->geometryRevision()) {
             LOG_WARN("Loop correction stale (snap geo " << snap_geometry
                      << " vs live " << map_->geometryRevision()
                      << "), dropped");
-            return;
+            return false;
         }
         // 组包为 OptimizationResult，统一走唯一 BackendCommitter 提交路径
         // （PGO 已有自身的校正/相邻步长防护，此处关闭额外校正上限）。
@@ -1688,51 +2049,23 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
         loop_result.base_topology_revision = snap_topology;
         loop_result.base_geometry_revision = snap_geometry;
         loop_result.valid = true;
-        for (const auto& [kf_id, pose] : final_pose) {
-            if (kf_id == 1597)
+        // 回环优化返回的每个 KF 都必须与同步后的地图点一起提交；按帧号
+        // 过滤会让同一快照内出现"位姿旧、点新"的部分提交。
+        for (const auto& [kf_id, pose] : final_pose)
             loop_result.poses.push_back({kf_id, pose});
-        }
         // 写回顺序：粗同步值在前、BA 精修值在后（synced 已含精修，等价）
         for (const auto& [mp_id, pos] : synced)
             loop_result.points.push_back({mp_id, pos});
+
         // 全量写回（无 skip）：位姿与点必须一致写回，否则端点 KF 出现
         // "位姿旧、点新"失配 → 下一帧跟踪的 T_ca 变 44m 级 → 轨迹跳变
         // （abcd4/abcd9 实测：loop_skip 保护端点位姿但点仍被写回）。
         const CommitStatus commit_status =
-            BackendCommitter::commit(map_, loop_result, {}, 0.0);
+            BackendCommitter::commit(map_, loop_result, {}, 0.0, snap_map);
         if (commit_status != CommitStatus::COMMITTED) {
             LOG_WARN("Loop correction commit failed (status "
-                     << (int)commit_status << "), skipping writeback propagation");
-            return;
-        }
-
-        // 快照后插入 KF 的校正传播（async 竞争修复，§3.21）：
-        // 回环快照不含校正时刻之后插入的 KF（如静止段回环时的 1599），
-        // PGO 不校正它们 → 保持校正前位姿 → 与校正后的锚点 KF 跳变 44.8m。
-        // 按"最近快照 KF 的校正量"传播其位姿与独有点（共视点已在 synced
-        // 中校正过，不能重复）。
-        if (!kf_states.empty()) {
-            const unsigned long snap_max = kf_states.back().id;
-            std::unordered_map<unsigned long, SE3> kf_corrections;
-            for (const auto& [kf_id, new_pose] : final_pose) {
-                auto old = old_pose.find(kf_id);
-                if (old != old_pose.end())
-                    kf_corrections[kf_id] = new_pose.inverse() * old->second;
-            }
-            for (const auto& kf : map_->getAllKeyFrames()) {
-                if (kf->id <= snap_max || final_pose.count(kf->id)) continue;
-                unsigned long anchor_id = 0;
-                for (auto it = kf_states.rbegin(); it != kf_states.rend(); ++it) {
-                    if (it->id < kf->id) { anchor_id = it->id; break; }
-                }
-                auto cit = kf_corrections.find(anchor_id);
-                if (!anchor_id || cit == kf_corrections.end()) continue;
-                const SE3 corr = cit->second;
-                kf->pose_cs = corr * kf->pose_cs;
-                for (auto& mp : kf->map_points) {
-                    if (mp && !synced.count(mp->id)) mp->pos_s = corr * mp->pos_s;
-                }
-            }
+                     << (int)commit_status << ")");
+            return false;
         }
         // 保留累积回环边（含本次，优化成功）
         loop_edges_.clear();
@@ -1741,11 +2074,11 @@ void VisualOdometry::handleLoopCorrection(const SE3& T_loop_curr,
         // 冷却基准更新留在锁内：锁外解引用 map_ 会与前端 createSubmap 的
         // map_ 成员交换并发（shared_ptr 读写竞争，§3.16）
         last_loop_kf_count_ = map_->keyFrameCount();
-    }
-
     loop_closure_count_++;
-    LOG_INFO("Loop closed! kf#" << kf_loop->id << " -> kf#" << kf_curr->id
+    LOG_INFO("Loop closed! kf#" << context.loop_kf_id << " -> kf#"
+             << context.curr_kf_id
              << " (total " << loop_closure_count_.load() << ")");
+    return true;
 }
 
 // ============================================================
@@ -1761,6 +2094,7 @@ Frame::Ptr VisualOdometry::snapshotFrame(
     auto snap = std::make_shared<Frame>(kf->id, 0.0);
     snap->pose_cs = kf->pose_cs;
     snap->keypoints = kf->keypoints;
+    snap->pts_c = kf->pts_c;
     if (with_descriptors && !kf->descriptors.empty())
         snap->descriptors = kf->descriptors.clone();
     snap->map_points.resize(kf->map_points.size(), nullptr);
@@ -1777,7 +2111,6 @@ Frame::Ptr VisualOdometry::snapshotFrame(
         smp->pos_s = mp->pos_s;
         if (with_descriptors && !mp->descriptor.empty())
             smp->descriptor = mp->descriptor.clone();
-        smp->observed_count = mp->observed_count;
         snap_cache.emplace(mp->id, smp);
         snap->map_points[i] = smp;
     }
@@ -1789,6 +2122,7 @@ Frame::Ptr VisualOdometry::snapshotFrame(
 // ============================================================
 VisualOdometry::TrackingSnapshot VisualOdometry::captureTrackingSnapshot() const {
     TrackingSnapshot snap;
+    snap.map = map_;
     snap.topology_revision = map_->topologyRevision();
     snap.geometry_revision = map_->geometryRevision();
     const auto* sub = atlas_->activeSubmap();
@@ -1811,81 +2145,183 @@ VisualOdometry::TrackingSnapshot VisualOdometry::captureTrackingSnapshot() const
 // ============================================================
 // M1：Optimizer 只读快照 / 结果提交
 // ============================================================
-void VisualOdometry::runWindowLocalBA(const std::vector<Frame::Ptr>& window) {
+void VisualOdometry::runWindowLocalBA(
+    const std::vector<Frame::Ptr>& window, KeyframeId anchor_kf_id,
+    const Map::Ptr& expected_map,
+    std::optional<unsigned long> expected_submap_id) {
     if (window.empty() || !cfg_.enable_local_ba) return;
     PERF_SCOPE("kf.local_ba");
     OptimizationSnapshot snap;
+    Map::Ptr snapshot_map;
+    unsigned long snapshot_submap_id = 0;
     {
         std::shared_lock<std::shared_mutex> lock(map_mutex_);
-        snap = buildLocalBASnapshot(window);
+        const auto* active_submap = atlas_->activeSubmap();
+        if (!active_submap ||
+            (expected_map && map_ != expected_map) ||
+            (expected_submap_id && active_submap->id != *expected_submap_id)) {
+            LOG_WARN("Local BA task dropped: Map/Submap identity changed before snapshot");
+            return;
+        }
+        snapshot_map = map_;
+        snapshot_submap_id = active_submap->id;
+        // Optimizer 的有效 BA 边要求同一点至少有 3 个正式关键帧观测；
+        // 在快照入口就执行同一门槛，避免先构建无效弱点再原样重算一次。
+        snap = buildLocalBASnapshot(window, anchor_kf_id, 3);
     }
     if (snap.keyframes.size() < 2) return;
-    // 跳过"窗口内最新关键帧"（= 前端 ref_frame_，§3.16/§M0：后端写回其
-    // 位姿会被前端误判为跳变 → LOST 带）
-    const std::unordered_set<unsigned long> skip{snap.keyframes.back().id};
+    // 跳过提交任务捕获的 anchor KF（通常是前端 ref_frame_；§3.16/§M0：
+    // 后端写回其位姿会被前端误判为跳变 → LOST 带）。
+    const std::unordered_set<unsigned long> skip{anchor_kf_id};
     auto result = Optimizer::solveLocalBA(camera_, snap, cfg_.local_ba_iterations);
-    if (result.valid && applyLocalBAResult(result, skip)) return;
-    // C：提交被质量门限拒绝（大校正 = 弱观测垃圾点拖偏）→ 剔除
-    // observed_count < 3 的点重建快照重试一次（保守，不循环重试）
-    if (result.valid) {
-        OptimizationSnapshot snap2;
-        {
-            std::shared_lock<std::shared_mutex> lock(map_mutex_);
-            snap2 = buildLocalBASnapshot(window, 3);
-        }
-        if (snap2.keyframes.size() >= 2) {
-            auto result2 = Optimizer::solveLocalBA(camera_, snap2,
-                                                   cfg_.local_ba_iterations);
-            if (result2.valid) applyLocalBAResult(result2, skip);
-        }
-    }
+    if (!result.valid) return;
+    // INVALID 直接丢弃；STALE 由覆盖式队列里的更新任务自然追赶。
+    // 对同一有效图重算不会改变质量验收结果，只会把 BA 成本翻倍。
+    (void)applyLocalBAResult(result, skip, snapshot_map, snapshot_submap_id);
 }
 
 OptimizationSnapshot VisualOdometry::buildLocalBASnapshot(
-    const std::vector<Frame::Ptr>& window, int min_observed) const {
+    const std::vector<Frame::Ptr>& window,
+    KeyframeId anchor_kf_id,
+    int min_observed) const {
     OptimizationSnapshot snap;
     const auto* active_submap = atlas_->activeSubmap();
     snap.submap_id = active_submap ? active_submap->id : 0;
     snap.topology_revision = map_->topologyRevision();
     snap.geometry_revision = map_->geometryRevision();
 
-    std::unordered_set<unsigned long> seen_mp;
+    const int required_observations = std::max(0, min_observed);
     for (const auto& kf : window) {
-        if (!map_->getKeyFrame(kf->id)) continue;  // 已被清理/地图重建
+        const auto live_kf = map_->getKeyFrame(kf->id);
+        // 不只按 id 判断：不同 Map 的关键帧 id 会从 0 重新分配，旧任务
+        // 可能与新子地图恰好撞号，必须绑定对象身份。
+        if (!live_kf || live_kf.get() != kf.get()) continue;
         KeyframeState ks;
         ks.id = kf->id;
         ks.pose_cs = kf->pose_cs;
-        ks.keypoints = kf->keypoints;
-        ks.map_points.resize(kf->map_points.size(), 0);
         for (size_t i = 0; i < kf->map_points.size(); i++) {
-            if (kf->map_points[i]) {
-                ks.map_points[i] = kf->map_points[i]->id;
-                seen_mp.insert(kf->map_points[i]->id);
+            const auto& mp = kf->map_points[i];
+            if (!mp || i > std::numeric_limits<FeatureIndex>::max() ||
+                !includeLocalBALandmark(
+                    static_cast<int>(mp->observationCount()),
+                    required_observations)) continue;
+            const Observation observation{
+                kf->id, static_cast<FeatureIndex>(i)};
+            if (!mp->hasObservation(observation)) continue;
+            ObservationState state;
+            state.keyframe_id = kf->id;
+            state.feature_index = static_cast<FeatureIndex>(i);
+            state.map_point_id = mp->id;
+            if (i < kf->keypoints.size()) {
+                state.pixel = Vec2(kf->keypoints[i].pt.x,
+                                   kf->keypoints[i].pt.y);
             }
+            if (i < kf->pts_c.size() && kf->pts_c[i].allFinite() &&
+                kf->pts_c[i].z() > 0.0) {
+                state.camera_point = kf->pts_c[i];
+            }
+            snap.observations.push_back(std::move(state));
         }
         snap.keyframes.push_back(std::move(ks));
     }
-    // 只收集窗口引用的点（快照点坐标 + 观测数；优化器内部再做 ≥3 观测截断）
-    snap.landmarks.reserve(seen_mp.size());
-    for (auto id : seen_mp) {
-        auto mp = map_->getMapPoint(id);
-        if (mp) snap.landmarks.push_back({id, mp->pos_s, mp->observed_count});
+
+    // 只保留显式 anchor KF 所在的观测连通分量。共视排序的兜底窗口可能
+    // 混入没有共同地图点的远端帧；把它们送进 BA 会产生未锚定的自由度，
+    // 也会让“窗口最早帧”错误地落在全局旧坐标上。
+    if (snap.keyframes.size() > 1) {
+        std::vector<size_t> parent(snap.keyframes.size());
+        std::iota(parent.begin(), parent.end(), 0);
+        auto find_root = [&](size_t value) {
+            size_t root = value;
+            while (parent[root] != root) root = parent[root];
+            return root;
+        };
+        auto unite = [&](size_t a, size_t b) {
+            a = find_root(a);
+            b = find_root(b);
+            if (a != b) parent[b] = a;
+        };
+        std::unordered_map<MapPointId, std::vector<size_t>> observations;
+        for (const auto& observation : snap.observations) {
+            auto it = std::ranges::find_if(
+                snap.keyframes,
+                [&](const KeyframeState& kf) {
+                    return kf.id == observation.keyframe_id;
+                });
+            if (it == snap.keyframes.end()) continue;
+            observations[observation.map_point_id].push_back(
+                static_cast<size_t>(std::distance(snap.keyframes.begin(), it)));
+        }
+        for (const auto& [id, frames] : observations) {
+            (void)id;
+            if (frames.size() < 3) continue;  // 与 Optimizer 的 BA 门槛一致
+            for (size_t i = 1; i < frames.size(); i++) unite(frames[0], frames[i]);
+        }
+
+        size_t current_idx = snap.keyframes.size();
+        for (size_t i = 0; i < snap.keyframes.size(); i++) {
+            if (snap.keyframes[i].id == anchor_kf_id) {
+                current_idx = i;
+                break;
+            }
+        }
+        if (current_idx < snap.keyframes.size()) {
+            const size_t current_root = find_root(current_idx);
+            std::vector<KeyframeState> connected;
+            connected.reserve(snap.keyframes.size());
+            for (size_t i = 0; i < snap.keyframes.size(); i++)
+                if (find_root(i) == current_root)
+                    connected.push_back(std::move(snap.keyframes[i]));
+            snap.keyframes = std::move(connected);
+        }
     }
-    // 锚定窗口最早 2 帧（BA 固定 = 基线长度 → 尺度锚定，与旧行为一致）
+
+    std::unordered_set<KeyframeId> kept_keyframes;
+    for (const auto& kf : snap.keyframes) kept_keyframes.insert(kf.id);
+    std::erase_if(snap.observations, [&](const ObservationState& observation) {
+        return !kept_keyframes.contains(observation.keyframe_id);
+    });
+
+    std::unordered_set<MapPointId> seen_mp;
+    for (const auto& observation : snap.observations)
+        seen_mp.insert(observation.map_point_id);
+    // 只收集窗口正式观测且达到 min_observed 的点；id=0 是合法地图点，
+    // 因此这里不能用 0 作为“无点”哨兵。
+    snap.landmarks.reserve(seen_mp.size());
+    for (const auto id : seen_mp) {
+        auto mp = map_->getMapPoint(id);
+        if (mp && includeLocalBALandmark(
+                static_cast<int>(mp->observationCount()), required_observations)) {
+            snap.landmarks.push_back({id, mp->pos_s,
+                                      static_cast<int>(mp->observationCount())});
+        }
+    }
+    // 锚定局部观测分量最早 2 帧（固定 = 局部基线长度，避免全局 kf#0/#1
+    // 与当前窗口断开时造成 gauge 漂移）。Optimizer 还会按实际 BA 边再次
+    // 校验/修正固定集。
     if (snap.keyframes.size() >= 2)
         snap.fixed_kf_ids = {snap.keyframes[0].id, snap.keyframes[1].id};
     return snap;
 }
 
-bool VisualOdometry::applyLocalBAResult(
+CommitStatus VisualOdometry::applyLocalBAResult(
     const OptimizationResult& result,
-    const std::unordered_set<unsigned long>& skip_pose) {
+    const std::unordered_set<unsigned long>& skip_pose,
+    const Map::Ptr& expected_map,
+    unsigned long expected_submap_id) {
     // M2：唯一提交路径——BackendCommitter 完成 stale 检查、质量验收、
     // 对象存活检查和一次锁内原子写回 + bumpGeometry。
     {
         std::unique_lock<std::shared_mutex> lock(map_mutex_);
-        return BackendCommitter::commit(map_, result, skip_pose)
-            == CommitStatus::COMMITTED;
+        const auto* active_submap = atlas_->activeSubmap();
+        if (map_ != expected_map || !active_submap ||
+            active_submap->id != expected_submap_id ||
+            result.submap_id != expected_submap_id) {
+            LOG_WARN("Local BA result dropped: Map/Submap identity changed before commit");
+            return CommitStatus::STALE;
+        }
+        return BackendCommitter::commit(
+            map_, result, skip_pose, 10.0, expected_map);
     }
 }
 
@@ -1947,16 +2383,17 @@ void VisualOdometry::backendLoop() {
             backend_tasks_.pop_front();
         }
         if (task.type == BackendTask::Type::LocalBA)
-            runBackendLocalBA(task.window);
+            runBackendLocalBA(task);
         else
             runBackendLoopClosure(task.curr_kf);
     }
 }
 
-void VisualOdometry::runBackendLocalBA(const std::vector<Frame::Ptr>& window) {
+void VisualOdometry::runBackendLocalBA(const BackendTask& task) {
     // 后台执行窗口 Local BA（统一入口 runWindowLocalBA：快照隔离 +
-    // 跳过活动参考帧写回 + C 弱观测点过滤重试）
-    runWindowLocalBA(window);
+    // 跳过活动参考帧写回 + 正式弱观测点前置过滤）
+    runWindowLocalBA(task.window, task.anchor_kf_id,
+                     task.map, task.submap_id);
 }
 
 void VisualOdometry::runBackendLoopClosure(const Frame::Ptr& curr_kf) {
@@ -1966,9 +2403,19 @@ void VisualOdometry::runBackendLoopClosure(const Frame::Ptr& curr_kf) {
     // 锁内快照当前 KF（detectLoop 只需描述子/位姿；点深拷贝浪费，keep 空集）
     static const std::unordered_set<unsigned long> kNoPoints;
     Frame::Ptr snap_curr;
+    LoopCorrectionContext current_context;
     {
         std::shared_lock<std::shared_mutex> lock(map_mutex_);  // P1：快照为读路径
-        if (!map_->getKeyFrame(curr_kf->id)) return;
+        const auto live_curr = map_->getKeyFrame(curr_kf->id);
+        const auto* active_submap = atlas_->activeSubmap();
+        if (!live_curr || live_curr.get() != curr_kf.get() || !active_submap)
+            return;
+        current_context.map = map_;
+        current_context.submap_id = active_submap->id;
+        current_context.topology_revision = map_->topologyRevision();
+        current_context.geometry_revision = map_->geometryRevision();
+        current_context.curr_kf_id = curr_kf->id;
+        current_context.curr_kf = curr_kf;
         std::unordered_map<unsigned long, MapPoint::Ptr> snap_cache;
         snap_curr = snapshotFrame(curr_kf, snap_cache, &kNoPoints);
     }
@@ -1976,19 +2423,28 @@ void VisualOdometry::runBackendLoopClosure(const Frame::Ptr& curr_kf) {
     // 检测（LoopClosure 内部互斥；候选可能跨子地图，写回前在锁内过滤）
     auto cands = loop_closure_->detectLoop(snap_curr);
     for (const auto& cand : cands) {
-        SE3 T_loop_curr;
-        bool verified = false;
+        LoopCorrectionContext context = current_context;
+        Frame::Ptr snap_loop;
         {
-            // 锁内验证：候选必须仍在本地图（防跨子地图误闭环），
-            // verifyLoop 读取候选 KF 的 map_points（真数组，与前端 cull 互斥）
-            std::shared_lock<std::shared_mutex> lock(map_mutex_);  // P1：验证为读路径
-            if (!map_->getKeyFrame(cand->id)) continue;
-            verified = loop_closure_->verifyLoop(snap_curr, cand, T_loop_curr);
+            // 先深拷贝候选几何；锁外预验证淘汰绝大多数假候选，避免每个
+            // 假候选都持全图独占锁做昂贵 PnP。真正提交前仍在事务内重验。
+            std::shared_lock<std::shared_mutex> lock(map_mutex_);
+            const auto live_curr = map_->getKeyFrame(context.curr_kf_id);
+            const auto live_loop = map_->getKeyFrame(cand->id);
+            const auto* active_submap = atlas_->activeSubmap();
+            if (!live_curr || live_curr.get() != context.curr_kf.get() ||
+                !live_loop || live_loop.get() != cand.get() || !active_submap ||
+                map_ != context.map || active_submap->id != context.submap_id) continue;
+            context.loop_kf_id = cand->id;
+            context.loop_kf = cand;
+            std::unordered_map<unsigned long, MapPoint::Ptr> snap_cache;
+            snap_loop = snapshotFrame(cand, snap_cache, nullptr);
         }
-        if (!verified) continue;
+        SE3 preverified_measurement;
+        if (!loop_closure_->verifyLoop(
+                snap_curr, snap_loop, preverified_measurement)) continue;
         // 校正（内部三阶段：收集/计算/写回，自行管理锁）
-        handleLoopCorrection(T_loop_curr, snap_curr, cand);
-        break;
+        if (handleLoopCorrection(context)) break;
     }
 }
 
@@ -1997,31 +2453,41 @@ void VisualOdometry::runBackendLoopClosure(const Frame::Ptr& curr_kf) {
 // ============================================================
 std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
     std::vector<Frame::Ptr> window;
+    if (n <= 0 || !curr_frame_) return window;
     auto all_kfs = map_->getAllKeyFrames();
-    if (all_kfs.empty() || !curr_frame_) return window;
+    if (all_kfs.empty()) return window;
 
-    // 当前帧引用的地图点集合
-    std::set<unsigned long> curr_mps;
-    for (auto& mp : curr_frame_->map_points)
-        if (mp) curr_mps.insert(mp->id);
-
-    // 统计每个关键帧与当前帧的共视点数量
     struct Candidate { Frame::Ptr kf; int cov; };
     std::vector<Candidate> cands;
-    for (auto& kf : all_kfs) {
-        if (kf->id == curr_frame_->id) continue;
-        int cov = 0;
-        for (auto& mp : kf->map_points)
-            if (mp && curr_mps.count(mp->id)) cov++;
-        cands.push_back({kf, cov});
+    const auto registered_curr = map_->getKeyFrame(curr_frame_->id);
+    if (registered_curr && registered_curr.get() == curr_frame_.get()) {
+        // 已注册 KF 使用 Map 的持久共视计数（正式 Observation 的唯一来源），
+        // 不再从 transient map_points 指针重复统计。
+        for (const auto& covisible : map_->covisibleKeyframes(
+                 curr_frame_->id, 1)) {
+            auto kf = map_->getKeyFrame(covisible.keyframe_id);
+            if (kf) cands.push_back({kf, static_cast<int>(covisible.shared_points)});
+        }
+    } else {
+        // 初始化/尚未注册帧仍只能使用临时指针作安全兜底。
+        std::set<MapPointId> curr_mps;
+        for (const auto& mp : curr_frame_->map_points)
+            if (mp) curr_mps.insert(mp->id);
+        for (const auto& kf : all_kfs) {
+            if (kf->id == curr_frame_->id) continue;
+            int cov = 0;
+            for (const auto& mp : kf->map_points)
+                if (mp && curr_mps.contains(mp->id)) ++cov;
+            cands.push_back({kf, cov});
+        }
     }
     // C++23 ranges：按共视点数量降序（投影 &Candidate::cov，免手写比较器）
     std::ranges::sort(cands, std::greater<>{}, &Candidate::cov);
 
-    // 窗口 = 当前帧 + 共视最多的前 n-3 帧（预留 2 个尺度锚位）
+    // 窗口 = 当前帧 + 共视最多的候选，最多填满 n 个 KF。
     window.push_back(curr_frame_);
     for (auto& c : cands) {
-        if ((int)window.size() >= n - 2) break;
+        if ((int)window.size() >= n) break;
         if (c.cov >= 2) window.push_back(c.kf);
     }
 
@@ -2033,17 +2499,8 @@ std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
             window.push_back(all_kfs[i]);
     }
 
-    // 强制加入全局最早的两个关键帧（id 0/1，初始化尺度基准）：
-    // BA 固定它们后，每个滑动窗口共用同一基线，避免窗口间锚定帧不同
-    // 导致的尺度漂移。
-    for (auto& kf : all_kfs) {
-        if (kf->id == 0 || kf->id == 1) {
-            if (std::find(window.begin(), window.end(), kf) == window.end())
-                window.push_back(kf);
-        }
-    }
-
-    // 按 id 升序，最早帧在 index 0/1（BA 中固定，尺度锚定）
+    // 按 id 升序；BA 快照随后按实际观测连通分量选择局部锚，不能把
+    // 与当前窗口断开的全局 kf#0/#1 强行带入优化。
     std::ranges::sort(window, {}, [](const Frame::Ptr& f) { return f->id; });
     return window;
 }
@@ -2069,8 +2526,20 @@ void VisualOdometry::triangulateNewPoints(
 
     cv::Mat K = camera_->K();
     int cnt = 0;
+    const bool f1_registered = map_->getKeyFrame(f1->id) == f1;
+    const bool f2_registered = map_->getKeyFrame(f2->id) == f2;
     for (auto& m : matches) {
-        if (f1->map_points[m.queryIdx] == nullptr) {
+        if (m.queryIdx < 0 || m.trainIdx < 0 ||
+            m.queryIdx >= static_cast<int>(f1->map_points.size()) ||
+            m.trainIdx >= static_cast<int>(f2->map_points.size()) ||
+            m.queryIdx >= static_cast<int>(f1->keypoints.size()) ||
+            m.trainIdx >= static_cast<int>(f2->keypoints.size()) ||
+            f1->map_points[m.queryIdx] != nullptr ||
+            f2->map_points[m.trainIdx] != nullptr) {
+            // f2 已绑定其它点时禁止覆盖，避免一个正式 slot 被静默重绑。
+            continue;
+        }
+        {
             auto mp = MapPoint::create(
                 map_->nextMapPointId(),
                 Vec2(f1->keypoints[m.queryIdx].pt.x, f1->keypoints[m.queryIdx].pt.y),
@@ -2079,11 +2548,28 @@ void VisualOdometry::triangulateNewPoints(
             if (!mp) continue;  // B2：退化三角化（视差角过小）拒绝
             Vec3 pc = f1->pose_cs * mp->pos_s;
             if (pc.z() > 0) {
-                mp->observed_count = 2;  // 初始被 f1、f2 两个关键帧观测
                 map_->insertMapPoint(mp);
-                f1->map_points[m.queryIdx] = mp;
-                f2->map_points[m.trainIdx] = mp;
-                cnt++;
+                // 已注册帧通过 Map 建立双向正式观测；初始化阶段的两个
+                // 未注册帧先写 slot，随后 insertKeyFrame 会统一 sync。
+                const bool f1_ok = !f1_registered || map_->setObservation(
+                    f1, static_cast<FeatureIndex>(m.queryIdx), mp);
+                const bool f2_ok = !f2_registered || map_->setObservation(
+                    f2, static_cast<FeatureIndex>(m.trainIdx), mp);
+                if (f1_ok && f2_ok) {
+                    if (!f1_registered) f1->map_points[m.queryIdx] = mp;
+                    if (!f2_registered) f2->map_points[m.trainIdx] = mp;
+                    ++cnt;
+                } else {
+                    // 新点必须是全有或全无；若第一侧已注册成功而第二侧
+                    // 失败，先撤销正式 observation，再删除点，禁止半连接。
+                    if (f1_registered && f1_ok)
+                        map_->clearObservation(
+                            f1->id, static_cast<FeatureIndex>(m.queryIdx));
+                    if (f2_registered && f2_ok)
+                        map_->clearObservation(
+                            f2->id, static_cast<FeatureIndex>(m.trainIdx));
+                    map_->removeMapPoint(mp->id);
+                }
             }
         }
     }

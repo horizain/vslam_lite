@@ -43,8 +43,10 @@ private:
     bool loadKITTIImageList(const std::string& path);
     /// TUM: 解析 <path>/rgb.txt（每行 "timestamp rgb/<file>"）
     bool loadTUMImageList(const std::string& path);
-    /// EuRoC: 解析 <path>/cam0/data.csv（每行 "timestamp,<file>"）
+    /// EuRoC: 解析 <mav0>/cam0/data.csv（每行 "timestamp,<file>"）
     bool loadEUROCImageList(const std::string& path);
+    /// EuRoC: 从 <mav0>/cam0/sensor.yaml 加载针孔相机模型
+    bool loadEUROCCalibration(const std::string& path);
     /// KITTI: 从 <image_dir>/../calib.txt 读取 P0 内参（KITTI 图像已校正，无畸变系数）
     bool loadCalibration(const std::string& image_dir);
 
@@ -56,6 +58,7 @@ private:
     std::vector<std::string> right_image_paths_;  // 右目图像列表（双目；单目为空）
     std::vector<double>      timestamps_;   // 数据集自带时间戳（KITTI 为空则按 10fps 推算）
     cv::VideoCapture cap_;
+    std::string euroc_root_;                // 规范化后的 EuRoC mav0 根目录
 
     bool calib_loaded_ = false;
     int current_index_ = 0;

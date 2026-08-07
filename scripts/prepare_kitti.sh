@@ -5,7 +5,7 @@
 # 用法：
 #   scripts/prepare_kitti.sh [数据目录] [序列列表]
 #
-# 默认数据目录: ~/data/kitti
+# 默认数据目录: datasets/kitti（输出 datasets/kitti/sequences 与 datasets/kitti/poses）
 # 默认序列:     00 01 02 03 04 05 06 07 08 09 10
 #
 # 前提：先自行下载以下文件并放入数据目录（注意本机代理可能阻断 S3，
@@ -20,12 +20,14 @@
 # ============================================================
 set -euo pipefail
 
-DATA_DIR="${1:-$HOME/data/kitti}"
+DATA_DIR="${1:-datasets/kitti}"
 SEQUENCES="${2:-00 01 02 03 04 05 06 07 08 09 10}"
-GRAY_ZIP="$DATA_DIR/data_odometry_gray.zip"
-POSES_ZIP="$DATA_DIR/data_odometry_poses.zip"
 
 mkdir -p "$DATA_DIR"
+# 后续会进入 DATA_DIR；先规范成绝对路径，避免默认相对路径被重复拼接。
+DATA_DIR="$(cd "$DATA_DIR" && pwd)"
+GRAY_ZIP="$DATA_DIR/data_odometry_gray.zip"
+POSES_ZIP="$DATA_DIR/data_odometry_poses.zip"
 
 echo "==> 数据目录: $DATA_DIR"
 
@@ -49,7 +51,7 @@ check_zip "$GRAY_ZIP" "data_odometry_gray.zip"
 check_zip "$POSES_ZIP" "data_odometry_poses.zip"
 
 # ---- 解压双目图像序列（只解压需要的序列，避免全部 8GB 展开）----
-cd "$DATA_DIR"
+pushd "$DATA_DIR" >/dev/null
 for seq in $SEQUENCES; do
     target_left="sequences/$seq/image_0"
     target_right="sequences/$seq/image_1"
@@ -110,6 +112,8 @@ print('    poses 解压完成:', len([n for n in z.namelist() if n.endswith('.tx
 else
     echo "==> poses 已存在，跳过"
 fi
+
+popd >/dev/null
 
 echo ""
 echo "==> 完成。运行示例："

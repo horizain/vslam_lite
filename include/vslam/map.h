@@ -6,6 +6,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 
 namespace vslam {
 
@@ -16,6 +17,11 @@ namespace vslam {
 class Map {
 public:
     using Ptr = std::shared_ptr<Map>;
+
+    struct Covisibility {
+        KeyframeId keyframe_id = 0;
+        size_t shared_points = 0;
+    };
 
     Map() = default;
 
@@ -28,16 +34,46 @@ public:
     void bumpGeometry() { geometry_rev_.fetch_add(1, std::memory_order_relaxed); }
 
     // ---- 地图点 ----
-    /// 分配一个全局唯一的地图点 id
+    /// 分配当前 Map 内唯一的地图点 id
     unsigned long nextMapPointId() { return next_mp_id_++; }
     void insertMapPoint(MapPoint::Ptr mp);
     MapPoint::Ptr getMapPoint(unsigned long id) const;
+    /// 原子删除地图点及其全部 observation、共视计数、KF slot。
+    /// 调用方必须持有 map_mutex_ 独占锁；不存在时幂等返回 false。
+    bool removeMapPoint(MapPointId id);
     /// 原子计数：供状态栏/状态轮询在锁外读取（无需锁住整个 std::map）。
     /// 与 map_points_.size() 的唯一差别是"插入后计数立即生效"，对统计足够。
     size_t mapPointCount() const { return mp_count_.load(std::memory_order_relaxed); }
 
     /// 剔除观测次数不足的地图点
     void cullMapPoints(int min_observations = 2);
+
+    // ---- 正式观测关系（调用方必须持有 map_mutex_ 独占锁）----
+    /// 原子维护关键帧 feature slot 与 MapPoint 反向观测。
+    /// 传入的关键帧和地图点必须已经注册到本 Map。
+    bool setObservation(const Frame::Ptr& keyframe,
+                        FeatureIndex feature_index,
+                        const MapPoint::Ptr& map_point);
+
+    /// 原子清除关键帧 feature slot 与 MapPoint 反向观测。
+    bool clearObservation(KeyframeId keyframe_id,
+                          FeatureIndex feature_index);
+
+    /// 关键帧插入或历史代码直接写 slot 后，重建该 KF 的正式观测关系。
+    void syncKeyframeObservations(const Frame::Ptr& keyframe);
+
+    /// 统计两个关键帧共享的唯一地图点数量。调用方需持有外部
+    /// map_mutex_ 读锁（或更强锁）。
+    size_t sharedObservationCount(KeyframeId a, KeyframeId b) const;
+
+    /// 返回与指定关键帧共视点数达标的关键帧，按数量降序、id 升序排列。
+    /// 调用方需持有外部 map_mutex_ 读锁（或更强锁）。
+    std::vector<Covisibility> covisibleKeyframes(
+        KeyframeId id, size_t min_shared = 1) const;
+
+    /// 检查 Frame slot、MapPoint 观测集合和共视计数是否相互一致。
+    /// 调用方需持有外部 map_mutex_ 读锁（或更强锁）。
+    bool verifyObservationConsistency() const;
 
     // ---- 关键帧 ----
     void insertKeyFrame(Frame::Ptr kf);
@@ -54,8 +90,33 @@ public:
     void clear();
 
 private:
+    bool setObservationUnlocked(const Frame::Ptr& keyframe,
+                                FeatureIndex feature_index,
+                                const MapPoint::Ptr& map_point);
+    bool addObservationUnlocked(const Observation& observation,
+                                const MapPoint::Ptr& map_point);
+    bool clearObservationUnlocked(KeyframeId keyframe_id,
+                                  FeatureIndex feature_index);
+    /// 仅把当前 slots 注册为正式观测；用于刚插入、按定义没有历史反向观测的 KF。
+    bool registerKeyframeObservationsUnlocked(const Frame::Ptr& keyframe);
+    void addCovisibilityUnlocked(const Observation& added,
+                                 const MapPoint::Ptr& map_point);
+    void removeCovisibilityUnlocked(const Observation& removed,
+                                    const MapPoint::Ptr& map_point);
+    bool clearDuplicateSlotsUnlocked(const Frame::Ptr& keyframe,
+                                     const MapPoint::Ptr& map_point,
+                                     std::optional<FeatureIndex> keep_feature);
+    // 批量剔除时先处理所有正式观测，再对 KF slot 做一次全量扫描；
+    // 调用方必须持有 map_mutex_ 独占锁。
+    void removeMapPointsUnlocked(
+        const std::vector<MapPoint::Ptr>& map_points);
+    void removeMapPointUnlocked(const MapPoint::Ptr& map_point);
+
     std::map<unsigned long, MapPoint::Ptr> map_points_;
     std::map<unsigned long, Frame::Ptr>    keyframes_;
+
+    // 以无向 KF 对为键的持久共视计数；唯一来源仍是 MapPoint 观测集合。
+    std::map<std::pair<KeyframeId, KeyframeId>, size_t> covisibility_;
 
     std::atomic<size_t> mp_count_{0};  // 地图点数量（原子，锁外可读）
     std::atomic<size_t> kf_count_{0};  // 关键帧数量（原子，锁外可读）

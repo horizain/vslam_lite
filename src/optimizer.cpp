@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
+#include <set>
+#include <tuple>
 #include <vector>
 
 #ifdef HAS_G2O
@@ -24,6 +27,10 @@
 
 namespace vslam {
 
+double cameraPositionDelta(const SE3& old_cw, const SE3& new_cw) {
+    return (new_cw.camera_position() - old_cw.camera_position()).norm();
+}
+
 #ifdef HAS_G2O
 // ---- 类型别名 ----
 using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
@@ -31,6 +38,73 @@ using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>
 // 位姿图专用：只有 6D 位姿顶点，无 3D 点（纯 pose 求解）
 using PoseBlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 6>>;
 using PoseLinearSolverType = g2o::LinearSolverEigen<PoseBlockSolverType::PoseMatrixType>;
+
+/// g2o 的 CameraParameters 只有单一 focal_length；项目相机允许 fx != fy，
+/// 因此 BA 使用本地二元投影边，显式携带两轴焦距和主点。
+class EdgeProjectXYZ2UV : public g2o::BaseBinaryEdge<
+    2, g2o::Vector2, g2o::VertexPointXYZ, g2o::VertexSE3Expmap> {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    EdgeProjectXYZ2UV(double fx, double fy, double cx, double cy)
+        : fx_(fx), fy_(fy), cx_(cx), cy_(cy) {}
+
+    bool read(std::istream& is) override {
+        for (int i = 0; i < 2; i++) is >> _measurement[i];
+        return readInformationMatrix(is);
+    }
+
+    bool write(std::ostream& os) const override {
+        for (int i = 0; i < 2; i++) os << measurement()[i] << ' ';
+        return writeInformationMatrix(os);
+    }
+
+    void computeError() override {
+        const auto* point = static_cast<const g2o::VertexPointXYZ*>(_vertices[0]);
+        const auto* pose = static_cast<const g2o::VertexSE3Expmap*>(_vertices[1]);
+        const Eigen::Vector3d p_c = pose->estimate().map(point->estimate());
+        const double inv_z = 1.0 / p_c.z();
+        _error = measurement() - g2o::Vector2(
+            fx_ * p_c.x() * inv_z + cx_,
+            fy_ * p_c.y() * inv_z + cy_);
+    }
+
+    void linearizeOplus() override {
+        auto* pose = static_cast<g2o::VertexSE3Expmap*>(_vertices[1]);
+        const g2o::SE3Quat T(pose->estimate());
+        auto* point = static_cast<g2o::VertexPointXYZ*>(_vertices[0]);
+        const g2o::Vector3 p_c = T.map(point->estimate());
+        const double x = p_c.x();
+        const double y = p_c.y();
+        const double z = p_c.z();
+        const double z2 = z * z;
+
+        Eigen::Matrix<double, 2, 3, Eigen::ColMajor> projection;
+        projection << fx_, 0.0, -fx_ * x / z,
+                      0.0, fy_, -fy_ * y / z;
+        _jacobianOplusXi = -projection * T.rotation().toRotationMatrix() / z;
+
+        _jacobianOplusXj(0, 0) = fx_ * x * y / z2;
+        _jacobianOplusXj(0, 1) = -fx_ * (1.0 + x * x / z2);
+        _jacobianOplusXj(0, 2) = fx_ * y / z;
+        _jacobianOplusXj(0, 3) = -fx_ / z;
+        _jacobianOplusXj(0, 4) = 0.0;
+        _jacobianOplusXj(0, 5) = fx_ * x / z2;
+
+        _jacobianOplusXj(1, 0) = fy_ * (1.0 + y * y / z2);
+        _jacobianOplusXj(1, 1) = -fy_ * x * y / z2;
+        _jacobianOplusXj(1, 2) = -fy_ * x / z;
+        _jacobianOplusXj(1, 3) = 0.0;
+        _jacobianOplusXj(1, 4) = -fy_ / z;
+        _jacobianOplusXj(1, 5) = fy_ * y / z2;
+    }
+
+private:
+    double fx_;
+    double fy_;
+    double cx_;
+    double cy_;
+};
 
 /// 旋转角（rad）：2*acos(|w|)，处理 q 与 -q 等价
 static double rotationAngle(const SE3& pose) {
@@ -71,18 +145,6 @@ OptimizationResult Optimizer::solveLocalBA(
     auto algorithm    = new g2o::OptimizationAlgorithmLevenberg(std::move(blockSolver));
     optimizer.setAlgorithm(algorithm);
 
-    // ========================================================
-    // 2. 添加相机参数
-    // ========================================================
-    auto* cam_params = new g2o::CameraParameters(
-        camera->fx,
-        g2o::Vector2(camera->cx, camera->cy),
-        0.0);  // baseline = 0 (monocular projection edge)
-    cam_params->setId(0);
-    if (!optimizer.addParameter(cam_params)) {
-        LOG_WARN("Local BA: camera parameter already exists");  // will use existing
-    }
-
     // Motion-only vs 全 BA 由调用方显式指定，默认按传感器自动选择：
     // 单目三角化点的尺度由初始化（recoverPose 归一化 t）决定，若让点自由
     // 优化存在尺度 gauge 自由度（点+位姿平移同时缩放 s 重投影不变），
@@ -90,7 +152,7 @@ OptimizationResult Optimizer::solveLocalBA(
     // 双目/RGB-D 有绝对尺度（视差直接测深），点自由优化不会退化，
     // 还能让回环后位姿图移动的关键帧把点坐标真正收敛到重投影残差上。
     const bool points_fixed = fix_points.value_or(!camera->hasPerFrameDepth());
-    const std::unordered_set<unsigned long> fixed_set(
+    const std::unordered_set<unsigned long> requested_fixed_set(
         snap.fixed_kf_ids.begin(), snap.fixed_kf_ids.end());
 
     // ========================================================
@@ -105,8 +167,6 @@ OptimizationResult Optimizer::solveLocalBA(
         auto* v_pose = new g2o::VertexSE3Expmap();
         v_pose->setId(static_cast<int>(i));
         v_pose->setEstimate(pose);
-        // 锚定固定集（窗口最早 2 帧 = 基线长度 → 尺度锚定）
-        if (fixed_set.count(kf.id)) v_pose->setFixed(true);
         optimizer.addVertex(v_pose);
         kf_id_to_idx[kf.id] = i;
     }
@@ -114,26 +174,37 @@ OptimizationResult Optimizer::solveLocalBA(
     // ========================================================
     // 4. 收集窗口内观测 + 添加 3D 点顶点
     // ========================================================
-    struct Observation {
+    struct SnapshotObservation {
         size_t    kf_idx;
-        size_t    kp_idx;
-        Eigen::Vector2d pixel;
+        FeatureIndex feature_index;
+        Vec2 pixel;
+        std::optional<Vec3> camera_point;
     };
-    std::unordered_map<unsigned long, std::vector<Observation>> mp_observations;
-    std::unordered_map<unsigned long, Vec3> mp_pos;
+    std::unordered_map<MapPointId, std::vector<SnapshotObservation>> mp_observations;
+    std::unordered_map<MapPointId, Vec3> mp_pos;
     for (const auto& lm : snap.landmarks) mp_pos.emplace(lm.id, lm.pos_s);
 
-    for (size_t i = 0; i < snap.keyframes.size(); i++) {
-        const auto& kf = snap.keyframes[i];
-        for (size_t j = 0; j < kf.keypoints.size() && j < kf.map_points.size(); j++) {
-            const unsigned long mp_id = kf.map_points[j];
-            if (mp_id == 0) continue;
-            mp_observations[mp_id].push_back({
-                i, j,
-                Eigen::Vector2d(kf.keypoints[j].pt.x, kf.keypoints[j].pt.y)
-            });
-        }
+    // ObservationState 已经是正式观测唯一来源；同一快照若意外重复同一
+    // (KF, feature) 槽位，只消费第一条，避免 BA 重复加边。
+    std::set<std::pair<size_t, FeatureIndex>> seen_slots;
+    for (const auto& observation : snap.observations) {
+        const auto kf_it = kf_id_to_idx.find(observation.keyframe_id);
+        if (kf_it == kf_id_to_idx.end()) continue;
+        if (!observation.pixel.allFinite()) continue;
+        if (!seen_slots.emplace(kf_it->second, observation.feature_index).second)
+            continue;
+        if (!mp_pos.contains(observation.map_point_id)) continue;
+        mp_observations[observation.map_point_id].push_back({
+            kf_it->second, observation.feature_index, observation.pixel,
+            observation.camera_point});
     }
+
+    const auto distinct_keyframes = [](const auto& obs_list) {
+        std::set<size_t> frame_ids;
+        for (const auto& observation : obs_list)
+            frame_ids.insert(observation.kf_idx);
+        return frame_ids.size();
+    };
 
     // 只保留被至少 3 帧观测到的地图点，且总量受限（BA 规模上限）
     std::unordered_set<unsigned long> selected_mps;
@@ -151,10 +222,60 @@ OptimizationResult Optimizer::solveLocalBA(
                  << max_points);
     }
 
+    // 仅用实际会进入 BA 的地图点建立观测连通分量。窗口可能包含
+    // 不相交的远端帧（例如旧的固定帧），每个分量都必须有自己的
+    // 局部锚；优先沿用调用方请求的锚，不在该分量内则选本分量前两帧。
+    std::vector<size_t> component_parent(snap.keyframes.size());
+    std::iota(component_parent.begin(), component_parent.end(), 0);
+    const auto find_component = [&](size_t value) {
+        size_t root = value;
+        while (component_parent[root] != root) root = component_parent[root];
+        return root;
+    };
+    auto unite_components = [&](size_t a, size_t b) {
+        a = find_component(a);
+        b = find_component(b);
+        if (a != b) component_parent[b] = a;
+    };
+    for (const auto& [mp_id, obs_list] : mp_observations) {
+        if (distinct_keyframes(obs_list) < 3) continue;
+        if (!selected_mps.empty() && !selected_mps.count(mp_id)) continue;
+        for (size_t i = 1; i < obs_list.size(); i++)
+            unite_components(obs_list[0].kf_idx, obs_list[i].kf_idx);
+    }
+    std::unordered_map<size_t, std::vector<size_t>> components;
+    for (size_t i = 0; i < snap.keyframes.size(); i++)
+        components[find_component(i)].push_back(i);
+
+    std::unordered_set<unsigned long> safe_fixed_ids;
+    for (const auto& [root, members] : components) {
+        (void)root;
+        size_t chosen_count = 0;
+        for (const size_t idx : members) {
+            if (requested_fixed_set.count(snap.keyframes[idx].id)) {
+                safe_fixed_ids.insert(snap.keyframes[idx].id);
+                chosen_count++;
+                if (chosen_count == 2) break;
+            }
+        }
+        for (const size_t idx : members) {
+            if (chosen_count == 2) break;
+            if (safe_fixed_ids.count(snap.keyframes[idx].id)) continue;
+            safe_fixed_ids.insert(snap.keyframes[idx].id);
+            chosen_count++;
+        }
+    }
+    for (size_t i = 0; i < snap.keyframes.size(); i++) {
+        auto* v_pose = dynamic_cast<g2o::VertexSE3Expmap*>(
+            optimizer.vertex(static_cast<int>(i)));
+        if (v_pose && safe_fixed_ids.count(snap.keyframes[i].id))
+            v_pose->setFixed(true);
+    }
+
     int point_vertex_id = static_cast<int>(snap.keyframes.size());
     std::unordered_map<unsigned long, int> mp_id_to_vertex;
     for (auto& [mp_id, obs_list] : mp_observations) {
-        if (obs_list.size() < 3) continue;  // 至少 3 帧观测，过滤弱观测坏点
+        if (distinct_keyframes(obs_list) < 3) continue;  // 至少 3 个 KF 观测
         if (!selected_mps.empty() && !selected_mps.count(mp_id)) continue;
         auto it = mp_pos.find(mp_id);
         if (it == mp_pos.end()) continue;
@@ -183,7 +304,8 @@ OptimizationResult Optimizer::solveLocalBA(
         const auto pit = mp_pos.find(mp_id);
 
         for (auto& obs : obs_list) {
-            auto* edge = new g2o::EdgeProjectXYZ2UV();
+            auto* edge = new EdgeProjectXYZ2UV(
+                camera->fx, camera->fy, camera->cx, camera->cy);
             edge->setVertex(0, dynamic_cast<g2o::VertexPointXYZ*>(
                 optimizer.vertex(point_vid)));
             edge->setVertex(1, dynamic_cast<g2o::VertexSE3Expmap*>(
@@ -192,15 +314,16 @@ OptimizationResult Optimizer::solveLocalBA(
 
             double huber_delta = 5.991;  // 2 DOF, chi2 95% 阈值
             if (depth_weighted && pit != mp_pos.end()) {
-                const double depth = std::max(
-                    0.1, (snap.keyframes[obs.kf_idx].pose_cs * pit->second).z());
+                const double depth = obs.camera_point && obs.camera_point->allFinite()
+                    ? std::max(0.1, obs.camera_point->z())
+                    : std::max(0.1, (snap.keyframes[obs.kf_idx].pose_cs
+                                     * pit->second).z());
                 const double w = std::clamp(100.0 / (depth * depth), 0.04, 25.0);
                 edge->setInformation(w * Eigen::Matrix2d::Identity());
                 huber_delta /= std::sqrt(w);
             } else {
                 edge->setInformation(Eigen::Matrix2d::Identity());
             }
-            edge->setParameterId(0, 0);
             auto* robust_kernel = new g2o::RobustKernelHuber();
             robust_kernel->setDelta(huber_delta);
             edge->setRobustKernel(robust_kernel);
@@ -240,9 +363,11 @@ OptimizationResult Optimizer::solveLocalBA(
             LOG_WARN("Local BA rejected non-finite pose kf#" << snap.keyframes[i].id);
             return OptimizationResult{};  // 整笔无效
         }
+        // 质量指标必须是相机光心在同一局部坐标系中的实际米制位移；
+        // 直接复合两个 T_wc 的平移会把姿态旋转耦合进该指标。
         max_correction = std::max(
             max_correction,
-            (snap.keyframes[i].pose_cs.inverse() * opt_cw.inverse()).t.norm());
+            cameraPositionDelta(snap.keyframes[i].pose_cs, opt_cw));
         result.poses.push_back({snap.keyframes[i].id, opt_cw});
     }
     result.metrics.max_correction = max_correction;

@@ -71,6 +71,51 @@ Camera MonocularCamera::fromYaml(const std::string& path) {
     return cam;
 }
 
+Camera MonocularCamera::fromEurocSensorYaml(const std::string& path) {
+    auto cam = std::make_shared<MonocularCamera>();
+    try {
+        YAML::Node cfg = YAML::LoadFile(path);
+        const auto model = cfg["camera_model"].as<std::string>();
+        const auto distortion_model = cfg["distortion_model"].as<std::string>();
+        if (model != "pinhole" || distortion_model != "radial-tangential") {
+            LOG_WARN("Unsupported EuRoC camera model in " << path
+                     << " (camera_model=" << model
+                     << ", distortion_model=" << distortion_model << ")");
+            return nullptr;
+        }
+
+        const auto resolution = cfg["resolution"];
+        const auto intrinsics = cfg["intrinsics"];
+        const auto distortion = cfg["distortion_coefficients"];
+        if (!resolution || resolution.size() != 2
+            || !intrinsics || intrinsics.size() != 4
+            || !distortion || distortion.size() != 4) {
+            LOG_WARN("Invalid EuRoC camera calibration in " << path);
+            return nullptr;
+        }
+
+        // EuRoC 顺序为 [fu, fv, cu, cv]，畸变为 [k1, k2, p1, p2]。
+        cam->img_width = resolution[0].as<int>();
+        cam->img_height = resolution[1].as<int>();
+        cam->fx = intrinsics[0].as<double>();
+        cam->fy = intrinsics[1].as<double>();
+        cam->cx = intrinsics[2].as<double>();
+        cam->cy = intrinsics[3].as<double>();
+        cam->k1 = distortion[0].as<double>();
+        cam->k2 = distortion[1].as<double>();
+        cam->p1 = distortion[2].as<double>();
+        cam->p2 = distortion[3].as<double>();
+        cam->k3 = 0.0;
+        LOG_INFO("EuRoC camera loaded from: " << path
+                 << " (" << cam->img_width << "x" << cam->img_height
+                 << ", fx=" << cam->fx << ", fy=" << cam->fy << ")");
+    } catch (const std::exception& e) {
+        LOG_WARN("Failed to load EuRoC camera from " << path << ": " << e.what());
+        return nullptr;
+    }
+    return cam;
+}
+
 // ============================================================
 // 双目相机（校正后平行双目）
 // ============================================================

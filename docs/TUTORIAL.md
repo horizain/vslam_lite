@@ -1,7 +1,7 @@
 # VSLAM 从零入门教程
 
-> 配套项目：教学级单目视觉里程计（Visual Odometry）
-> 语言：C++23 ｜ 依赖：OpenCV / Eigen / Pangolin / yaml-cpp / g2o
+> 配套项目：教学级单目/双目视觉里程计与可选回环 SLAM
+> 语言：C++23 ｜ 依赖：OpenCV / Eigen / Pangolin / yaml-cpp / vendored g2o；DBoW3 为可选回环依赖
 > 阅读对象：学过 C++ 基础、线性代数、刚接触 SLAM 的初学者
 > 建议阅读方式：**边读边打开源码对照**，按第 9 节的顺序逐文件阅读
 
@@ -28,27 +28,31 @@
 相机连续拍照 ──► 提取特征点 ──► 匹配相邻帧 ──► 恢复运动(位姿) ──► 三角化建点 ──► 输出轨迹
 ```
 
-**本项目刻意做成"教学级"**：只保留 SLAM 最核心的逻辑，砍掉工程化复杂度（词袋、回环、优化加速等），让每个文件都能独立读懂。
+**本项目刻意做成"教学级"**：保留 SLAM 的核心逻辑，并把词袋回环、异步后端等工程能力拆成可选模块，让每个文件都能独立读懂。
 
 ### 1.1 怎么运行
 
 ```bash
-# 构建
-mkdir -p build && cd build
-cmake .. && make -j$(nproc)
+# 构建（在仓库根目录执行）
+cmake -S . -B build -DBUILD_TESTS=ON
+cmake --build build -j2
 
 # 跑摄像头（实时）
-./bin/run_vo 0
+./build/bin/run_vo 0
 
-# 跑图片序列（KITTI 格式目录）
-./bin/run_vo /path/to/image_dir config/default.yaml
+# 跑 KITTI 双目序列
+./build/bin/run_vo datasets/kitti/sequences/00 config/kitti00.yaml kitti_vo.txt --headless
 
 # 跑 TUM / EuRoC 数据集
-./bin/run_vo /path/to/tum_dataset --tum
-./bin/run_vo /path/to/euroc_dataset --euroc
+./build/bin/run_vo /path/to/tum_dataset --tum
+./build/bin/run_vo datasets/euroc/V1_01_easy/mav0 config/default.yaml \
+    euroc_vo.txt --euroc --headless
+
+# 启用可选 DBoW3 回环的入口
+./build/bin/run_slam datasets/kitti/sequences/00 config/kitti00.yaml slam.txt --headless
 
 # 单元测试
-cmake -DBUILD_TESTS=ON .. && make test_vo && ./test_vo
+ctest --test-dir build --output-on-failure
 ```
 
 ### 1.2 一帧图像里发生了什么（30 秒版）
@@ -78,7 +82,7 @@ cmake -DBUILD_TESTS=ON .. && make test_vo && ./test_vo
 │  │ Feature  │→ │ tryInit  │→ │ track  │ │
 │  │ Matcher  │  │ /track   │  │ Frame  │ │
 │  └──────────┘  └────┬─────┘  └───┬────┘ │
-│                     │ pose_cw    │       │
+│                     │ pose_cs    │       │
 │                     ▼            ▼       │
 │              ┌────────────┐ ┌──────────┐│
 │              │ Map        │ │ Optimizer││
@@ -97,8 +101,8 @@ cmake -DBUILD_TESTS=ON .. && make test_vo && ./test_vo
 
 | 数据结构 | 含义 | 关键字段 |
 |---|---|---|
-| `Frame` | 一帧图像 + 它的特征 + 它的位姿 | `keypoints`、`descriptors`、`map_points`、`pose_cw` |
-| `MapPoint` | 三维世界中的一个点 | `pos_w`（世界坐标）、`observed_count` |
+| `Frame` | 一帧图像 + 它的特征 + 它的位姿 | `keypoints`、`descriptors`、`map_points`、`pose_cs` |
+| `MapPoint` | 子地图局部系中的三维点 | `pos_s`、正式 `Observation` 集合 |
 | `Map` | 全局容器 | `keyframes_`（关键帧）、`map_points_`（地图点） |
 
 **最重要的概念：`map_points` 数组**
@@ -135,7 +139,8 @@ T_cw = [ R  t ]   其中 R: 3×3 旋转，t: 3×1 平移
 
 > ⚠️ **这是本项目踩过的最大的坑**。很多资料里 `T_cw` 的意思是"相机在世界系中的位姿"（即 T_wc），两种约定会写出互为逆矩阵的代码，跑起来轨迹"看起来对"，但三角化全是错的。
 >
-> 本项目**统一约定**：`pose_cw` = T_cw = 世界→相机。证据链：
+> 本项目关键帧保存 `pose_cs` = T_cs（子地图局部系→相机）；组合子地图锚点后得到
+> 世界→相机的 `T_cw`。证据链：
 > 1. `solvePnP` 的返回值就是 T_cw（世界→相机）
 > 2. 三角化投影矩阵 `P = K·T_cw` 需要 T_cw
 > 3. 深度检查 `(T_cw · p_w).z > 0` 需要 T_cw
@@ -186,10 +191,16 @@ p_c2 = R · p_c1 + t
 即"把第一帧的点变换到第二帧"——**它就是 T_cw2**（当第一帧是原点时）。所以初始化代码里直接：
 
 ```cpp
-curr_frame_->pose_cw = matToSE3(R, t);   // 不要再取逆！
+curr_frame_->pose_cs = matToSE3(R, t) * ref_frame_->pose_cs; // 局部系中直接组合
 ```
 
 > 很多教程会写 `T_12.inverse()`，那是把 R,t 当成了"1→2 的逆"——用合成点对一测就露馅：取逆方向会让所有三角化点跑到相机**后方**（深度为负）。项目 `test_vo.cpp` 的 `[Pose Semantics]` 测试专门守护这个语义。
+
+初始化退化判定不能使用 `||t||` 作为视差：`recoverPose` 的单目平移只确定方向，
+通常已归一化为单位长度。实现把归一化观测光线变换到第一帧后计算
+`angle(d₁, Rᵀd₂)` 的中位数（三角化角，弧度），并要求三角化点在两帧均为正深度的比例
+不低于 0.7；`VO.min_parallax`（默认 `0.0175`，约 1°）就是该角度门槛。因此纯旋转、近零基线或
+低正深度比例会停留在 `INITIALIZING`，不会创建退化地图。
 
 ### 3.4 PnP（已知 3D 点，求当前帧位姿）
 
@@ -227,7 +238,9 @@ min  Σ  ‖ K·T_cw·P_w 投影出来的像素  −  实际观测像素 ‖²
   ● 鲁棒核(Huber)    = 抑制外点对优化的破坏
 ```
 
-> g2o 里 `VertexSE3Expmap` 的位姿语义是 **T_wc**（相机在世界系）！与我们的 T_cw 相反，所以喂给 g2o 之前要 `pose_cw.inverse()`，优化完再转回来。`optimizer.cpp` 里两处注释都标明了。
+> g2o 的内部顶点表示与项目快照字段不同；`optimizer.cpp` 负责在 `pose_cs`/T_cw
+> 与 g2o 所需表示之间显式转换，结果再转换回项目位姿语义。不要在前端自行交换
+> `pose_cs` 与其逆矩阵。
 
 ---
 
@@ -270,8 +283,9 @@ min  Σ  ‖ K·T_cw·P_w 投影出来的像素  −  实际观测像素 ‖²
 
 ### 4.3 精简 MiniAtlas
 
-`Atlas` 只负责保存多个局部 `Submap`，不负责子地图融合和位姿图优化。每个子地图记录一个
-`origin_Twc` 锚点，但帧位姿和地图点仍统一使用全局世界坐标：
+`Atlas` 只负责保存多个局部 `Submap`，不负责把子地图合并成一个地图。每个子地图记录
+`T_ws`（子地图→世界）锚点；关键帧位姿和地图点保存在局部系，世界→相机位姿按
+`T_cw = T_cs * T_ws.inverse()` 派生：
 
 ```text
 短时跟踪失败 → RECOVERING → LOST
@@ -280,9 +294,9 @@ min  Σ  ‖ K·T_cw·P_w 投影出来的像素  −  实际观测像素 ‖²
 ```
 
 创建新子地图时不清空历史轨迹，也不把第一帧显示到原点。需要注意：LOST 期间真实运动未知，
-最后有效位姿只能作为 Viewer 的显示锚点，不能证明新子地图已经连接到全局世界系。因此新子地图
-先标记为 `disconnected`，其中的位姿不写入主 ATE 轨迹；后续重定位到已连接地图后才恢复全局
-有效输出。`Status` 中的 `submap_id`、`map_connected`、`pose_valid` 和 `lost_frames` 可用于诊断。
+当前实现以最后有效位姿/限幅外推作为低置信 `TrackingBridge` 锚点，因此新子地图可继续输出，
+但其全局对齐仍应由后续重定位或 Atlas 约束修正。`pose_valid` 是最终轨迹筛选条件；
+`Status` 中的 `submap_id`、`map_connected`、`pose_valid` 和 `lost_frames` 可用于诊断。
 
 ### 4.4 双目深度质量门槛
 
@@ -373,7 +387,7 @@ Vec3 pixel2camera(const Vec2& pixel, double depth);   // 像素 → 归一化坐
 ### 5.3 `frame.h / mappoint.h / map.h` —— 数据三件套
 
 - `Frame`：看图 5.3-1，重点理解 `map_points[i]` 与 `keypoints[i]` 的配对
-- `MapPoint`：`pos_w` 世界坐标 + `create()` 三角化工厂
+- `MapPoint`：`pos_s` 子地图坐标 + 正式 `Observation` + `create()` 三角化工厂
 - `Map`：两个 `std::map` 容器 + `nextMapPointId()` 全局唯一 id
 
 ### 5.4 `feature.h/cpp` —— 眼睛
@@ -394,7 +408,7 @@ trackLK(prev, curr) // 光流跟踪（LK 模式用）
 1. 建 Frame + CLAHE 增强 + 提取特征
 2. 按状态分发：tryInitialize / trackFrame(LK) / tryRelocalize
 3. 关键帧判决 + 插入 + Local BA
-4. 记录轨迹，返回 pose_cw
+4. 记录轨迹，组合并返回世界系 T_cw
 ```
 
 `VOConfig` 结构体把**所有可调参数**集中起来（对应 config/default.yaml），构造函数传入——改参数不用改代码。
@@ -411,7 +425,10 @@ Pangolin 双窗口：**左 = 世界系 2D 轨迹图**（x-z 俯视，红色箭�
 
 ### 5.8 `dataset.cpp` —— 数据输入
 
-一个抽象，四种来源：KITTI（图片目录）、TUM（`rgb.txt` 时间戳）、EuRoC（`cam0/data.csv`）、摄像头（`VideoCapture`）。时间戳数组 `timestamps_` 是 TUM 轨迹评估的关键。
+一个抽象，四种来源：KITTI（图片目录）、TUM（`rgb.txt` 时间戳）、EuRoC
+（`mav0/cam0/data.csv`）、摄像头（`VideoCapture`）。EuRoC 可传数据集根目录或 `mav0`
+目录；程序读取 `cam0/sensor.yaml` 的 pinhole + radial-tangential 标定并去畸变。
+时间戳数组 `timestamps_` 是轨迹评估的关键。
 
 ### 5.9 `run_vo.cpp` —— 组装一切
 
@@ -495,7 +512,7 @@ std::string status = std::format("{} | Matches:{} Parallax:{:.2f}", state_str, s
 第 4 步  vo.cpp 的 addFrame → tryInitialize → trackFrame（60 分钟）⭐核心
 第 5 步  optimizer.cpp（30 分钟）——BA 的六步模板
 第 6 步  viewer/dataset/run_vo（30 分钟）——把它们串起来
-第 7 步  跑起来：./test_vo 和 ./bin/run_vo 0
+第 7 步  跑起来：`ctest --test-dir build` 和 `./build/bin/run_vo 0`
 ```
 
 ### 7.2 动手实验（由易到难）
@@ -521,7 +538,9 @@ std::string status = std::format("{} | Matches:{} Parallax:{:.2f}", state_str, s
 （C++23 的 `std::chrono::system_clock` 精度足够）
 
 **实验 6：真正跑通 KITTI 并评估**
-下载 KITTI 双目 → `scripts/prepare_kitti.sh` → 传序列根目录给 `run_slam` → 输出轨迹并评估。
+下载 KITTI 双目 → `scripts/prepare_kitti.sh`（默认写入 `datasets/kitti/`）→ 传
+`datasets/kitti/sequences/00` 给 `run_slam`；真值位于 `datasets/kitti/poses/00.txt`，
+然后输出轨迹并评估。
 
 ### 7.3 评估工具 EVO 速查
 
@@ -575,9 +594,10 @@ evo_traj tum trajectory.txt groundtruth.txt -p
 
 ---
 
-## 9. 下一步：从 VO 到 SLAM（Phase 2 预告）
+## 9. 从 VO 到 SLAM（当前能力与边界）
 
-当前项目完成的是 **VO（无回环）**。真正的 SLAM 还要加三块，本项目已在 `loop_closure.h` 留好接口：
+当前项目已接入可选 DBoW3 回环检测、SE3 位姿图和异步后端；关闭回环时仍可作为纯 VO
+运行。全局 BA 可配置但默认关闭，跨子地图地图点融合尚未实现：
 
 1. **回环检测**：用词袋（DBoW3）判断"我是不是回到了老地方"→ 检测到回环说明漂移可纠正
 2. **位姿图优化**：只优化关键帧位姿（加回环边约束），速度快于全局 BA
@@ -587,9 +607,10 @@ evo_traj tum trajectory.txt groundtruth.txt -p
 
 ---
 
-## 10. 性能优化实战（2026-08-05 真实案例）
+## 10. 性能优化实战（2026-08-05 历史案例）
 
-> 这一章用项目里真实发生的一次性能攻坚战（KITTI 00 全程 run_slam）讲清楚
+> 本章是旧实现、旧配置下的历史性能快照，不代表当前 HEAD；当前双轮基准见
+> `DEVELOPMENT_LOG.md` §3.23。它用一次 KITTI 00 全程 run_slam 攻坚讲清楚
 > **如何系统地定位和解决性能问题**。全程 8 项改动，FPS 3.3 → 8+，单次卡顿
 > 从 131 秒降到毫秒级，ATE 同时从 178m 降到 15-33m。
 
@@ -600,7 +621,7 @@ evo_traj tum trajectory.txt groundtruth.txt -p
 （`utils/perf_monitor.h`），程序退出时 dump 出每个阶段的平均/最大耗时：
 
 ```bash
-./build/bin/run_vo datasets/sequences/00 config/kitti00.yaml t.txt --headless
+./build/bin/run_vo datasets/kitti/sequences/00 config/kitti00.yaml t.txt --headless
 # 退出后看控制台 + perf.csv
 ```
 
@@ -704,7 +725,7 @@ Sim3 ATE 只作为形状诊断，不能替代双目绝对尺度指标。
 □ 有没有做过 A/B 单变量对比？
 ```
 
-**嵌入式/实时性展望**：当前 x86 笔记本 ~8 FPS（KITTI 10Hz 数据）。下一阶段
+**当时的嵌入式/实时性展望**：该历史版本在 x86 笔记本约 8 FPS（KITTI 10Hz 数据）。下一阶段
 框架级优化：关键帧稀疏化（全程 2700 → <1000 KF）、异步后端（前端不等待 BA）、
 特征数自适应（低纹理段不需要 2000 特征）。这三点做完，4 核 ARM 跑 10Hz 是
 可行的。

@@ -81,6 +81,8 @@ public:
 
     /// 从 yaml 配置加载（Camera 段）
     static Camera fromYaml(const std::string& path);
+    /// 从 EuRoC cam0/sensor.yaml 加载针孔内参与畸变参数
+    static Camera fromEurocSensorYaml(const std::string& path);
 };
 
 // ============================================================

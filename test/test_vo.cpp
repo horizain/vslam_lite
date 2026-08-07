@@ -16,6 +16,7 @@
 
 #include "vslam/common.h"
 #include "vslam/camera.h"
+#include "vslam/dataset.h"
 #include "vslam/feature.h"
 #include "vslam/vo.h"
 #include "vslam/atlas.h"
@@ -26,6 +27,7 @@
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <iostream>
 #include <cassert>
@@ -35,8 +37,10 @@
 #include <numeric>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <map>
+#include <thread>
 
 // 简单的测试辅助宏
 #define TEST(name) \
@@ -109,6 +113,53 @@ void test_camera_projection() {
         assert(std::abs(px.x() - 320.0) < 1e-6);
         assert(std::abs(px.y() - 240.0) < 1e-6);
     } TEST_PASS();
+
+    TEST("EuRoC sensor.yaml 内参/畸变与图像去畸变") {
+        const auto unique_id = std::chrono::steady_clock::now()
+                                   .time_since_epoch().count();
+        const auto root = std::filesystem::temp_directory_path()
+                         / ("vslam_euroc_sensor_test_"
+                            + std::to_string(unique_id));
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root / "mav0/cam0/data");
+        {
+            std::ofstream sensor(root / "mav0/cam0/sensor.yaml");
+            sensor << "camera_model: pinhole\n"
+                   << "resolution: [32, 24]\n"
+                   << "intrinsics: [20.0, 21.0, 16.0, 12.0]\n"
+                   << "distortion_model: radial-tangential\n"
+                   << "distortion_coefficients: [-0.2, 0.03, 0.01, -0.02]\n";
+        }
+        {
+            std::ofstream csv(root / "mav0/cam0/data.csv");
+            csv << "#timestamp [ns],filename\n"
+                << "1000000000,000000.png\n";
+        }
+        cv::Mat source(24, 32, CV_8UC3, cv::Scalar(0, 0, 0));
+        cv::rectangle(source, cv::Rect(12, 8, 8, 8),
+                      cv::Scalar(255, 255, 255), -1);
+        cv::imwrite((root / "mav0/cam0/data/000000.png").string(), source);
+
+        vslam::Dataset dataset(root.string(), vslam::Dataset::Type::EUROC);
+        assert(dataset.hasCalibration());
+        assert(dataset.totalFrames() == 1);
+        auto camera = dataset.getCamera();
+        assert(camera && camera->type() == vslam::CameraType::MONOCULAR);
+        assert(std::abs(camera->fx - 20.0) < 1e-12);
+        assert(std::abs(camera->fy - 21.0) < 1e-12);
+        assert(camera->img_width == 32 && camera->img_height == 24);
+        assert(std::abs(camera->k1 + 0.2) < 1e-12);
+        assert(std::abs(camera->p2 + 0.02) < 1e-12);
+
+        cv::Mat left, right;
+        double timestamp = 0.0;
+        assert(dataset.nextFrame(left, right, timestamp));
+        assert(std::abs(timestamp - 1.0) < 1e-12);
+        assert(right.empty());
+        assert(left.size() == source.size());
+        assert(cv::norm(left, source, cv::NORM_INF) > 0.0);
+        std::filesystem::remove_all(root);
+    } TEST_PASS();
 }
 
 void test_feature_extraction() {
@@ -168,6 +219,64 @@ void test_mobile_config() {
         assert(cfg.local_window_size == 6);
         assert(cfg.local_ba_iterations == 3);
         assert(cfg.enable_loop_closure);
+        assert(std::abs(cfg.min_parallax - 0.025) < 1e-12);
+        assert(cfg.min_init_inliers == 18);
+    } TEST_PASS();
+}
+
+void test_monocular_initialization_quality() {
+    TEST("单目初始化几何判定拒绝纯旋转/近零基线") {
+        const vslam::Mat33 R = Eigen::AngleAxisd(
+            0.35, vslam::Vec3::UnitY()).toRotationMatrix();
+        std::vector<vslam::Vec2> ref, curr;
+        for (int i = 0; i < 20; ++i) {
+            const vslam::Vec3 ray(0.1 * (i - 10), 0.03 * (i - 5), 1.0);
+            const vslam::Vec3 rotated = R * ray;
+            ref.emplace_back(ray.x() / ray.z(), ray.y() / ray.z());
+            curr.emplace_back(rotated.x() / rotated.z(),
+                              rotated.y() / rotated.z());
+        }
+        // recoverPose 的 t 即使在纯旋转退化时也可能是任意单位方向；
+        // 必须依靠光线夹角而不是 ||t|| 拒绝它。
+        const auto pure_rotation = vslam::assessMonocularInitialization(
+            ref, curr, R, vslam::Vec3(1.0, 0.0, 0.0), 0.1);
+        assert(!pure_rotation.accepted);
+        assert(pure_rotation.parallax_rad < 1e-8);
+
+        const auto near_zero_baseline = vslam::assessMonocularInitialization(
+            ref, curr, R, vslam::Vec3(1e-12, 0.0, 0.0), 0.1);
+        assert(!near_zero_baseline.accepted);
+    } TEST_PASS();
+
+    TEST("单目初始化几何判定要求足够视差和双正深度") {
+        const vslam::Mat33 R = vslam::Mat33::Identity();
+        const vslam::Vec3 t(1.0, 0.0, 0.0);
+        std::vector<vslam::Vec2> ref, curr;
+        for (int i = 0; i < 20; ++i) {
+            const double x = -0.8 + 0.08 * i;
+            const double y = -0.3 + 0.03 * (i % 10);
+            const double z = 4.0 + 0.2 * (i % 7);
+            ref.emplace_back(x / z, y / z);
+            curr.emplace_back((x + t.x()) / z, y / z);
+        }
+        const auto good = vslam::assessMonocularInitialization(
+            ref, curr, R, t, 0.1);
+        assert(good.accepted);
+        assert(good.parallax_rad > 0.1);
+        assert(good.positive_depth_ratio > 0.99);
+
+        std::vector<vslam::Vec2> mostly_invalid_ref, mostly_invalid_curr;
+        for (int i = 0; i < 20; ++i) {
+            const double z = 4.0 + 0.1 * i;
+            mostly_invalid_ref.emplace_back(0.0, 0.02 * (i % 5));
+            const double disparity_sign = i < 5 ? 1.0 : -1.0;
+            mostly_invalid_curr.emplace_back(disparity_sign / z,
+                                             0.02 * (i % 5));
+        }
+        const auto low_positive = vslam::assessMonocularInitialization(
+            mostly_invalid_ref, mostly_invalid_curr, R, t, 0.1);
+        assert(!low_positive.accepted);
+        assert(low_positive.positive_depth_ratio < 0.7);
     } TEST_PASS();
 }
 
@@ -189,6 +298,7 @@ void test_vo_initialization() {
         // 合成场景特征匹配数较少，显式放宽初始化阈值（验证 VOConfig 接口生效）
         vslam::VOConfig cfg;
         cfg.min_matches_init = 20;
+        cfg.min_init_inliers = 10;
 
         vslam::VisualOdometry vo(cam, cfg);
 
@@ -203,6 +313,18 @@ void test_vo_initialization() {
         // 检查是否初始化成功（可能成功，取决于合成图像的特征质量）
         std::cout << " (state=" << static_cast<int>(vo.state()) << ")"
                   << " map_points=" << vo.getMap()->mapPointCount();
+        if (vo.getMap()->keyFrameCount() > 0)
+            assert(vo.getMap()->verifyObservationConsistency());
+
+        // 几何内点门槛必须在原始匹配数足够时仍能阻止退化初始化。
+        vslam::VOConfig strict_cfg;
+        strict_cfg.min_matches_init = 20;
+        strict_cfg.min_init_inliers = 1000;
+        vslam::VisualOdometry strict_vo(cam, strict_cfg);
+        strict_vo.addFrame(img1, 0.0);
+        strict_vo.addFrame(img2, 0.1);
+        assert(strict_vo.state() == vslam::VisualOdometry::State::INITIALIZING);
+        assert(strict_vo.getMap()->mapPointCount() == 0);
     } TEST_PASS();
 }
 
@@ -314,6 +436,7 @@ void test_lk_tracking() {
         vslam::VOConfig cfg;
         cfg.feature_method = 1;          // LK 模式
         cfg.min_matches_init = 20;
+        cfg.min_init_inliers = 20;
         cfg.min_matches_track = 10;
 
         vslam::VisualOdometry vo(cam, cfg);
@@ -329,7 +452,60 @@ void test_lk_tracking() {
         }
         // 至少一半帧保持在 TRACKING（合成场景允许回退 ORB）
         assert(track_ok >= 2);
+        assert(vo.getMap()->mapPointCount() > 0);
         std::cout << " (tracking_frames=" << track_ok << "/4)";
+    } TEST_PASS();
+}
+
+void test_monocular_3d_initialization() {
+    TEST("单目确定性 3D 场景初始化进入 TRACKING") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        const cv::Mat K = cam->K();
+
+        struct Block { cv::Point3f center; float sx, sy; int gray; };
+        std::vector<Block> blocks;
+        for (int iy = -2; iy <= 2; ++iy) {
+            for (int ix = -4; ix <= 4; ++ix) {
+                const float z = 4.0f + ((ix + iy) & 1) * 0.8f;
+                const int gray = 80 + ((ix + 5) * 31 + (iy + 3) * 17) % 150;
+                blocks.push_back({cv::Point3f(0.48f * ix, 0.48f * iy, z),
+                                  0.22f, 0.22f, gray});
+            }
+        }
+
+        auto render = [&](double tx) {
+            cv::Mat image(480, 640, CV_8UC1, cv::Scalar(32));
+            const cv::Mat rvec = cv::Mat::zeros(3, 1, CV_64F);
+            const cv::Mat tvec = (cv::Mat_<double>(3, 1) << tx, 0.0, 0.0);
+            for (const auto& block : blocks) {
+                const auto& c = block.center;
+                std::vector<cv::Point3f> corners = {
+                    {c.x - block.sx, c.y - block.sy, c.z},
+                    {c.x + block.sx, c.y - block.sy, c.z},
+                    {c.x + block.sx, c.y + block.sy, c.z},
+                    {c.x - block.sx, c.y + block.sy, c.z}};
+                std::vector<cv::Point2f> pixels;
+                cv::projectPoints(corners, rvec, tvec, K, cv::Mat(), pixels);
+                std::vector<cv::Point> polygon;
+                for (const auto& pixel : pixels)
+                    polygon.emplace_back(cvRound(pixel.x), cvRound(pixel.y));
+                cv::fillConvexPoly(image, polygon, cv::Scalar(block.gray));
+            }
+            return image;
+        };
+
+        vslam::VOConfig cfg;
+        cfg.min_matches_init = 20;
+        cfg.min_init_inliers = 10;
+        vslam::VisualOdometry vo(cam, cfg);
+        vo.addFrame(render(0.0), 0.0);
+        vo.addFrame(render(0.4), 0.1);
+
+        assert(vo.state() == vslam::VisualOdometry::State::TRACKING);
+        assert(vo.getMap()->mapPointCount() > 0);
+        assert(vo.getMap()->verifyObservationConsistency());
     } TEST_PASS();
 }
 
@@ -372,12 +548,14 @@ void test_long_run_stability() {
 
         vslam::VOConfig cfg;
         cfg.min_matches_init = 20;
+        cfg.min_init_inliers = 10;
 
         vslam::VisualOdometry vo(cam, cfg);
 
         // 螺旋路径 150 帧：缓慢前进 + 小幅摆动
         constexpr int kFrames = 150;
         std::vector<double> frame_ms;
+        bool initialized = false;
         for (int f = 0; f < kFrames; f++) {
             cv::Mat rvec = (cv::Mat_<double>(3,1) << 0.003*f, 0.005*f, 0);
             cv::Mat tvec = (cv::Mat_<double>(3,1) << 0.1*f, 0.02*std::sin(f*0.05), 0.1*std::sin(f*0.03));
@@ -388,6 +566,9 @@ void test_long_run_stability() {
             vo.addFrame(img, f * 0.1);
             auto t1 = std::chrono::steady_clock::now();
             frame_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            initialized = initialized ||
+                (vo.state() == vslam::VisualOdometry::State::TRACKING &&
+                 vo.getMap()->mapPointCount() > 0);
         }
 
         auto avg = [&](int from, int to) {
@@ -404,6 +585,7 @@ void test_long_run_stability() {
                   << " avg_first=" << avg_first << "ms avg_last=" << avg_last << "ms)";
 
         // 有界性：关键帧 ≈ 30（每 0.5m 一个，共 15m），地图点几千
+        assert(initialized);
         assert(kf < 80);
         assert(mp < 15000);
         // 稳定性：末尾帧耗时不能比开头差 3 倍以上（防增长型卡死回归）
@@ -417,10 +599,54 @@ void test_long_run_stability() {
 // 守护：本机 apt 版 g2o 的 EdgeProjectXYZ2UV 用 T_cw 语义，
 // 若喂 T_wc 会被反向优化（实测帧位姿被拉飞、轨迹尺度膨胀）。
 // ============================================================
+void test_camera_position_delta() {
+    TEST("T_cw 光心位移指标不混入旋转") {
+        const vslam::Vec3 old_center(2.0, -1.0, 4.0);
+        const vslam::Vec3 new_center(2.12, -1.07, 4.20);
+        const Eigen::Quaterniond old_rotation(
+            Eigen::AngleAxisd(0.4, vslam::Vec3::UnitY()));
+        const Eigen::Quaterniond new_rotation(
+            Eigen::AngleAxisd(-0.7, vslam::Vec3::UnitZ()) *
+            Eigen::AngleAxisd(0.2, vslam::Vec3::UnitX()));
+        const vslam::SE3 old_cw(old_rotation, -(old_rotation * old_center));
+        const vslam::SE3 new_cw(new_rotation, -(new_rotation * new_center));
+        const double expected = (new_center - old_center).norm();
+        assert(std::abs(vslam::cameraPositionDelta(old_cw, new_cw) - expected)
+               < 1e-12);
+        std::cout << " (delta=" << expected << "m)";
+    } TEST_PASS();
+}
+
+void test_local_ba_filter_helper() {
+    TEST("Local BA 弱观测过滤") {
+        assert(vslam::includeLocalBALandmark(3, 3));
+        assert(!vslam::includeLocalBALandmark(2, 3));
+        assert(vslam::includeLocalBALandmark(0, 0));
+    } TEST_PASS();
+
+    TEST("帧内回环后按参考 KF 重基并保持 T_ca") {
+        const vslam::SE3 old_ref(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.2, vslam::Vec3::UnitY())),
+            vslam::Vec3(2, -1, 4));
+        const vslam::SE3 frame(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.24, vslam::Vec3::UnitY())),
+            vslam::Vec3(2.7, -0.8, 4.4));
+        const vslam::SE3 new_ref(
+            Eigen::Quaterniond(Eigen::AngleAxisd(-0.35, vslam::Vec3::UnitZ())),
+            vslam::Vec3(-30, 7, 12));
+        const auto rebased = vslam::rebaseAnchoredFramePose(
+            frame, old_ref, new_ref);
+        const auto old_T_ca = frame * old_ref.inverse();
+        const auto new_T_ca = rebased * new_ref.inverse();
+        assert((old_T_ca.matrix() - new_T_ca.matrix()).norm() < 1e-12);
+        assert((rebased.matrix() - frame.matrix()).norm() > 1.0);
+    } TEST_PASS();
+}
+
 void test_local_ba() {
     TEST("Local BA 保持尺度 (3 帧已知位姿)") {
         auto cam = std::make_shared<vslam::MonocularCamera>();
-        cam->fx = 500; cam->fy = 500; cam->cx = 320; cam->cy = 240;
+        cam->fx = 500; cam->fy = 620; cam->cx = 320; cam->cy = 240;
         cam->img_width = 640; cam->img_height = 480;
 
         auto map = std::make_shared<vslam::Map>();
@@ -444,7 +670,6 @@ void test_local_ba() {
         for (int i = 0; i < 20; i++) {
             auto mp = std::make_shared<vslam::MapPoint>((unsigned long)i);
             mp->pos_s = vslam::Vec3(dx(gen), dy(gen), dz(gen));
-            mp->observed_count = 3;
             map->insertMapPoint(mp);
             for (int f = 0; f < 3; f++) {
                 vslam::Vec2 px = cam->world2pixel(mp->pos_s, kfs[f]->pose_cs);
@@ -454,32 +679,60 @@ void test_local_ba() {
                 kfs[f]->map_points.push_back(mp);
             }
         }
+        for (const auto& kf : kfs) map->syncKeyframeObservations(kf);
+        assert(map->verifyObservationConsistency());
 
-        // M1：构建只读快照 → 纯计算 → 结果携带候选增量
+        // M1：构建只读快照 → 纯计算 → 结果携带候选增量。
+        // ObservationState 使用非连续 feature_index，且 id=0 是合法地图点。
         vslam::OptimizationSnapshot snap;
-        std::set<unsigned long> seen_mp;
         for (auto& kf : kfs) {
             vslam::KeyframeState ks;
             ks.id = kf->id;
             ks.pose_cs = kf->pose_cs;
-            for (size_t i = 0; i < kf->keypoints.size(); i++) {
-                ks.keypoints.push_back(kf->keypoints[i]);
-                ks.map_points.push_back(kf->map_points[i] ? kf->map_points[i]->id : 0);
-                if (kf->map_points[i]) seen_mp.insert(kf->map_points[i]->id);
-            }
             snap.keyframes.push_back(std::move(ks));
         }
-        for (auto id : seen_mp) {
-            auto mp = map->getMapPoint(id);
-            if (mp) snap.landmarks.push_back({id, mp->pos_s, mp->observed_count});
+        for (const auto& mp : map->getAllMapPoints()) {
+            snap.landmarks.push_back({mp->id, mp->pos_s,
+                                      static_cast<int>(mp->observationCount())});
+        }
+        for (size_t f = 0; f < kfs.size(); ++f) {
+            for (size_t i = 0; i < kfs[f]->map_points.size(); ++i) {
+                const auto& mp = kfs[f]->map_points[i];
+                if (!mp) continue;
+                const vslam::Vec2 pixel = cam->world2pixel(
+                    mp->pos_s, kfs[f]->pose_cs);
+                snap.observations.push_back({
+                    kfs[f]->id, static_cast<vslam::FeatureIndex>(7 + 2 * i),
+                    mp->id, pixel, std::nullopt});
+            }
         }
         snap.fixed_kf_ids = {0, 1};  // 帧 0/1 固定（基线锚定）
 
+        // 观测仍来自真值，但让非固定帧从一个带旋转/平移的初值开始；
+        // 这样会验证 BA 的投影模型和 Jacobian 真正驱动了收敛，而不是
+        // 仅凭“初始残差为 0”通过。
+        const vslam::SE3 perturb(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.08, vslam::Vec3::UnitY())),
+            vslam::Vec3(0.18, -0.12, 0.10));
+        const vslam::SE3 perturbed_twc = Twc[2] * perturb;
+        snap.keyframes[2].pose_cs = perturbed_twc.inverse();
+        const double initial_pose_error =
+            (perturbed_twc.t - Twc[2].t).norm();
+
         auto result = vslam::Optimizer::solveLocalBA(cam, snap, 10);
         assert(result.valid);
-        // 点固定（motion-only）+ 帧 0/1 固定：尺度必须保持 1m/帧
+        assert(result.metrics.edges == 60);  // 20 点×3 KF，包含合法 id=0
+        // 非方形像素测试自定义投影边确实使用 fy；精确输入不应被
+        // 错误的单一 focal_length 模型拉动位姿。
         std::map<unsigned long, vslam::SE3> opt_pose;
         for (auto& u : result.poses) opt_pose[u.id] = u.pose_cs;
+        const double final_pose_error =
+            (opt_pose[2].inverse().t - Twc[2].t).norm();
+        assert(result.metrics.max_correction > initial_pose_error * 0.5);
+        assert(final_pose_error < initial_pose_error * 0.35);
+        std::cout << " (pose_error=" << initial_pose_error << "m -> "
+                  << final_pose_error << "m)";
+        // 点固定（motion-only）+ 帧 0/1 固定：尺度必须保持 1m/帧
         auto disp = [&](int a, int b) {
             return (opt_pose[(unsigned long)b].inverse().t
                     - opt_pose[(unsigned long)a].inverse().t).norm();
@@ -490,6 +743,81 @@ void test_local_ba() {
         // 快照 API 不修改任何实时对象
         for (auto& kf : kfs)
             assert((kf->pose_cs.matrix() - Twc[kf->id].inverse().matrix()).norm() < 1e-12);
+    } TEST_PASS();
+}
+
+// ============================================================
+// Local BA gauge 回归：窗口含两个不相交的观测分量时，调用方只提供
+// 分量 A 的固定帧，Optimizer 必须为分量 B 选择局部锚，不能让其自由漂移。
+// ============================================================
+void test_local_ba_disconnected_components() {
+    TEST("Local BA 为断开观测分量选择局部锚") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = 500; cam->fy = 620; cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+
+        vslam::OptimizationSnapshot snap;
+        std::vector<vslam::SE3> true_twc;
+        for (int component = 0; component < 2; component++) {
+            const double x_base = component == 0 ? 0.0 : 10.0;
+            for (int frame = 0; frame < 3; frame++) {
+                true_twc.emplace_back(
+                    Eigen::Quaterniond::Identity(),
+                    vslam::Vec3(x_base + frame, 0, 0));
+            }
+        }
+
+        constexpr int kPointsPerComponent = 12;
+        for (int component = 0; component < 2; component++) {
+            const unsigned long id_base = component == 0 ? 100 : 200;
+            const double x_base = component == 0 ? 0.0 : 10.0;
+            for (int frame = 0; frame < 3; frame++) {
+                vslam::KeyframeState kf;
+                kf.id = id_base + static_cast<unsigned long>(frame);
+                kf.pose_cs = true_twc[component * 3 + frame].inverse();
+                for (int point = 0; point < kPointsPerComponent; point++) {
+                    const unsigned long mp_id =
+                        static_cast<unsigned long>(component * 1000 + point);
+                    const vslam::Vec3 p(
+                        x_base - 1.0 + 0.17 * point,
+                        -0.7 + 0.11 * (point % 7),
+                        5.0 + 0.18 * point);
+                    if (frame == 0)
+                        snap.landmarks.push_back({mp_id, p, 3});
+                    const vslam::Vec2 pixel = cam->world2pixel(p, kf.pose_cs);
+                    snap.observations.push_back({
+                        kf.id, static_cast<vslam::FeatureIndex>(11 + point * 3),
+                        mp_id, pixel, std::nullopt});
+                }
+                snap.keyframes.push_back(std::move(kf));
+            }
+        }
+
+        // B 的初值整体平移，且只锚定 A；Optimizer 必须自动固定 B 的
+        // 前两帧，否则带自由点的 BA 存在未约束的刚体/尺度 gauge。
+        const vslam::SE3 shift(
+            Eigen::Quaterniond::Identity(), vslam::Vec3(2.0, 0, 0));
+        for (size_t i = 3; i < 6; i++)
+            snap.keyframes[i].pose_cs = (true_twc[i] * shift).inverse();
+        snap.fixed_kf_ids = {100, 101};
+
+        auto result = vslam::Optimizer::solveLocalBA(cam, snap, 20, false);
+        assert(result.valid);
+        std::map<unsigned long, vslam::SE3> poses;
+        for (const auto& update : result.poses) poses[update.id] = update.pose_cs;
+        assert(poses.size() == 6);
+        // B 的局部锚必须保持其快照初值；若沿用全局固定集，这两个
+        // 顶点会被整体拉回真值，回归即可区分两种行为。
+        for (size_t i = 3; i < 5; i++) {
+            const unsigned long id = 200 + static_cast<unsigned long>(i - 3);
+            assert((poses[id].matrix() - snap.keyframes[i].pose_cs.matrix()).norm()
+                   < 1e-10);
+        }
+        for (const auto& [id, pose] : poses) {
+            (void)id;
+            assert(pose.t.allFinite() && pose.q.coeffs().allFinite());
+        }
+        assert(std::isfinite(result.metrics.max_correction));
     } TEST_PASS();
 }
 
@@ -761,7 +1089,7 @@ void test_map_revision() {
         // 剔除触发 topology
         auto mp2 = std::make_shared<vslam::MapPoint>(1);
         map->insertMapPoint(mp2);
-        map->cullMapPoints(2);  // observed_count=0 < 2 → 全部剔除
+        map->cullMapPoints(2);  // 正式观测数为 0 < 2 → 全部剔除
         assert(map->topologyRevision() == 4);
 
         // 快照版本绑定 + stale 检测（M2 提交器的前置）
@@ -772,6 +1100,182 @@ void test_map_revision() {
         // 快照后地图又插入 KF → 快照过期（stale）
         map->insertKeyFrame(std::make_shared<vslam::Frame>(1, 0.1));
         assert(snap.topology_revision != map->topologyRevision());
+    } TEST_PASS();
+}
+
+void test_map_observation_model() {
+    TEST("MapPoint 正式观测：幂等、重绑、共视、剔除与 clear") {
+        auto map = std::make_shared<vslam::Map>();
+        auto kf0 = std::make_shared<vslam::Frame>(0, 0.0);
+        auto kf1 = std::make_shared<vslam::Frame>(1, 0.1);
+        kf0->keypoints.resize(2);
+        kf1->keypoints.resize(2);
+        kf0->map_points.resize(2);
+        kf1->map_points.resize(2);
+        map->insertKeyFrame(kf0);
+        map->insertKeyFrame(kf1);
+
+        auto mp0 = std::make_shared<vslam::MapPoint>(0);  // id=0 合法
+        auto mp1 = std::make_shared<vslam::MapPoint>(1);
+        map->insertMapPoint(mp0);
+        map->insertMapPoint(mp1);
+        assert(map->getMapPoint(0) == mp0);
+
+        assert(map->setObservation(kf0, 0, mp0));
+        assert(!map->setObservation(kf0, 0, mp0));  // 幂等
+        assert(!map->setObservation(kf0, 1, mp0));  // 同 KF 冲突
+        assert(mp0->observationCount() == 1);
+        assert(map->sharedObservationCount(0, 1) == 0);
+        assert(map->setObservation(kf1, 0, mp0));
+        assert(!map->setObservation(kf1, 0, mp0));  // 重复添加不得重复计数
+        assert(!mp0->addObservation({0, 1}));  // MapPoint 冲突添加也不得改状态
+        assert(mp0->observationCount() == 2);
+        assert(map->sharedObservationCount(0, 1) == 1);
+        assert(map->verifyObservationConsistency());
+
+        // 普通跟踪帧只持有临时指针，不应把一次 PnP/LK 关联计入正式观测。
+        auto tracking = std::make_shared<vslam::Frame>(2, 0.2);
+        tracking->map_points.resize(1);
+        tracking->map_points[0] = mp0;
+        assert(mp0->observationCount() == 2);
+
+        // 直接构造历史重复 slot：清除 formal slot 必须同时清掉 stale slot。
+        kf0->map_points[1] = mp0;
+        assert(!map->verifyObservationConsistency());
+        assert(map->clearObservation(0, 0));
+        assert(!kf0->map_points[0] && !kf0->map_points[1]);
+        assert(mp0->observationCount() == 1);  // kf1 的正式观测仍在
+        assert(map->verifyObservationConsistency());
+
+        // 重绑必须同步删除旧点的反向观测和共视计数。
+        assert(map->setObservation(kf0, 0, mp1));
+        assert(mp0->observationCount() == 1);
+        assert(mp1->observationCount() == 1);
+        assert(map->sharedObservationCount(0, 1) == 0);
+
+        // 重绑 duplicate slot 不得误删另一个 KF slot 的合法 formal 观测。
+        kf1->map_points[1] = mp0;
+        assert(!map->verifyObservationConsistency());
+        assert(map->setObservation(kf1, 1, mp1));
+        assert(kf1->map_points[0] == mp0);
+        assert(kf1->map_points[1] == mp1);
+        assert(mp0->observationCount() == 1);
+        assert(map->sharedObservationCount(0, 1) == 1);
+        assert(map->verifyObservationConsistency());
+
+        // feature_index 必须同时落在 keypoints/map_points 范围内；
+        // 直接构造越界历史 slot 后 sync 应将其自愈清空。
+        kf0->map_points.resize(3);
+        assert(!map->setObservation(kf0, 2, mp1));
+        kf0->map_points[2] = mp1;
+        assert(!map->verifyObservationConsistency());
+        map->syncKeyframeObservations(kf0);
+        assert(!kf0->map_points[2]);
+        assert(map->verifyObservationConsistency());
+
+        // mp0 只有一个正式观测，应被剔除；slot 与反向集合一并清空。
+        map->cullMapPoints(2);
+        assert(!map->getMapPoint(0));
+        assert(!kf1->map_points[0]);
+        assert(map->getMapPoint(1) == mp1);
+        assert(map->verifyObservationConsistency());
+
+        assert(map->clearObservation(1, 1));
+        map->cullMapPoints(2);
+        assert(!map->getMapPoint(1));
+        assert(!kf0->map_points[0]);
+        assert(!kf1->map_points[1]);
+        assert(map->verifyObservationConsistency());
+
+        // sync 覆盖历史代码直接写 slot 的迁移路径。
+        auto mp2 = std::make_shared<vslam::MapPoint>(0);
+        map->insertMapPoint(mp2);
+        kf0->map_points[1] = mp2;
+        map->syncKeyframeObservations(kf0);
+        assert(mp2->observationCount() == 1);
+        assert(mp2->featureIndex(0).value() == 1);
+        assert(map->verifyObservationConsistency());
+
+        // removeMapPoint 必须同时清掉 id=0 点的双向观测、KF slot 和共视；
+        // 重复删除不应再次减少计数或改变拓扑。
+        const auto topology_before_remove = map->topologyRevision();
+        assert(map->removeMapPoint(0));
+        assert(map->topologyRevision() == topology_before_remove + 1);
+        assert(map->mapPointCount() == 0);
+        assert(!map->getMapPoint(0));
+        assert(mp2->observationCount() == 0);
+        assert(!kf0->map_points[1]);
+        assert(map->sharedObservationCount(0, 1) == 0);
+        assert(map->verifyObservationConsistency());
+        assert(!map->removeMapPoint(0));
+        assert(map->mapPointCount() == 0);
+
+        // clear 覆盖空/非空关系，不留下任意反向观测。
+        map->clear();
+        assert(!map->getMapPoint(0));
+        assert(!kf0->map_points[0]);
+    } TEST_PASS();
+}
+
+void test_map_batch_cull() {
+    TEST("Map 批量剔除：stale slot、共视和计数一次性保持一致") {
+        auto map = std::make_shared<vslam::Map>();
+        std::vector<vslam::Frame::Ptr> kfs;
+        for (unsigned long id = 0; id < 3; id++) {
+            auto kf = std::make_shared<vslam::Frame>(id, id * 0.1);
+            kf->keypoints.resize(8);
+            kf->map_points.resize(8);
+            map->insertKeyFrame(kf);
+            kfs.push_back(kf);
+        }
+
+        auto keep = std::make_shared<vslam::MapPoint>(10);
+        auto weak = std::make_shared<vslam::MapPoint>(11);
+        auto stale_only = std::make_shared<vslam::MapPoint>(12);
+        map->insertMapPoint(keep);
+        map->insertMapPoint(weak);
+        map->insertMapPoint(stale_only);
+
+        // keep 出现在三个 KF，weak 出现在两个 KF；剔除阈值为 3，
+        // 因而 kf0/kf1 的共视由 2 降为 keep 的 1。
+        assert(map->setObservation(kfs[0], 0, keep));
+        assert(map->setObservation(kfs[1], 0, keep));
+        assert(map->setObservation(kfs[2], 0, keep));
+        assert(map->setObservation(kfs[0], 1, weak));
+        assert(map->setObservation(kfs[1], 1, weak));
+        assert(map->setObservation(kfs[2], 2, stale_only));
+        assert(map->sharedObservationCount(0, 1) == 2);
+
+        // 直接构造迁移期间可能遗留的 duplicate/stale slot。批量剔除
+        // 必须在正式 observation 删除后仍能一次扫描把这些引用清干净。
+        kfs[0]->map_points[4] = weak;
+        kfs[1]->map_points[4] = stale_only;
+        assert(!map->verifyObservationConsistency());
+
+        const auto topology_before = map->topologyRevision();
+        map->cullMapPoints(3);
+
+        assert(map->mapPointCount() == 1);
+        assert(map->getMapPoint(10) == keep);
+        assert(!map->getMapPoint(11));
+        assert(!map->getMapPoint(12));
+        assert(keep->observationCount() == 3);
+        assert(weak->observationCount() == 0);
+        assert(stale_only->observationCount() == 0);
+        assert(!kfs[0]->map_points[1] && !kfs[0]->map_points[4]);
+        assert(!kfs[1]->map_points[1] && !kfs[1]->map_points[4]);
+        assert(!kfs[2]->map_points[2]);
+        assert(map->sharedObservationCount(0, 1) == 1);
+        assert(map->sharedObservationCount(0, 2) == 1);
+        assert(map->sharedObservationCount(1, 2) == 1);
+        assert(map->topologyRevision() == topology_before + 1);
+        assert(map->verifyObservationConsistency());
+
+        // 再次剔除是幂等的，不会重复减少计数或破坏共视。
+        map->cullMapPoints(3);
+        assert(map->mapPointCount() == 1);
+        assert(map->sharedObservationCount(0, 1) == 1);
+        assert(map->verifyObservationConsistency());
     } TEST_PASS();
 }
 
@@ -818,10 +1322,13 @@ void test_backend_committer() {
         vslam::OptimizationSnapshot snap;
         vslam::KeyframeState ka;
         ka.id = 0;
-        ka.pose_cs = vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(10, 0, 0));
+        const vslam::SE3 expected_a(
+            Eigen::Quaterniond::Identity(), vslam::Vec3(10, 0, 0));
+        ka.pose_cs = expected_a.inverse();  // 位姿图接口输入 T_cw
         vslam::KeyframeState kb;
         kb.id = 1;
-        kb.pose_cs = vslam::SE3(Eigen::Quaterniond::Identity(), vslam::Vec3(40, 0, 0));
+        kb.pose_cs = vslam::SE3(
+            Eigen::Quaterniond::Identity(), vslam::Vec3(40, 0, 0)).inverse();
         snap.keyframes = {ka, kb};
         // 旧 TrackingBridge（锚点差 30m，低权重）+ 新 Relocalization（0m，高权重）
         snap.constraints.push_back({
@@ -835,8 +1342,8 @@ void test_backend_committer() {
         assert(result.valid);
         vslam::SE3 T_ws_a, T_ws_b;
         for (const auto& u : result.poses) {
-            if (u.id == 0) T_ws_a = u.pose_cs;
-            if (u.id == 1) T_ws_b = u.pose_cs;
+            if (u.id == 0) T_ws_a = u.pose_cs.inverse();
+            if (u.id == 1) T_ws_b = u.pose_cs.inverse();
         }
         // A 固定不动；B 被高权重 reloc 约束拉回 A（Huber 下桥边被降权，
         // 30m 锚点差收敛到几米内——跨子地图连接不跳变）
@@ -866,6 +1373,28 @@ void test_backend_committer() {
         assert(map->geometryRevision() == geo_before + 1);
         assert((map->getKeyFrame(0)->pose_cs.matrix() - new_pose.matrix()).norm() < 1e-12);
         assert((map->getMapPoint(0)->pos_s - vslam::Vec3(4, 5, 6)).norm() < 1e-12);
+    } TEST_PASS();
+
+    TEST("BackendCommitter：相同 revision/id 的另一 Map 不能接收旧结果") {
+        auto old_map = std::make_shared<vslam::Map>();
+        auto new_map = std::make_shared<vslam::Map>();
+        auto old_kf = std::make_shared<vslam::Frame>(0, 0.0);
+        auto new_kf = std::make_shared<vslam::Frame>(0, 0.0);
+        old_map->insertKeyFrame(old_kf);
+        new_map->insertKeyFrame(new_kf);
+
+        vslam::OptimizationResult r;
+        r.valid = true;
+        r.base_geometry_revision = old_map->geometryRevision();
+        r.metrics.max_correction = 1.0;
+        r.poses.push_back({0, vslam::SE3(Eigen::Quaterniond::Identity(),
+                                         vslam::Vec3(1, 0, 0))});
+
+        const auto new_geo = new_map->geometryRevision();
+        assert(BackendCommitter::commit(new_map, r, {}, 10.0, old_map)
+               == CommitStatus::STALE);
+        assert(new_kf->pose_cs.t.norm() < 1e-12);
+        assert(new_map->geometryRevision() == new_geo);
     } TEST_PASS();
 
     TEST("BackendCommitter：几何过期 STALE 且地图逐项不变；拓扑过期允许追加 rebase") {
@@ -1100,6 +1629,7 @@ void test_stereo_vo() {
         auto pose2 = vo.addFrame(l2, r2, 0.1);
         double disp = pose2.inverse().t.norm();   // T_cw → T_wc 位移
         std::cout << " (disp=" << disp << "m mp=" << vo.getMap()->mapPointCount() << ")";
+        assert(vo.getMap()->verifyObservationConsistency());
         assert(std::abs(disp - 1.0) < 0.3);
         assert(vo.getStatus().pose_valid);
         assert(first_kf->image.empty());        // 历史关键帧不再持有像素缓冲
@@ -1112,6 +1642,17 @@ void test_stereo_vo() {
         assert(!first_kf->pts_c.empty());
         assert(!vo.currentFrame()->image.empty());
         assert(!vo.currentFrame()->image_right.empty());
+
+        // LK 普通帧在插入关键帧时必须先重提 ORB、再重算深度；否则
+        // extract 会清掉刚建立的 slot，留下反向 stale Observation。
+        vslam::VOConfig lk_cfg = cfg;
+        lk_cfg.feature_method = 1;
+        vslam::VisualOdometry lk_vo(cam, lk_cfg);
+        lk_vo.addFrame(l1, r1, 0.0);
+        assert(lk_vo.getMap()->verifyObservationConsistency());
+        lk_vo.addFrame(l2, r2, 0.1);
+        assert(lk_vo.getMap()->keyFrameCount() >= 2);
+        assert(lk_vo.getMap()->verifyObservationConsistency());
     } TEST_PASS();
 }
 
@@ -1368,11 +1909,9 @@ void test_loop_closure() {
         cam->fx = cam->fy = 500; cam->cx = 320; cam->cy = 240;
         cam->img_width = 640; cam->img_height = 480;
 
-        // 词典路径（项目根运行：config/ORBvoc.dbow3；ctest：../config/...）
-        std::string vocab;
-        for (const auto& p : {"config/ORBvoc.dbow3", "../config/ORBvoc.dbow3"})
-            if (std::filesystem::exists(p)) { vocab = p; break; }
-        assert(!vocab.empty());
+        // 测试资源固定相对源码根定位，避免独立构建目录下依赖 cwd。
+        const std::string vocab = VSLAM_SOURCE_DIR "/config/ORBvoc.dbow3";
+        assert(std::filesystem::exists(vocab));
 
         vslam::LoopClosure lc;
         // min_score 取 0.05：合成圆点特征的 ORB 描述子对微小视差很敏感，
@@ -1511,6 +2050,80 @@ void test_loop_closure() {
 #endif
 }
 
+void test_loop_closure_concurrency_and_position_cache() {
+#ifdef HAS_DBOW3
+    TEST("LoopClosure 并发 add/detect 与光心位置缓存") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500;
+        cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+
+        const std::string vocab = VSLAM_SOURCE_DIR "/config/ORBvoc.dbow3";
+        assert(std::filesystem::exists(vocab));
+
+        vslam::LoopClosure lc;
+        lc.setParams(0.0, 1, 8, 0.1, 3.0, cam, 20, 5.0, 1);
+        assert(lc.loadVocabulary(vocab));
+
+        constexpr int kFrameCount = 32;
+        std::vector<vslam::Frame::Ptr> frames;
+        frames.reserve(kFrameCount);
+        for (int i = 0; i < kFrameCount; ++i) {
+            auto frame = std::make_shared<vslam::Frame>(
+                static_cast<unsigned long>(i), static_cast<double>(i));
+            frame->pose_cs = vslam::SE3(
+                Eigen::Quaterniond::Identity(), vslam::Vec3(-i * 0.1, 0, 0));
+            frame->descriptors = cv::Mat(48, 32, CV_8U);
+            for (int r = 0; r < frame->descriptors.rows; ++r)
+                for (int c = 0; c < frame->descriptors.cols; ++c)
+                    frame->descriptors.at<unsigned char>(r, c) =
+                        static_cast<unsigned char>((r * 17 + c * 31 + i * 13) & 255);
+            frames.push_back(std::move(frame));
+        }
+        auto query = std::make_shared<vslam::Frame>(1000, 1000.0);
+        query->pose_cs = vslam::SE3();
+        query->descriptors = frames.front()->descriptors.clone();
+
+        // addKeyFrame 缓存的是加入瞬间的 T_cw 光心；之后修改 live Frame
+        // 位姿不应改变位置先验结果。
+        auto cached_position = std::make_shared<vslam::Frame>(200, 200.0);
+        cached_position->pose_cs = vslam::SE3();
+        cached_position->descriptors = frames.front()->descriptors.clone();
+        lc.addKeyFrame(cached_position);
+        cached_position->pose_cs.t = vslam::Vec3(-1000, 0, 0);
+        auto position_candidates = lc.detectLoop(query);
+        assert(std::ranges::any_of(position_candidates,
+                                   [](const auto& candidate) {
+                                       return candidate && candidate->id == 200;
+                                   }));
+
+        // 并发回归只验证状态安全；关闭位置先验和候选日志，避免测试输出
+        // 被重复检测结果淹没。
+        lc.setParams(1.1, 1, 8, 0.1, 3.0, cam, 20, 0.0, 1);
+
+        std::vector<std::thread> workers;
+        for (int worker = 0; worker < 4; ++worker) {
+            workers.emplace_back([&, worker] {
+                for (int i = worker; i < kFrameCount; i += 4)
+                    lc.addKeyFrame(frames[i]);
+            });
+        }
+        for (int worker = 0; worker < 4; ++worker) {
+            workers.emplace_back([&] {
+                for (int i = 0; i < 10; ++i)
+                    (void)lc.detectLoop(query);
+            });
+        }
+        for (auto& worker : workers) worker.join();
+
+    } TEST_PASS();
+#else
+    TEST("LoopClosure 并发 add/detect 与光心位置缓存") {
+        std::cout << "SKIPPED (built without DBoW3)";
+    } TEST_PASS();
+#endif
+}
+
 // ============================================================
 // 主函数
 // ============================================================
@@ -1528,6 +2141,8 @@ int main() {
 
     std::cout << "\n[Map Revision (M1)]\n";
     test_map_revision();
+    test_map_observation_model();
+    test_map_batch_cull();
 
     std::cout << "\n[BackendCommitter (M2)]\n";
     test_backend_committer();
@@ -1551,14 +2166,17 @@ int main() {
 
     std::cout << "\n[Loop Closure (Phase 2)]\n";
     test_loop_closure();
+    test_loop_closure_concurrency_and_position_cache();
 
     std::cout << "\n[Feature Extraction]\n";
     test_feature_extraction();
     test_frame_image_lifecycle();
     test_mobile_config();
+    test_monocular_initialization_quality();
 
     std::cout << "\n[VO Initialization]\n";
     test_vo_initialization();
+    test_monocular_3d_initialization();
 
     std::cout << "\n[Pose Semantics]\n";
     test_pose_semantics();
@@ -1571,7 +2189,10 @@ int main() {
     test_rotation_ambiguity();
 
     std::cout << "\n[Local BA]\n";
+    test_camera_position_delta();
+    test_local_ba_filter_helper();
     test_local_ba();
+    test_local_ba_disconnected_components();
 
     std::cout << "\n[Long-Run Stability]\n";
     test_long_run_stability();

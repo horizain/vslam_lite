@@ -35,11 +35,13 @@ public:
     /// 提交优化结果。skip_pose：不回写位姿的 KF id 集合
     /// （活动参考帧保护，M0；该集合同样免除最大校正约束不适用——它只跳过写回）。
     /// @param max_pose_correction  最大允许位姿校正（m）；0 = 不检查
+    /// @param expected_map  任务创建时绑定的 Map；非空且实例不一致时返回 STALE
     static CommitStatus commit(
         const Map::Ptr& map,
         const OptimizationResult& result,
         const std::unordered_set<unsigned long>& skip_pose = {},
-        double max_pose_correction = 10.0);
+        double max_pose_correction = 10.0,
+        const Map::Ptr& expected_map = nullptr);
 
     /// stale 检查纯函数（快照版本 vs 实时版本）
     static bool isStale(const OptimizationResult& result, const Map::Ptr& map);

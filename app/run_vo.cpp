@@ -5,9 +5,9 @@
  *   ./run_vo [dataset_path] [config.yaml] [trajectory.txt]
  *
  * 示例：
- *   ./run_vo /data/kitti/sequences/00 config/default.yaml    # 双目（自动检测 image_1）
- *   ./run_vo /data/kitti/sequences/00/image_0 config/default.yaml   # 单目（仅左目）
- *   ./run_vo /data/kitti/sequences/00/image_0 config/default.yaml traj.txt
+ *   ./run_vo datasets/kitti/sequences/00 config/default.yaml    # 双目（自动检测 image_1）
+ *   ./run_vo datasets/kitti/sequences/00/image_0 config/default.yaml   # 单目（仅左目）
+ *   ./run_vo datasets/kitti/sequences/00/image_0 config/default.yaml traj.txt
  *   ./run_vo 0                          # 使用摄像头 0
  *
  * 输出：运行结束后将轨迹保存为 TUM 格式
@@ -37,14 +37,21 @@ int main(int argc, char** argv) {
     // ---- 解析命令行参数 ----
     // 用法: run_vo <dataset_path|camera_index> [config.yaml] [trajectory.txt] [--tum|--euroc] [--headless]
     bool headless = false;
+    std::vector<std::string> positional;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--tum")       dataset_type = vslam::Dataset::Type::TUM;
         else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
         else if (a == "--headless") headless = true;
+        else if (a.starts_with("--")) {
+            std::cerr << "Unknown option: " << a << "\n";
+            return 1;
+        } else {
+            positional.push_back(a);
+        }
     }
-    if (argc >= 2) {
-        input_path = argv[1];
+    if (!positional.empty()) {
+        input_path = positional[0];
         // 如果第一个参数是数字，视为摄像头索引
         if (std::all_of(input_path.begin(), input_path.end(), ::isdigit)) {
             dataset_type = vslam::Dataset::Type::CAMERA;
@@ -55,19 +62,18 @@ int main(int argc, char** argv) {
         std::cout << "  camera_index: integer (e.g., 0) for live camera\n";
         std::cout << "  --tum / --euroc: dataset format flag\n";
         std::cout << "\nExample:\n";
-        std::cout << "  ./run_vo /data/kitti/00/image_0\n";
+        std::cout << "  ./run_vo datasets/kitti/sequences/00/image_0\n";
         std::cout << "  ./run_vo /data/tum/rgbd_dataset_freiburg1_xyz --tum\n";
-        std::cout << "  ./run_vo /data/euroc/MH_01 --euroc\n";
+        std::cout << "  ./run_vo datasets/euroc/V1_01_easy/mav0 --euroc\n";
         std::cout << "  ./run_vo 0\n";
         return 1;
     }
-
-    if (argc >= 3) {
-        config_path = argv[2];
+    if (positional.size() > 3) {
+        std::cerr << "Too many positional arguments\n";
+        return 1;
     }
-    if (argc >= 4) {
-        traj_path = argv[3];
-    }
+    if (positional.size() >= 2) config_path = positional[1];
+    if (positional.size() >= 3) traj_path = positional[2];
 
     // ---- 创建数据源（先创建，便于读取数据集自带标定）----
     vslam::Dataset dataset(

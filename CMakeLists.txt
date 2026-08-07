@@ -127,6 +127,7 @@ set(VSLAM_HEADERS
     include/vslam/camera.h
     include/vslam/dataset.h
     include/vslam/frame.h
+    include/vslam/observation.h
     include/vslam/mappoint.h
     include/vslam/map.h
     include/vslam/atlas.h
@@ -199,6 +200,9 @@ if(BUILD_TESTS)
     enable_testing()
     add_executable(test_vo test/test_vo.cpp)
     target_link_libraries(test_vo vslam)
+    # 测试可能从任意构建目录启动；资源路径不得依赖进程当前工作目录。
+    target_compile_definitions(test_vo PRIVATE
+        VSLAM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     # 测试使用 assert；Release 全局定义了 NDEBUG，必须为测试目标显式恢复断言。
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(test_vo PRIVATE -UNDEBUG)

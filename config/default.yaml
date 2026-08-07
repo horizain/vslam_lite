@@ -42,7 +42,8 @@ Runtime:
 # ---- VO 参数 ----
 VO:
   method: 0                # 0 = ORB匹配, 1 = LK光流
-  min_parallax: 0.1        # 初始化的最小视差
+  min_parallax: 0.0175     # 单目初始化最小三角化角（弧度，约1°；不是 ||recoverPose.t||）
+  min_init_inliers: 20     # 单目初始化最小对极几何内点数（通用门槛）
   min_matches_init: 100    # 初始化的最小匹配数
   min_matches_track: 20    # 跟踪的最小匹配数
   pnp_min_inliers: 15      # PnP 最小内点数
@@ -57,7 +58,7 @@ VO:
   keyframe_min_inliers: 15 # 内点不足时补关键帧
   min_keyframe_interval: 10 # 弱匹配触发关键帧的最小间隔
   max_keyframe_interval: 15 # 最长关键帧间隔，防止参考帧过旧
-  keyframe_max_count: 1800       # KF 规模硬顶：超过后平移阈值放大 1.5 倍
+  keyframe_max_count: 1800       # KF 规模软阈值：超过后平移阈值放大 1.5 倍
 
 # ---- 优化参数 (Phase 1) ----
 Optimizer:

@@ -3,6 +3,7 @@
 #include "vslam/common.h"
 #include "vslam/camera.h"
 #include "vslam/map.h"
+#include "vslam/observation.h"
 
 #include <opencv2/features2d.hpp>
 #include <optional>
@@ -10,6 +11,11 @@
 #include <vector>
 
 namespace vslam {
+
+/// 两个位姿均按 T_cw 表示时，相机光心实际发生的米制位移。
+/// 该量不受姿态旋转参数化影响，供 BA 质量指标和回归测试使用。
+[[nodiscard]] double cameraPositionDelta(const SE3& old_cw,
+                                         const SE3& new_cw);
 
 /// (Phase 2) 位姿图边：关键帧 a ↔ b 的相对位姿约束
 struct LoopEdge {
@@ -28,13 +34,20 @@ struct LoopEdge {
 // 原子提交；优化失败/结果过期/验收失败时实时状态逐项保持不变。
 // ============================================================
 
-/// 快照关键帧：位姿 + 观测（keypoints[i] 对应 map_points[i] 的地图点 id）
+/// 快照关键帧：仅保存位姿；正式观测统一位于 OptimizationSnapshot::observations。
 struct KeyframeState {
     unsigned long id = 0;
-    SE3 pose_cs;                          // T_cw（与全局项目语义一致）
-    std::vector<cv::KeyPoint> keypoints;  // BA 重投影观测（像素）
-    std::vector<unsigned long> map_points;  // 每特征点对应的地图点 id（无点 = 0）
-    std::vector<Vec3> pts_c;              // 双目/RGB-D 相机系观测（深度加权用）
+    SE3 pose_cs;  // T_cw（与全局项目语义一致）
+};
+
+/// 优化快照中的正式观测；map_point_id=0 也是合法地图点。
+/// camera_point 有值时表示该观测带有相机系深度，可用于深度权重。
+struct ObservationState {
+    KeyframeId keyframe_id = 0;
+    FeatureIndex feature_index = 0;
+    MapPointId map_point_id = 0;
+    Vec2 pixel = Vec2::Zero();
+    std::optional<Vec3> camera_point;
 };
 
 /// 快照地图点：坐标 + 观测数
@@ -59,6 +72,7 @@ struct OptimizationSnapshot {
     uint64_t topology_revision = 0;
     uint64_t geometry_revision = 0;
     std::vector<KeyframeState> keyframes;
+    std::vector<ObservationState> observations;
     std::vector<LandmarkState> landmarks;
     std::vector<Constraint> constraints;
     std::vector<unsigned long> fixed_kf_ids;  // BA 锚定（窗口最早 2 帧等）

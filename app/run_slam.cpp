@@ -5,7 +5,7 @@
  *   ./run_slam [dataset_path] [config.yaml] [trajectory.txt]
  *
  * 示例：
- *   ./run_slam datasets/sequences/00 config/default.yaml slam_traj.txt
+ *   ./run_slam datasets/kitti/sequences/00 config/default.yaml slam_traj.txt
  *   ./run_slam 0                          # 使用摄像头 0
  *
  * 与 run_vo 的唯一区别：VOConfig.enable_loop_closure 强制置 true
@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     bool headless = false;
     int max_frames = 0;  // 0 = 全程；>0 = 只处理前 N 帧（性能/回归测试用）
     int skip_frames = 0; // 跳过前 N 帧（性能分片测试用）
+    std::vector<std::string> positional;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--tum")       dataset_type = vslam::Dataset::Type::TUM;
@@ -48,9 +49,15 @@ int main(int argc, char** argv) {
         else if (a == "--headless") headless = true;
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--skip" && i + 1 < argc) skip_frames = std::atoi(argv[++i]);
+        else if (a.starts_with("--")) {
+            std::cerr << "Unknown or incomplete option: " << a << "\n";
+            return 1;
+        } else {
+            positional.push_back(a);
+        }
     }
-    if (argc >= 2) {
-        input_path = argv[1];
+    if (!positional.empty()) {
+        input_path = positional[0];
         if (std::all_of(input_path.begin(), input_path.end(), ::isdigit)) {
             dataset_type = vslam::Dataset::Type::CAMERA;
         }
@@ -61,8 +68,12 @@ int main(int argc, char** argv) {
         std::cout << "  --tum / --euroc: dataset format flag\n";
         return 1;
     }
-    if (argc >= 3) config_path = argv[2];
-    if (argc >= 4) traj_path = argv[3];
+    if (positional.size() > 3) {
+        std::cerr << "Too many positional arguments\n";
+        return 1;
+    }
+    if (positional.size() >= 2) config_path = positional[1];
+    if (positional.size() >= 3) traj_path = positional[2];
 
     // ---- 创建数据源（先创建，便于读取数据集自带标定）----
     vslam::Dataset dataset(

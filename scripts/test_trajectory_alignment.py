@@ -4,6 +4,7 @@
 import numpy as np
 
 import evaluate_ate
+import euroc_gt_to_tum
 import kitti_gt_to_tum
 import plot_traj
 
@@ -93,6 +94,16 @@ def assert_kitti_large_rotation_quaternions():
         assert abs(quat[3]) < 1e-12
 
 
+def assert_euroc_camera_extrinsic_composition():
+    # 机体在世界原点、姿态为单位阵时，相机 T_WC 应恰好等于 T_BC。
+    fields = ["1000000000", "0", "0", "0", "1", "0", "0", "0"]
+    t_bc = np.eye(4)
+    t_bc[:3, 3] = [0.1, -0.2, 0.3]
+    timestamp, t_wc = euroc_gt_to_tum.row_to_camera_pose(fields, t_bc)
+    assert np.isclose(timestamp, 1.0)
+    assert np.allclose(t_wc, t_bc)
+
+
 def main():
     assert_umeyama(evaluate_ate)
     assert_umeyama(plot_traj)
@@ -100,6 +111,7 @@ def main():
     assert_evaluator_timestamp_matching_is_one_to_one()
     assert_stereo_se3_does_not_hide_scale_error()
     assert_kitti_large_rotation_quaternions()
+    assert_euroc_camera_extrinsic_composition()
     print("trajectory alignment regression tests: PASSED")
 
 

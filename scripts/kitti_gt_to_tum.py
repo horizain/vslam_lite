@@ -2,7 +2,7 @@
 """
 kitti_gt_to_tum.py - KITTI 真值位姿 → TUM 轨迹格式
 
-KITTI poses/XX.txt 每行是 3x4 矩阵 [R|t]（T_wc：相机系 → 世界系），
+KITTI datasets/kitti/poses/XX.txt 每行是 3x4 矩阵 [R|t]（T_wc：相机系 → 世界系），
 TUM 格式每行: timestamp tx ty tz qx qy qz qw（也是 T_wc，与 run_vo 输出一致）
 
 用法:

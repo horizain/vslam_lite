@@ -11,7 +11,7 @@ Contributor guide for **vslam**, a C++23 visual odometry / SLAM system: VO front
 - `config/default.yaml` — runtime parameters (camera intrinsics, feature/VO/optimizer settings).
 - `scripts/` — dependency installer, KITTI preparation, ATE evaluation helpers.
 - `docs/` — `TUTORIAL.md`, `DEVELOPMENT_LOG.md`.
-- `datasets/` — KITTI sequences (git-ignored; fetched via `prepare_kitti.sh`).
+- `datasets/` — `kitti/sequences` + `kitti/poses` and other datasets (git-ignored; fetched via `prepare_kitti.sh`).
 
 ## Build, Test, and Development Commands
 
@@ -19,7 +19,7 @@ Contributor guide for **vslam**, a C++23 visual odometry / SLAM system: VO front
 bash scripts/install_deps.sh        # Install OpenCV, Eigen3, Pangolin, yaml-cpp, g2o, DBoW3
 cmake -S . -B build                 # Configure (Release + C++23 by default)
 cmake --build build -j              # Build the vslam library and run_vo
-./build/bin/run_vo datasets/sequences/00 config/default.yaml traj.txt   # Run VO on KITTI 00
+./build/bin/run_vo datasets/kitti/sequences/00 config/default.yaml traj.txt   # Run VO on KITTI 00
 
 # Tests
 cmake -S . -B build -DBUILD_TESTS=ON

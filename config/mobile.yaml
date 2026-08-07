@@ -30,7 +30,8 @@ Runtime:
 
 VO:
   method: 0
-  min_parallax: 0.1
+  min_parallax: 0.025      # 单目初始化最小三角化角（弧度，约1.4°）；低资源噪声下略保守
+  min_init_inliers: 18     # 单目初始化最小对极几何内点数（低资源特征较少）
   min_matches_init: 80
   min_matches_track: 20
   pnp_min_inliers: 15

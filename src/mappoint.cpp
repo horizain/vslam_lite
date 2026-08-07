@@ -5,6 +5,30 @@
 
 namespace vslam {
 
+bool MapPoint::addObservation(const Observation& observation) {
+    auto it = observations_.lower_bound(
+        Observation{observation.keyframe_id, 0});
+    if (it != observations_.end() &&
+        it->keyframe_id == observation.keyframe_id) {
+        // 同一关键帧最多一个特征：相同键是幂等，不同特征是冲突。
+        return false;
+    }
+    observations_.insert(it, observation);
+    return true;
+}
+
+bool MapPoint::removeObservation(const Observation& observation) {
+    return observations_.erase(observation) != 0;
+}
+
+std::optional<FeatureIndex> MapPoint::featureIndex(
+    KeyframeId keyframe_id) const {
+    auto it = observations_.lower_bound(Observation{keyframe_id, 0});
+    if (it == observations_.end() || it->keyframe_id != keyframe_id)
+        return std::nullopt;
+    return it->feature_index;
+}
+
 MapPoint::Ptr MapPoint::create(unsigned long id,
                                 const Vec2& px1, const Vec2& px2,
                                 const SE3& T1, const SE3& T2,

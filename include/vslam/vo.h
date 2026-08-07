@@ -25,8 +25,25 @@ namespace vslam {
 struct BackendTask {
     enum class Type { LocalBA, LoopClosure };
     Type type = Type::LocalBA;
+    Map::Ptr map;                       // 入队时所属 Map；revision 不能替代实例身份
+    unsigned long submap_id = 0;       // 入队时所属 Submap
     std::vector<Frame::Ptr> window;   // LocalBA：窗口关键帧（快照在后台锁内构造）
+    KeyframeId anchor_kf_id = 0;      // LocalBA：提交时的当前/锚定 KF 身份
     Frame::Ptr curr_kf;               // LoopClosure：当前关键帧
+};
+
+/// 回环事务的身份边界；候选发现后只携带 Map/submap/KF 身份进入事务。
+/// 最终验证必须在事务独占 map 锁内重新执行，revision 仅用于记录候选发现时的
+/// 版本，不能把锁外计算结果直接写回新的几何版本。
+struct LoopCorrectionContext {
+    Map::Ptr map;
+    unsigned long submap_id = 0;
+    uint64_t topology_revision = 0;
+    uint64_t geometry_revision = 0;
+    KeyframeId curr_kf_id = 0;
+    KeyframeId loop_kf_id = 0;
+    Frame::Ptr curr_kf;
+    Frame::Ptr loop_kf;
 };
 
 /// VO/Feature/Optimizer 参数（默认值与 config/default.yaml 一致）
@@ -39,6 +56,8 @@ struct VOConfig {
     int    orb_max_bands          = 8;      // ORB 外层并行分带上限（1=单带）
     int    opencv_threads         = 0;      // OpenCV 线程数（0=保持库默认值）
     int    min_matches_init       = 100;    // 初始化最小匹配数
+    int    min_init_inliers       = 20;     // 初始化最小对极几何内点数
+    double min_parallax           = 0.0175; // 单目初始化最小三角化角（弧度，约1°）
     int    min_matches_track      = 20;     // 跟踪/对极回退最小匹配数
     int    pnp_min_inliers        = 15;     // PnP 最小内点数
     double pnp_min_inlier_ratio   = 0.3;    // PnP 最小内点比例
@@ -53,7 +72,7 @@ struct VOConfig {
                                              // 阈值过大 → ref 间隔远 → 高速段匹配骤减会 LOST，
                                              // 过小 → 每帧插 KF → 地图膨胀 + BA 空转
                                              // 跳过插入（关键帧稀疏化，压地图规模）
-    int    keyframe_max_count      = 1800;  // 关键帧规模硬顶：超过后平移阈值放大 1.5 倍
+    int    keyframe_max_count      = 1800;  // 关键帧规模软阈值：超过后平移阈值放大 1.5 倍
                                              // （长序列/大场景防 KF 无限增长）
     double keyframe_rotation      = 0.2;    // 关键帧最小旋转(rad)
     int    keyframe_min_inliers   = 15;     // 跟踪内点低于该值 → 强制插入关键帧
@@ -94,6 +113,39 @@ struct VOConfig {
     /// 从 yaml 配置加载（缺省字段保持默认值）
     static VOConfig fromYaml(const std::string& path);
 };
+
+/// 单目两帧初始化的几何质量（归一化相机坐标）。
+/// parallax_rad 是两帧光线夹角的中位数，不是 recoverPose 的平移范数。
+/// positive_depth_ratio 是三角化点在两帧中均为正深度的比例。
+struct MonocularInitializationQuality {
+    double parallax_rad = 0.0;
+    double positive_depth_ratio = 0.0;
+    int triangulated_points = 0;
+    bool accepted = false;
+};
+
+/// 用真实三角化几何判断单目初始化是否退化。
+/// normalized_ref/curr 为 K^{-1}[u,v,1] 的前两维，relative_rotation 和
+/// relative_translation 满足 p_c2 = R p_c1 + t。平移尺度不可观测，因此
+/// 不能把 ||t|| 当作视差；近零基线会表现为光线夹角接近零。
+[[nodiscard]] MonocularInitializationQuality assessMonocularInitialization(
+    const std::vector<Vec2>& normalized_ref,
+    const std::vector<Vec2>& normalized_curr,
+    const Mat33& relative_rotation,
+    const Vec3& relative_translation,
+    double min_parallax_rad,
+    double min_positive_depth_ratio = 0.7);
+
+/// Local BA 快照是否应保留某个地图点。
+[[nodiscard]] bool includeLocalBALandmark(int observation_count,
+                                          int min_observed);
+
+/// 后端在一帧跟踪期间校正参考 KF 时，保持该帧相对参考帧的 T_ca 不变，
+/// 把当前帧从旧局部几何重基到新参考位姿。
+[[nodiscard]] SE3 rebaseAnchoredFramePose(
+    const SE3& frame_pose_cs,
+    const SE3& old_ref_pose_cs,
+    const SE3& new_ref_pose_cs);
 
 /// 视觉里程计前端
 class VisualOdometry {
@@ -190,6 +242,7 @@ public:
     /// M2：前端只读快照（§14.1-6）——每帧开头捕获一次，整帧使用同一版本数据。
     /// 跟踪不再在途中读实时地图点坐标（避免跨版本/部分提交观测）。
     struct TrackingSnapshot {
+        Map::Ptr map;                        // 捕获时的 Map 实例身份
         uint64_t topology_revision = 0;   // 捕获时的地图版本（诊断/审计用）
         uint64_t geometry_revision = 0;
         unsigned long submap_id = 0;
@@ -243,7 +296,8 @@ private:
     SE3 relocBaselineWorld() const;
     /// M5：求解 Atlas 子地图约束图——节点 = 子地图 T_ws，边 = 约束
     /// （T_ws_b = T_ws_a · T_rel）；首个子地图固定锚定世界系。
-    /// 成功时更新全部子地图 T_ws 并返回 true。
+    /// 成功时更新全部子地图 T_ws 并返回 true。调用方必须持有
+    /// map_mutex_ 独占锁；本函数不获取该锁，也不允许锁内回调。
     bool solveAtlasConstraints();
     /// 跟踪/重定位共用：计算候选位姿相对运动基线的平移/旋转（角度），
     /// 并判定是否在 [max_translation, max_rotation] 门限内（validateMotion 的通用版）。
@@ -278,10 +332,11 @@ private:
     /// 消除丢失期位移未知导致的锚点残留偏差。延迟到子地图有 ≥3 个
     /// 关键帧时在 insertKeyFrame 中触发（重建瞬间 KF 数不足无法拟合）
     void alignSubmapToTrajectory();
-    void insertKeyFrame();              // 关键帧插入 + 三角化 + BA
-    /// (Phase 2) 回环校正：位姿图优化 + 地图点/逐帧轨迹同步 + 全局 BA
-    void handleLoopCorrection(const SE3& T_loop_curr,
-                              const Frame::Ptr& kf_curr, const Frame::Ptr& kf_loop);
+    bool insertKeyFrame();              // 关键帧插入；帧内几何过期时重基并跳过
+    /// (Phase 2) 回环事务：独占 map 锁内重新验证、快照、位姿图/全局 BA 与原子提交。
+    /// 低频回环会在该事务期间阻塞前端 KF/Local BA 写入，避免阶段间 stale 饥饿。
+    /// 返回 true 仅表示该候选已成功提交；false 时调用方应继续尝试后续候选。
+    bool handleLoopCorrection(const LoopCorrectionContext& context);
     /// 按共视地图点数选取 Local BA 窗口（含当前关键帧，最早帧锚定）
     std::vector<Frame::Ptr> selectLocalWindow(int n) const;
     void triangulateNewPoints(const Frame::Ptr& f1, const Frame::Ptr& f2,
@@ -291,7 +346,7 @@ private:
     // ---- 异步后端（P2-1）----
     /// 后台线程主循环：取任务 → 快照（锁内）→ 锁外优化 → 写回（锁内）
     void backendLoop();
-    /// 提交任务到有界队列（满则调用方同步执行，防止任务无限堆积）
+    /// 提交任务到有界队列（满则丢弃最旧的低频任务，防止任务无限堆积）
     void submitBackendTask(BackendTask task);
     void startBackend();
     void stopBackend();
@@ -299,19 +354,25 @@ private:
     // ---- M1：Optimizer 只读快照 / Result / 提交 ----
     /// 构建 Local BA 只读快照（调用方需持 map_mutex_ 读锁；窗口内已被
     /// 清理/地图重建的 KF 自动剔除）。不深拷贝任何实时对象。
-    /// @param min_observed  只收集观测数 ≥ 该值的点（C：弱观测垃圾点过滤，
-    ///                       0 = 不过滤）
+    /// @param min_observed  只收集观测数 ≥ 该值的点；Local BA 与优化器统一用 3
     OptimizationSnapshot buildLocalBASnapshot(
-        const std::vector<Frame::Ptr>& window, int min_observed = 0) const;
-    /// 执行窗口 Local BA（唯一入口）：快照 → 求解 → 提交（跳过活动参考帧）。
-    /// C：提交被质量门限拒绝（大校正 = 弱观测点拖偏）时，剔除 observed<3
-    /// 的点重建快照重试一次——垃圾段不再长期不被修复。
-    void runWindowLocalBA(const std::vector<Frame::Ptr>& window);
+        const std::vector<Frame::Ptr>& window,
+        KeyframeId anchor_kf_id,
+        int min_observed = 0) const;
+    /// 执行窗口 Local BA（唯一入口）：正式弱观测过滤 → 快照 → 求解 →
+    /// 提交（跳过活动参考帧）；失败结果不在同一窗口重复求解。
+    void runWindowLocalBA(const std::vector<Frame::Ptr>& window,
+                          KeyframeId anchor_kf_id,
+                          const Map::Ptr& expected_map = nullptr,
+                          std::optional<unsigned long> expected_submap_id = std::nullopt);
     /// 应用 Local BA 结果：唯一提交路径（BackendCommitter::commit，M2）——
     /// stale 检查 + 质量验收 + 锁内原子写回（跳过 skip_pose 活动参考帧）。
-    /// 返回是否提交成功；stale/验收失败 → 不提交，实时状态逐项不变。
-    bool applyLocalBAResult(const OptimizationResult& result,
-                            const std::unordered_set<unsigned long>& skip_pose);
+    /// 返回明确提交状态；stale/验收失败 → 不提交，实时状态逐项不变。
+    CommitStatus applyLocalBAResult(
+        const OptimizationResult& result,
+        const std::unordered_set<unsigned long>& skip_pose,
+        const Map::Ptr& expected_map,
+        unsigned long expected_submap_id);
 
     // ---- M2：前端只读快照 ----
     /// 捕获前端只读快照（调用方需持 map_mutex_ 读锁；每帧开头一次）
@@ -329,7 +390,7 @@ private:
         const std::unordered_set<unsigned long>* keep_points = nullptr,
         bool with_descriptors = true);
     /// 后台执行 Local BA（快照隔离，优化不触碰地图集合）
-    void runBackendLocalBA(const std::vector<Frame::Ptr>& window);
+    void runBackendLocalBA(const BackendTask& task);
     /// 后台执行回环检测 → 验证 → 校正（候选来自词袋+位置先验）
     void runBackendLoopClosure(const Frame::Ptr& curr_kf);
 

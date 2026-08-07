@@ -1,6 +1,6 @@
 # ============================================================
 # VSLAM KITTI 00 优化配置
-# 用法: ./build/bin/run_vo datasets/sequences/00 config/kitti00.yaml traj_00.txt --headless
+# 用法: ./build/bin/run_vo datasets/kitti/sequences/00 config/kitti00.yaml traj_00.txt --headless
 #
 # 说明:
 #   - KITTI 00 实际内参由 calib.txt 自动加载(见 run_vo 输出), 此处 Camera 段
@@ -37,7 +37,8 @@ Feature:
 # ---- VO 参数 ----
 VO:
   method: 0                # 0 = ORB匹配, 1 = LK光流
-  min_parallax: 0.1
+  min_parallax: 0.0175     # 单目初始化最小三角化角（弧度，约1°；由归一化观测计算）
+  min_init_inliers: 20     # 单目初始化最小对极几何内点数
   min_matches_init: 100
   min_matches_track: 20
   pnp_min_inliers: 20      # 特征更多后提高内点门槛, 过滤弱解
@@ -52,6 +53,7 @@ VO:
   keyframe_min_inliers: 20
   min_keyframe_interval: 10
   max_keyframe_interval: 15
+  keyframe_max_count: 1800  # KF 规模软顶：超过后平移阈值放大 1.5 倍
 
 # ---- 优化参数 ----
 Optimizer:
@@ -98,5 +100,3 @@ Stereo:
   rigid_max_rmse: 0.25
   keyframe_translation: 1.2  # KITTI ~1m/帧: 1.2m 约每 1~2 帧一 KF,
                              # 减少冗余 KF, 同时保留足够三角化基线
-  keyframe_max_count: 1800        # KF 规模硬顶：超过后平移阈值放大 1.5 倍
-

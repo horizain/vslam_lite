@@ -5,8 +5,8 @@
 #include "vslam/camera.h"
 #include "vslam/feature.h"
 #include <memory>
+#include <mutex>
 #include <string>
-#include <unordered_set>
 
 namespace vslam {
 
@@ -36,10 +36,6 @@ public:
 
     /// 将关键帧加入数据库（词袋向量入库 + 缓存，供回查）
     void addKeyFrame(Frame::Ptr kf);
-
-    /// 已被回环数据库引用的关键帧 id 集合（cull 保护用——这些 KF 的地图点
-    /// 是回环几何验证的 3D-2D 数据源，观测不足时也不能被清空引用）
-    std::unordered_set<unsigned long> protectedKeyFrames() const;
 
     /// 检测回环：返回候选关键帧列表（按优先级排序，可空）。
     /// 候选来源：① DBoW3 Top-N 词袋候选（分数过滤 + 时间窗）按分数降序；
@@ -71,6 +67,8 @@ private:
     int    position_prior_gap_   = 100;   // 位置先验最小关键帧间隔
     Camera camera_;
     FeatureMatcher matcher_;
+    // 只保护本模块状态；不持有地图锁，也不从锁内回调 Map。
+    mutable std::mutex mutex_;
 };
 
 } // namespace vslam

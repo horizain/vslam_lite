@@ -1,15 +1,19 @@
 # VSLAM Phase 2 设计文档：完整 SLAM 闭环
 
 > 创建日期: 2026-08-03
-> 状态: 设计定稿（待实施）
+> 状态: 历史设计稿（部分已实现，部分已被 Phase 0/1 架构取代；请勿当作当前 API）
 > 关联: `docs/DEVELOPMENT_LOG.md` §3.2、`docs/TUTORIAL.md` §9
 > 决策记录: 范围 = 完整 SLAM 闭环；校正模型 = Sim3（7DOF 含尺度）
+
+> 当前实现已提供 `run_slam`、可选 DBoW3 回环和 SE3 回环校正；本文中“TODO”、
+> `pose_cw`/`pos_w`/`origin_Twc` 等名称及 Sim3/跨子地图方案是历史设计语境。
+> 当前字段和坐标约定请以 [`README.md`](README.md) 与 [`TUTORIAL.md`](TUTORIAL.md) 为准。
 
 ---
 
 ## 1. 目标与验收标准
 
-**目标**：把当前的 VO（无回环）升级为完整 SLAM——当相机"回到老地方"时自动检测回环、验证、校正累积漂移，显著降低轨迹误差。
+**目标（设计稿）**：把 VO 与可选回环模块组合成完整 SLAM——当相机"回到老地方"时自动检测回环、验证、校正累积漂移。
 
 ```
 前端 VO（已有）→ 关键帧 → 词袋回环检测(DBoW3) → 几何验证(PnP) → Sim3 校正
@@ -33,11 +37,11 @@
 | 组件 | 现状 | Phase 2 差距 |
 |------|------|--------------|
 | DBoW3 依赖 | `install_deps.sh` 已支持安装；CMake `find_package(DBoW3)` + `HAS_DBOW3` 已接入 | 本机实际安装；需要预训练词典文件（ORBvoc） |
-| `loop_closure.h/cpp` | 接口已留：`loadVocabulary` / `addKeyFrame` / `detectLoop` / `verifyLoop`，实现全 TODO | 完整实现（词袋加载、数据库增查、候选过滤、PnP 几何验证、SE3 回环边输出） |
-| `optimizer.cpp` | `localBundleAdjustment` ✅、`globalBundleAdjustment` ✅（转发 Local BA）、`poseGraphOptimization` ❌ TODO | 实现位姿图优化（相邻边 + 回环边）；全局 BA 增加回环后触发路径 |
+| `loop_closure.h/cpp` | 词袋加载、入库、候选、PnP 验证与线程安全状态已实现（DBoW3 可选） | 词典/数据集依赖下继续做召回和误检评估 |
+| `optimizer.cpp` | Local BA、位姿图/回环结果提交路径已接入 | Sim3 与更大规模全局优化仍属后续方案 |
 | `common.h` | 只有 `SE3` | 新增轻量 `Sim3`（含 Umeyama 求解） |
-| `vo.h/cpp` | 纯前端，关键帧插入后无回环钩子 | 增加回环开关/参数；关键帧插入后喂给 LoopClosure；回环校正后更新地图 |
-| `app/run_slam.cpp` | CMakeLists 中已注释预留 | 新建入口并启用 CMake 目标；`run_vo` 保持纯 VO 不变（便于 A/B 对比） |
+| `vo.h/cpp` | VO 前端与可选回环/异步后端钩子已接入；当前使用 `pose_cs`/`pos_s`/`Observation` | 继续完善跨子地图融合与基准 |
+| `app/run_slam.cpp` | 已启用，强制打开回环入口（缺 DBoW3/词典时会降级） | 继续补充真实数据集验收 |
 | `config/default.yaml` | `LoopClosure` 段已有：`vocab_path` / `min_score` / `pnp_inlier_ratio` | 补充开关、检测频率、时间窗口、最小内点数、Sim3 迭代数 |
 | 测试 | 12 项断言（SE3/投影/ORB/初始化/BA/长稳/MiniAtlas） | 新增 Sim3、回环几何验证、位姿图优化测试 |
 
@@ -159,12 +163,13 @@ bool verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop, SE3& T_loop_curr); // �
 2. 固定原始首帧，以完整的里程计边和回环边集合执行位姿图优化；
 3. 每个地图点按其最早观测关键帧的 `old_pose → new_pose` 增量同步一次；
 4. 执行全局 motion-only BA，迭代数取 `global_ba_iterations`；
-5. 对非关键帧插值相邻关键帧校正，更新完整 `T_cw` 历史，保证 TUM 位置和朝向均来自校正后轨迹；
+5. （历史方案）对非关键帧插值相邻关键帧校正；当前实现使用锚定轨迹与 `T_ws` 派生世界位姿；
 6. 状态栏/日志输出：`Loop closed! kf# -> kf#`。
 
 ### 4.4 位姿图优化（optimizer.cpp，g2o）
 
-**顶点**：所有关键帧（`g2o::VertexSE3Expmap`，T_wc 语义——沿用 localBA 的取逆约定）。
+**顶点（历史设计语义）**：所有关键帧（`g2o::VertexSE3Expmap`）；当前字段到 g2o 的转换以
+`optimizer.cpp` 为准，不应由调用方直接假设 `pose_cs` 的逆。
 
 **边**：
 - **相邻边**（里程计约束）：关键帧插入时冻结 `T_rel = T_cw_prev · T_wc_curr`，后续优化不得从已校正位姿重算；
@@ -172,7 +177,8 @@ bool verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop, SE3& T_loop_curr); // �
 
 **固定**：第一个关键帧 `setFixed(true)` 锚定坐标系。
 
-**回写**：优化后所有关键帧 `pose_cw` 取逆写回；地图点按最早观测关键帧的位姿增量同步。
+**回写（历史方案）**：优化后更新关键帧/地图点；当前实现使用 `pose_cs`、`pos_s` 和
+`T_ws` 的局部坐标模型，并通过严格 revision/topology 检查提交快照结果。
 
 接口签名调整（`optimizer.h`）：
 
@@ -196,7 +202,8 @@ static bool poseGraphOptimization(Map::Ptr map,
 - 差异：`VOConfig` 读取 yaml 时 `LoopClosure.enable_loop_closure=true`（run_vo 默认 false）；
 - 主循环：读帧 → `addFrame` → Viewer → FPS；结束后保存 TUM 轨迹（**必须是校正后的轨迹**，即 vo.getTrajectory() 在 handleLoopCorrection 后已更新）。
 
-**CMakeLists.txt**：取消 `run_slam` 注释块；`VOConfig` 增加字段（见 4.7）。`run_vo` 保持纯 VO（`enable_loop_closure=false`），用于 A/B 评估对比。
+**CMakeLists.txt（历史计划）**：当时需要取消 `run_slam` 注释块；当前目标已启用。
+`run_vo` 仍强制关闭回环（`enable_loop_closure=false`），用于 A/B 评估对比。
 
 ### 4.7 配置项（config/default.yaml + VOConfig）
 
@@ -248,8 +255,8 @@ LoopClosure:
 **评估**：
 ```
 bash scripts/prepare_kitti.sh        # 已有
-./build/bin/run_vo  datasets/sequences/00 config/default.yaml vo_traj.txt          # 基线（回环关）
-./build/bin/run_slam datasets/sequences/00 config/default.yaml slam_traj.txt        # 回环开
+./build/bin/run_vo  datasets/kitti/sequences/00 config/default.yaml vo_traj.txt          # 基线（回环关）
+./build/bin/run_slam datasets/kitti/sequences/00 config/default.yaml slam_traj.txt        # 回环开
 evo_ape tum kitti_gt.txt vo_traj.txt   -a    # 双目基线：SE3 对齐，不修尺度
 evo_ape tum kitti_gt.txt slam_traj.txt -a    # 双目回环版：SE3 对齐，不修尺度
 ```
@@ -274,6 +281,7 @@ evo_ape tum kitti_gt.txt slam_traj.txt -a    # 双目回环版：SE3 对齐，�
 
 ## 9. 附：与既有约定的兼容性
 
-- **位姿语义**：全程保持 `pose_cw = T_cw`（世界→相机）；g2o 侧沿用"喂 T_wc、回写取逆"的既有约定（§4.4）；
+- **位姿语义**：当前字段为 `pose_cs = T_cs`（子地图→相机），世界→相机位姿由
+  `T_cw = T_cs · T_ws⁻¹` 派生；g2o 适配细节以 `optimizer.cpp` 当前实现为准；
 - **时间过滤阈值**（temporal_window=30）与关键帧冷却（min_keyframe_interval=10）互不干扰——回环跳过的是"刚走过的路"，关键帧冷却防的是"连续插帧"；
 - **教学定位**：所有新代码坚持"≤200 行/模块 + 中文注释 + 可对照 TUTORIAL §3 数学基础"。

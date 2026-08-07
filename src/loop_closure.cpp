@@ -31,12 +31,17 @@ SE3 matToSE3(const cv::Mat& R, const cv::Mat& t) {
 // ============================================================
 class LoopClosure::Impl {
 public:
+    struct CachedKeyFrame {
+        Frame::Ptr frame;
+        Vec3 camera_position = Vec3::Zero();
+    };
+
     std::unique_ptr<DBoW3::Vocabulary> vocab;   // 词典（加载后只读）
     std::unique_ptr<DBoW3::Database>   db;      // 数据库（随关键帧增长）
     // 关键帧 id ↔ 数据库条目 id 双向映射（查询结果反查关键帧用）
     std::unordered_map<unsigned long, DBoW3::EntryId> kf_db_id;
     std::unordered_map<DBoW3::EntryId, unsigned long> db_id_kf;
-    std::unordered_map<unsigned long, Frame::Ptr>     kf_cache;  // 候选帧回查
+    std::unordered_map<unsigned long, CachedKeyFrame> kf_cache;  // 候选帧+位置快照
     std::unordered_map<unsigned long, DBoW3::BowVector> kf_bow; // 词袋缓存
 };
 #endif
@@ -55,6 +60,7 @@ void LoopClosure::setParams(double min_score, int temporal_window,
                             int top_candidates,
                             double pos_prior_dist_m,
                             int pos_prior_gap) {
+    std::lock_guard<std::mutex> lock(mutex_);
     min_score_             = min_score;
     temporal_window_       = temporal_window;
     min_loop_inliers_      = min_loop_inliers;
@@ -87,6 +93,7 @@ bool LoopClosure::loadVocabulary(const std::string& vocab_path) {
         LOG_ERROR("LoopClosure: vocabulary is empty");
         return false;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     impl_->vocab = std::move(vocab);
     impl_->db = std::make_unique<DBoW3::Database>(*impl_->vocab, false, 0);
     LOG_INFO("LoopClosure: vocabulary loaded (" << vocab_path << "), "
@@ -95,24 +102,15 @@ bool LoopClosure::loadVocabulary(const std::string& vocab_path) {
 #endif
 }
 
-std::unordered_set<unsigned long> LoopClosure::protectedKeyFrames() const {
-#ifdef HAS_DBOW3
-    std::unordered_set<unsigned long> out;
-    if (impl_) {
-        out.reserve(impl_->kf_db_id.size());
-        for (const auto& [id, eid] : impl_->kf_db_id) out.insert(id);
-    }
-    return out;
-#else
-    return {};
-#endif
-}
-
 void LoopClosure::addKeyFrame(Frame::Ptr kf) {
 #ifndef HAS_DBOW3
     (void)kf;
 #else
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return;
+    const Vec3 camera_position = kf->pose_cs.camera_position();
+    // 异步任务重排时同一 KF 可能重复提交；数据库和保护集合保持幂等。
+    if (impl_->kf_db_id.contains(kf->id)) return;
     // 计算词袋向量并入库（复用已算过的，避免重复 transform）
     auto it = impl_->kf_bow.find(kf->id);
     DBoW3::BowVector bow;
@@ -125,7 +123,7 @@ void LoopClosure::addKeyFrame(Frame::Ptr kf) {
     DBoW3::EntryId eid = impl_->db->add(bow);
     impl_->kf_db_id[kf->id] = eid;
     impl_->db_id_kf[eid]    = kf->id;
-    impl_->kf_cache[kf->id] = kf;
+    impl_->kf_cache[kf->id] = {kf, camera_position};
 #endif
 }
 
@@ -134,6 +132,7 @@ std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
     (void)kf;
     return {};
 #else
+    std::lock_guard<std::mutex> lock(mutex_);
     PERF_SCOPE("lc.detect");
     std::vector<Frame::Ptr> candidates;
     if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return candidates;
@@ -157,7 +156,7 @@ std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
         if (r.Score < min_score_) continue;
         auto kf_it = impl_->kf_cache.find(cand_id);
         if (kf_it == impl_->kf_cache.end()) continue;
-        scored.emplace_back(kf_it->second, r.Score);
+        scored.emplace_back(kf_it->second.frame, r.Score);
     }
     // 分数降序，取前 3 个（PnP 验证多个候选提高闭环召回；验证失败大概率
     // 是候选 KF 点被 cull 稀疏，多试几个提高成功率）
@@ -171,13 +170,15 @@ std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
         const Vec3 curr_pos = kf->pose_cs.inverse().t;  // 相机光心（世界系）
         double best_dist = position_prior_dist_m_;
         Frame::Ptr prior_cand;
-        for (const auto& [cand_id, cand] : impl_->kf_cache) {
-            if (!cand || cand_id >= kf->id ||
+        for (const auto& [cand_id, cached] : impl_->kf_cache) {
+            if (!cached.frame || cand_id >= kf->id ||
                 kf->id - cand_id < (unsigned long)position_prior_gap_) continue;
-            const double dist = (cand->pose_cs.inverse().t - curr_pos).norm();
+            // 候选位置是 addKeyFrame 时记录的 T_cw 光心快照；不读取
+            // map_mutex_ 外可能被后端更新的候选 Frame::pose_cs。
+            const double dist = (cached.camera_position - curr_pos).norm();
             if (dist < best_dist) {
                 best_dist = dist;
-                prior_cand = cand;
+                prior_cand = cached.frame;
             }
         }
         if (prior_cand) {
@@ -205,6 +206,7 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
     (void)kf_curr; (void)kf_loop; (void)T_loop_curr;
     return false;
 #else
+    std::lock_guard<std::mutex> lock(mutex_);
     PERF_SCOPE("lc.verify");
     if (!camera_ || !kf_curr || !kf_loop) return false;
 

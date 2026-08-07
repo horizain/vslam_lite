@@ -140,7 +140,8 @@ Threading:
    「后台处理」（建点/三角化/Local BA/剔除/里程计边冻结）。
 3. 回环钩子改为入队：`detectLoop`/`verifyLoop`/`handleLoopCorrection` 迁到后台。
 4. Map 加 `map_mutex_`（或 VO 内独立锁），跟踪/后台/回环按第五节加锁。
-5. `run_vo`/`run_slam` 启动/停止后台线程；`config` 加 `Threading` 段。
+5. （初稿计划）`run_vo`/`run_slam` 启动/停止后台线程；当前以后端配置和现有
+   `async_backend` 路径为准，不要新增未实现的 `Threading` 段。
 6. 验证：25 项单测 + KITTI 00 全程（FPS、有效位姿、轨迹长度、perf 报告对比）。
 
 ---
@@ -210,7 +211,7 @@ LOST 292→8（-97%）、闭环 1→3、子地图重建 13→3。
 | 覆盖式队列 / BA 优先 | ✅ 已实现 | — |
 | 描述子免拷贝快照 | ✅ `with_descriptors=false` | — |
 | FROZEN 冻结协议 | ⬜ 隐式（滑出即不被选中） | `selectLocalWindow` 显式标记 FROZEN，前端参考限 ACTIVE/FROZEN |
-| 点锚定局部坐标 | ⬜ 点仍存世界坐标 | `MapPoint` 加 `anchor_kf`；`pos_w` 改读时组合 |
+| 点锚定局部坐标 | ✅ `MapPoint::pos_s` + `Submap::T_ws` | 继续验证跨子地图/大规模场景 |
 | 校正场 C | ⬜ 回环全量写回 | `handleLoopCorrection` 只生成 C + 轨迹副本原子交换 |
 
 g2o 保持单线程：窗口 BA 与回环位姿图规模已被窗口/点截断/位姿采样控制住，
@@ -352,7 +353,7 @@ std::atomic<std::shared_ptr<const CorrectionField>> corrections;
 | M3 ✅ | `T_cs/p_s/T_ws` 局部坐标迁移 | 改 `T_ws` 时 KF/点/轨迹一致移动 |
 | M4 ✅ | 锚定普通帧和地图点 | 删除全量轨迹插值与全量点搬运 |
 | M5 ✅ | Atlas 约束图 | 跨子地图连接不跳变，融合可暂不实现 |
-| M6 ✅ | COW 校正场、异步默认恢复 | TSAN/压力测试通过，FPS 提升且精度不退化 |
+| M6 ◐ | revision rebase + 异步默认恢复已落地；COW 校正场未实现 | TSan/压力测试与 COW 发布仍待完成 |
 
 > 2026-08-06 落地记录（§3.20）：M0 统一验收 + 同步 BA 跳过活动参考写回；
 > M1/M2 快照/Result/Committer/帧级快照；M3 子地图局部坐标（对齐只改

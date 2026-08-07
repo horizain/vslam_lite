@@ -31,9 +31,16 @@ CommitStatus BackendCommitter::commit(
     const Map::Ptr& map,
     const OptimizationResult& result,
     const std::unordered_set<unsigned long>& skip_pose,
-    double max_pose_correction) {
+    double max_pose_correction,
+    const Map::Ptr& expected_map) {
     // 调用方约定已持 map_mutex_ 独占锁（§14.1-5 原子提交）。
     if (!map) return CommitStatus::NOT_FOUND;
+    // revision 只在单个 Map 实例内有意义。不同子地图会从相同版本/对象 id
+    // 重新起步，因此提交者必须先验证任务绑定的 Map 身份，不能仅比较数值版本。
+    if (expected_map && map != expected_map) {
+        LOG_WARN("Committer dropped result for a different Map instance");
+        return CommitStatus::STALE;
+    }
 
     // 1. stale 检查（M6 追加 rebase 协议，§14.2）：
     //    - 几何版本已变（其他提交/对齐发布过新几何）→ 结果基于旧坐标，

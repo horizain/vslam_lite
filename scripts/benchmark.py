@@ -10,16 +10,21 @@ benchmark.py - VSLAM 全程基准测试套件
 
 用法:
   # 单配置基准（跑 2 次取均值）
-  python3 scripts/benchmark.py datasets/sequences/00 config/kitti00.yaml /tmp/bench_async
+  python3 scripts/benchmark.py datasets/kitti/sequences/00 config/kitti00.yaml /tmp/bench_async \
+      --expected-frames 4541
+
+  # EuRoC 单目（自动传 --euroc，Sim3 对齐）
+  python3 scripts/benchmark.py datasets/euroc/V1_01_easy/mav0 config/default.yaml \
+      /tmp/bench_euroc --format euroc --alignment sim3 --expected-frames 2912
 
   # 对比两个配置（各跑 3 次，输出对比表）
-  python3 scripts/benchmark.py datasets/sequences/00 config/kitti00.yaml /tmp/bench_ab \
+  python3 scripts/benchmark.py datasets/kitti/sequences/00 config/kitti00.yaml /tmp/bench_ab \
       --runs 3 --compare config/kitti00_sync.yaml
 
   # 指定可执行文件 / 真值
   python3 scripts/benchmark.py ... --bin build/bin/run_slam --gt kitti_gt.txt
 
-输出：<out_dir>/results.json + 控制台汇总表。
+输出：<out_dir>/results_A.json（对照配置另写 results_B.json）+ 控制台汇总表。
 """
 import argparse
 import json
@@ -34,12 +39,16 @@ RE_ANCHOR = re.compile(r"creating anchored submap")
 RE_LOOP = re.compile(r"Loop closed!")
 RE_BA_CAP = re.compile(r"BA point cap")
 RE_BACKEND = re.compile(r"Async backend ENABLED")
+RE_FINAL_MAP = re.compile(r"Final map: (\d+) points, (\d+) keyframes")
+RE_MATCHED = re.compile(r"时间戳匹配:\s*(\d+)")
 
 
 def run_once(args, out_path, run_dir):
     """跑一次全程，返回指标 dict。"""
     log_path = str(Path(run_dir) / "run.log")
     cmd = [args.bin, args.dataset, args.config, out_path, "--headless"]
+    if args.format != "kitti":
+        cmd.append(f"--{args.format}")
     with open(log_path, "w") as logf:
         proc = subprocess.run(cmd, cwd=args.cwd, stdout=logf, stderr=subprocess.STDOUT)
     if proc.returncode != 0:
@@ -55,10 +64,17 @@ def run_once(args, out_path, run_dir):
     m["submap_reinit"] = len(RE_ANCHOR.findall(log))
     m["loops"] = len(RE_LOOP.findall(log))
     m["async"] = bool(RE_BACKEND.search(log))
+    final_map = RE_FINAL_MAP.search(log)
+    m["map_points"] = int(final_map.group(1)) if final_map else -1
+    m["keyframes"] = int(final_map.group(2)) if final_map else -1
     if m["frames"] <= 0:
         raise RuntimeError(f"未解析到完整运行统计，见 {log_path}")
     if args.expected_frames and m["frames"] != args.expected_frames:
         raise RuntimeError(f"帧数不完整: {m['frames']} != {args.expected_frames}")
+    with open(out_path) as trajectory:
+        m["valid_poses"] = sum(
+            1 for line in trajectory if line.strip() and not line.startswith("#"))
+    m["valid_ratio"] = m["valid_poses"] / m["frames"]
 
     # ATE（无真值则跳过）
     if args.gt and Path(out_path).exists():
@@ -68,6 +84,8 @@ def run_once(args, out_path, run_dir):
         if ate_out.returncode != 0:
             raise RuntimeError(f"轨迹评估失败: {ate_out.stderr.strip()}")
         ate_text = ate_out.stdout
+        matched = RE_MATCHED.search(ate_text)
+        m["matched_poses"] = int(matched.group(1)) if matched else -1
         for key in ("RMSE", "Mean", "Max"):
             mm = re.search(rf"ATE\s+{key}\s*=\s*([\d.]+)", ate_text)
             m[f"ate_{key.lower()}"] = float(mm.group(1)) if mm else -1.0
@@ -122,8 +140,10 @@ def main():
     ap.add_argument("--gt", default=None, help="真值轨迹（TUM），给则评估 ATE")
     ap.add_argument("--alignment", choices=("se3", "sim3", "none"), default="se3",
                     help="双目默认 se3；单目请显式选择 sim3")
-    ap.add_argument("--expected-frames", type=int, default=4541,
-                    help="必须完整处理的帧数；0 表示不校验（KITTI00 默认 4541）")
+    ap.add_argument("--format", choices=("kitti", "tum", "euroc"), default="kitti",
+                    help="数据集格式；非 KITTI 时向 run_slam 传对应标志")
+    ap.add_argument("--expected-frames", type=int, default=0,
+                    help="必须完整处理的帧数；0 表示不校验")
     ap.add_argument("--cwd", default=".", help="工作目录（默认仓库根，perf.csv 在此生成）")
     ap.add_argument("--evaluate", default="scripts/evaluate_ate.py")
     args = ap.parse_args()
@@ -160,12 +180,16 @@ def main():
     # ---- 输出 ----
     metric_names = [
         ("fps", "FPS", "%.2f"), ("seconds", "耗时(s)", "%.1f"),
+        ("valid_poses", "有效位姿", "%.0f"),
+        ("valid_ratio", "有效位姿率", "%.2f"),
+        ("matched_poses", "GT匹配位姿", "%.0f"),
         ("ate_rmse", "ATE RMSE(m)", "%.2f"), ("ate_mean", "ATE Mean(m)", "%.2f"),
         ("ate_max", "ATE Max(m)", "%.2f"),
         ("rpe_trans_rmse", "RPE trans(m/f)", "%.2f"),
         ("rpe_rot_rmse", "RPE rot(deg/f)", "%.2f"),
         ("jumps_10m", ">10m 跳变", "%.1f"), ("lost", "LOST 次数", "%.1f"),
         ("submap_reinit", "子地图重建", "%.1f"), ("loops", "闭环次数", "%.1f"),
+        ("map_points", "最终地图点", "%.0f"), ("keyframes", "最终关键帧", "%.0f"),
         ("ba_max_ms", "Local BA max(ms)", "%.0f"),
         ("global_ba_max_ms", "全局 BA max(ms)", "%.0f"),
     ]
