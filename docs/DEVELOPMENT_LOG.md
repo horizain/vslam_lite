@@ -1332,3 +1332,17 @@ python3 scripts/benchmark.py datasets/euroc/V1_01_easy/mav0 config/default.yaml 
 Atlas 当前只对齐子地图坐标系，尚未融合跨子地图重复点；
 全局 BA 默认关闭；EuRoC 暂只支持 pinhole + radial-tangential 模型。上述是后续框架级
 工作，不应再用 KITTI 00 专项阈值去掩盖。
+
+### 3.24 机器人长期定位组件产品化规划（2026-08-07）
+
+在 §3.23 的事务式后端和 KITTI/EuRoC 基准基础上，新增当前规划文档
+`docs/PRODUCTION_LOCALIZATION_PLAN.md`。规划不再以单次 ATE 调参作为主线，而是按
+M0～M7 依次收口：定位 API/状态机、`VisualOdometry` 模块拆分、实时输入与资源硬预算、
+视觉退化检测和协方差、版本化地图与纯定位模式、多会话 Atlas 融合、IMU/轮速松耦合
+ESKF，以及 CI/24 小时灰度发布。
+
+文档为每个里程碑固定了算法或框架方向、首版参数、任务依赖、禁止事项和量化门槛。关键
+产品不变量包括：错误或过期后端结果不修改实时状态；所有队列和地图资源有硬上限；失败
+位姿不得伪装为有效定位；生产默认使用只读地图；控制器使用连续 `T_ob`，回环只更新
+`T_wo`，全局规划位姿按 `T_wb=T_wo*T_ob` 组合。该文档目前是实施规格，M0～M7 尚未
+落地，不能把规划参数当成当前代码已具备的能力或当前 benchmark 结果。

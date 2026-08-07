@@ -11,6 +11,7 @@
 | [`TUTORIAL.md`](TUTORIAL.md) | 面向初学者的算法、坐标系和逐文件教程 |
 | [`THIRD_PARTY.md`](THIRD_PARTY.md) | 依赖与离线构建说明 |
 | [`THREADING_DESIGN.md`](THREADING_DESIGN.md) | 当前锁序、快照与异步后端约束；旧双队列方案已标为历史 |
+| [`PRODUCTION_LOCALIZATION_PLAN.md`](PRODUCTION_LOCALIZATION_PLAN.md) | 从教学 SLAM 演进到机器人长期定位组件的当前实施规格、固定算法方向和量化门槛 |
 
 ## 历史设计与计划
 
@@ -18,7 +19,7 @@
 |---|---|
 | [`PHASE2_DESIGN.md`](PHASE2_DESIGN.md) | 历史 Phase 2 设计稿；部分目标已实现，部分 Sim3/跨子地图方案仍未落地，不能当作 API 说明 |
 | [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) | 历史 KITTI 基线与改进计划；数字依赖具体数据集、词典和构建配置 |
-| [`DEVELOPMENT_LOG.md`](DEVELOPMENT_LOG.md) | 追加式历史记录，保留旧字段和实验结论；当前实现与完整基准见 §3.22-3.23 |
+| [`DEVELOPMENT_LOG.md`](DEVELOPMENT_LOG.md) | 追加式历史记录，保留旧字段和实验结论；当前实现与完整基准见 §3.22-3.23，产品化规划见 §3.24 |
 | [`../data/eval/README.md`](../data/eval/README.md) | 旧提交 `ff09804` 的回环跳变复现档案；当前 HEAD 指标见开发日志 §3.23 |
 
 ## 当前命名速查
