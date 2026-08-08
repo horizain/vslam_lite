@@ -1,0 +1,19 @@
+# ============================================================
+# 机器人定位配置（M0.3 Localizer Facade）
+# PRODUCTION_LOCALIZATION_PLAN §4.1 / §4.3
+# 生产地图模式要求双目或 VIO 提供公制尺度；纯单目仅用于教学/诊断。
+# ============================================================
+
+Robot:
+  # 运行模式（§1.3）：OdometryOnly / Mapping / LocalizationOnly / MapMaintenance
+  mode: LocalizationOnly
+
+  # 相机 -> 机器人基座 固定标定（§2 T_bc，不允许因回环跳变）
+  # 平移：相机光心在基座系中的位置（米）
+  # 四元数：xyzw；归一化误差 < 1e-6（§4.3，构造时校验，不静默归一化）
+  T_bc:
+    translation: [0.0, 0.0, 0.0]
+    quaternion: [0.0, 0.0, 0.0, 1.0]
+
+  # 双目时间差初值上限（秒）（§4.3）
+  stereo_max_time_diff_s: 0.001

@@ -121,12 +121,14 @@ set(VSLAM_SOURCES
     src/optimizer.cpp
     src/viewer.cpp
     src/loop_closure.cpp
-    src/tracking_state_machine.cpp)
+    src/tracking_state_machine.cpp
+    src/localizer.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
     include/vslam/localization_types.h
     include/vslam/tracking_state_machine.h
+    include/vslam/localizer.h
     include/vslam/camera.h
     include/vslam/dataset.h
     include/vslam/frame.h
@@ -228,6 +230,16 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME test_tracking_state_machine COMMAND test_tracking_state_machine)
 
+    # M0.3 Localizer Facade 契约（独立 CTest）
+    add_executable(test_localizer_contract test/test_localizer_contract.cpp)
+    target_link_libraries(test_localizer_contract vslam)
+    target_compile_definitions(test_localizer_contract PRIVATE
+        VSLAM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_localizer_contract PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_localizer_contract COMMAND test_localizer_contract)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME test_trajectory_alignment
@@ -243,3 +255,4 @@ install(TARGETS vslam
     LIBRARY DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)
 install(FILES config/default.yaml DESTINATION share/vslam)
+install(FILES config/robot.yaml DESTINATION share/vslam)

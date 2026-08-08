@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0.1 定位契约类型落地 §3.25）
+> 最后更新: 2026-08-08（M0 完成：类型契约/状态机/Localizer Facade §3.25-3.27）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1388,3 +1388,43 @@ ESKF，以及 CI/24 小时灰度发布。
 验证：`./build/test_tracking_state_machine` 24/24 PASSED；`ctest --test-dir build`
 4/4 通过（含旧 `test_vo` 5.36s 全过）。纯状态机新增，无算法/轨迹/状态变化。
 下一任务：M0.3 Facade（Localizer 包装 run_slam 输出一致性验收）。
+
+### 3.27 M0.3 Localizer Facade 落地（2026-08-08）
+
+在 M0.1/M0.2 基础上实现 `Localizer` Facade（§4.1/§4.3/§4.4），不修改 `VisualOdometry` 算法。
+
+- 新增 `include/vslam/localizer.h` + `src/localizer.cpp`：包装
+  `VisualOdometry` + `TrackingStateMachine`，调用方不再直接读取 Frame/Map/VO 内部状态。
+  输出 `PoseEstimate`（§4.1），坐标契约 §2：`T_wb = T_wc · T_bc⁻¹`，M0 尚未接入
+  ESKF，`T_ob = T_wb`（odom 系 = 全局系，M6 后由 `T_wo` 分离）。
+- §4.3 输入硬检查：时间戳严格递增（倒退/相等拒绝）、空图/尺寸与标定不一致拒绝、
+  左右尺寸/类型不一致拒绝、双目时间差 >1ms 拒绝（`StereoUnsynchronized`）；
+  失败帧不调用 VO，Map revision 逐项不变。构造时校验 `T_bc` 四元数归一化误差
+  <1e-6、平移有限。
+- 新增 `config/robot.yaml`（Robot 段：mode/`T_bc`/`stereo_max_time_diff_s`）。
+- 新增独立 CTest `test/test_localizer_contract.cpp`（16 项：构造校验、输入硬检查、
+  Map revision 不变、run_slam 等价、重复 stop、析构、robot.yaml 解析）。
+- `app/run_slam.cpp` 增加 `--localizer` 可选入口（§12：只增加可选入口），与旧路径
+  完全并行，不改旧行为。
+
+验证：`./build/test_localizer_contract` 16/16 PASSED；`ctest --test-dir build` 5/5
+通过（含旧 `test_vo`）。`run_slam --localizer --headless --frames 200` 处理 200 帧
+198 有效位姿，轨迹与旧路径逐行一致（如 0.2s 帧平移 `0.020432 0.002230 1.377625`
+完全相同）；localizer 入口按 §4.2 需连续 3 帧完整验收才发布有效位姿，故从 0.2s 起。
+
+**等价性测试的确定性**：两路 `VisualOdometry` 逐位一致需要（与 M1 §5.6
+deterministic.yaml 同思路）——`cv::setRNGSeed(0x5A17)` 固定
+`solvePnPRansac` 内部 RNG，`opencv_threads=1` + `orb_max_bands=1` 关闭特征提取
+的并行分带；`M0 不增加线程`：Localizer 自身不创建线程，p95 处理开销只含包装与
+校验。
+
+**发现的既有缺陷（不在 M0 范围修复）**：`src/vo.cpp:305,309` 中
+`curr_frame_->image_gray = left_input` 是浅拷贝，随后
+`clahe->apply(image_gray, image_gray)` 会**原地改写调用方传入的 cv::Mat 缓冲**。
+等价测试因此必须给每路 VO 渲染独立拷贝（与 run_slam 每帧新矩阵的用法一致）；
+对 Localizer 而言，调用方若复用同一图像缓冲（如摄像头循环），第二次调用会被
+喂入已 CLAHE 增强的图像。该问题记入 `IMPROVEMENT_PLAN` 待办，建议在 M1 拆分
+FrontendTracker 时改为对输入深拷贝或让 CLAHE 写临时缓冲，避免跨实例/复用缓冲
+的非确定性。
+
+下一任务：M1.1 PoseGate（从 `vo.cpp` 提取纯几何质量与运动连续性）。

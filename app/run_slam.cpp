@@ -19,6 +19,7 @@
 #include "vslam/dataset.h"
 #include "vslam/viewer.h"
 #include "vslam/camera.h"
+#include "vslam/localizer.h"
 #include "perf_monitor.h"
 
 #include <iostream>
@@ -39,6 +40,7 @@ int main(int argc, char** argv) {
 
     // ---- 解析命令行参数（与 run_vo 相同）----
     bool headless = false;
+    bool use_localizer = false;  // M0.3 可选入口：用 Localizer Facade 包装同一 VO
     int max_frames = 0;  // 0 = 全程；>0 = 只处理前 N 帧（性能/回归测试用）
     int skip_frames = 0; // 跳过前 N 帧（性能分片测试用）
     std::vector<std::string> positional;
@@ -47,6 +49,7 @@ int main(int argc, char** argv) {
         if (a == "--tum")       dataset_type = vslam::Dataset::Type::TUM;
         else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
         else if (a == "--headless") headless = true;
+        else if (a == "--localizer") use_localizer = true;
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--skip" && i + 1 < argc) skip_frames = std::atoi(argv[++i]);
         else if (a.starts_with("--")) {
@@ -96,6 +99,79 @@ int main(int argc, char** argv) {
         camera->img_width = 640; camera->img_height = 480;
         LOG_WARN("Camera mode: using DEFAULT intrinsics (500/500/320/240). "
                  "Calibrate your camera and pass config.yaml.");
+    }
+
+    // ---- M0.3 可选入口：Localizer Facade（包装同一 VO，只读输出 PoseEstimate）----
+    // 与旧路径完全并行、互不影响：走 Localizer 时不创建/不驱动裸 VisualOdometry。
+    if (use_localizer) {
+        vslam::VOConfig loc_vo_cfg = vslam::VOConfig::fromYaml(config_path);
+        loc_vo_cfg.enable_loop_closure = true;  // 与 run_slam 旧路径一致（A/B 对比）
+        vslam::LocalizerConfig loc_cfg = vslam::LocalizerConfig::fromYaml("config/robot.yaml");
+        vslam::Localizer localizer(camera, loc_vo_cfg, loc_cfg);
+
+        vslam::Viewer viewer;
+        if (!headless) viewer.start();
+
+        cv::Mat image, image_right;
+        double timestamp;
+        int frame_count = 0;
+        auto start_time = std::chrono::steady_clock::now();
+        std::vector<std::pair<double, vslam::SE3>> valid_poses;  // timestamp + T_wc
+
+        for (int i = 0; i < skip_frames && dataset.nextFrame(image, image_right, timestamp); i++) {
+        }
+        start_time = std::chrono::steady_clock::now();
+
+        while (dataset.nextFrame(image, image_right, timestamp)
+               && (max_frames == 0 || frame_count < max_frames)
+               && (headless || !viewer.shouldQuit())) {
+            frame_count++;
+            vslam::PoseEstimate est = image_right.empty()
+                ? localizer.processFrame(image, timestamp)
+                : localizer.processFrame(image, image_right, timestamp);
+            if (est.pose_valid) {
+                // 轨迹约定为相机系：T_wc = T_wb · T_bc（§2）
+                valid_poses.emplace_back(timestamp, est.T_wb * loc_cfg.T_bc);
+            }
+            if (!headless) {
+                std::string state_str;
+                switch (est.state) {
+                    case vslam::TrackingState::Initializing: state_str = "INIT"; break;
+                    case vslam::TrackingState::Tracking:     state_str = "TRACKING"; break;
+                    case vslam::TrackingState::Degraded:     state_str = "DEGRADED"; break;
+                    case vslam::TrackingState::Relocalizing: state_str = "RELOC"; break;
+                    case vslam::TrackingState::Lost:         state_str = "LOST"; break;
+                    case vslam::TrackingState::Stopped:      state_str = "STOPPED"; break;
+                }
+                viewer.setStatus(std::format("LOC {} | {}{} | MP:{} KF:{}",
+                                             state_str,
+                                             est.pose_valid ? "" : " INVALID",
+                                             est.prediction_only ? " PRED" : "",
+                                             localizer.mapPointCount(),
+                                             localizer.keyFrameCount()));
+            }
+        }
+
+        if (!headless) viewer.stop();
+        localizer.stop();
+
+        std::ofstream ofs(traj_path);
+        if (ofs.is_open()) {
+            ofs << std::fixed << std::setprecision(6);
+            for (const auto& [ts, Twc] : valid_poses) {
+                ofs << ts << " "
+                    << Twc.t.x() << " " << Twc.t.y() << " " << Twc.t.z() << " "
+                    << Twc.q.x() << " " << Twc.q.y() << " " << Twc.q.z() << " "
+                    << Twc.q.w() << "\n";
+            }
+        }
+        auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        LOG_INFO("Done (localizer). Processed " << frame_count << " frames in "
+                 << total_time / 1000.0 << " seconds ("
+                 << frame_count * 1000.0 / total_time << " FPS), "
+                 << valid_poses.size() << " valid poses -> " << traj_path);
+        return 0;
     }
 
     // ---- 初始化 SLAM（回环强制开启；run_vo 强制关闭，A/B 对比）----

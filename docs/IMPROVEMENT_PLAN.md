@@ -122,6 +122,17 @@
   Atlas `origin_Twc` 对齐各子地图世界系。
 - **验证**：双子地图合成回环单元测试；长时 LOST 后重定位回旧图场景。
 
+### P2.4 输入图像缓冲原地改写（`vo.cpp` CLAHE 浅拷贝）
+
+- **现状**：`src/vo.cpp:305,309` `curr_frame_->image_gray = left_input`（浅拷贝）后
+  `clahe->apply(image_gray, image_gray)` **原地改写调用方传入的 cv::Mat 缓冲**。
+  M0.3 等价测试已证实：复用同一缓冲的第二个 VO/第二次调用会拿到已 CLAHE 增强的
+  图像（关键点数 612 vs 630），跨实例不可复现；摄像头循环复用缓冲时同样受影响。
+- **设计**：改为对输入深拷贝后再 CLAHE（`left_input.copyTo(image_gray)`），或让 CLAHE
+  写入独立临时缓冲；修复后输入只读，跨实例/复用缓冲确定性。
+- **验证**：复用同一 cv::Mat 连喂两个 VO 结果一致；`run_slam` 轨迹逐位不变。
+- **归属**：建议在 M1 拆分 FrontendTracker 时一并处理（M0.3 文件范围不含 vo.cpp）。
+
 ---
 
 ## 4. 优先级与里程碑
