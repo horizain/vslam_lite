@@ -1460,3 +1460,32 @@ FrontendTracker 时改为对输入深拷贝或让 CLAHE 写临时缓冲，避免
   分配）。
 
 下一任务：M1.2 Relocalizer（候选与几何验证，只返回结果）。
+
+### 3.29 生产级基准评估方案（L0~L2 提交门，2026-08-08）
+
+针对"评估结果能否体现性能/准确性"的缺口（无延迟分位、无多轮统计、正则解析日志、
+无提交门），落地分层评估与提交基准门，详见 `docs/BENCHMARK.md`。
+
+- **结构化指标**：`utils/metrics_json.h` + `run_slam --metrics-json <path>` 输出
+  单次运行 JSON——延迟 p50/p95/p99/max、deadline miss、有效位姿率、LOST 次数/时长、
+  子地图重建、回环、地图规模。`--deadline-ms` 可配（默认 100ms，10Hz）。
+- **统计基准 v2**：`scripts/benchmark.py` 重写——每轮读 metrics JSON（不解析日志）、
+  ATE 用 `evaluate_ate.py --json`（机读摘要），N 轮（默认 5）聚合 mean/std/worst，
+  门限断言作用于 **worst 一轮**，输出 `report.json`，退出码 0/1/2。
+- **门限配置**：`config/benchmark.yaml`（dataset/config/runs/window/deadline_ms +
+  Gates：valid_ratio≥0.99、lost≤30、submap_reinit≤1、jumps_10m=0、latency_p99≤80ms、
+  deadline_miss<1%、ATE worst≤40m/std≤8m；ate_* 需 GT，无则 skip）。
+- **精度评估补全**：`evaluate_ate.py` 增加 ATE Std、RPE trans/rot Mean/Max、`--json`
+  机读输出。
+- **确定性参考**：`scripts/benchmark/reference/{pose.txt,status.csv}`（KITTI 00 前 1000
+  帧 deterministic.yaml 输出）。
+- **提交门**：`scripts/benchmark_gate.sh`（L0 构建+ctest → L1 确定性回归 →
+  L2 统计基准快速档）经 `.githooks/pre-commit` 由
+  `git config core.hooksPath .githooks` 启用；`--full` 完整档，`--update-reference`
+  更新 L1 参考。
+
+验证：`scripts/benchmark_gate.sh` 快速档端到端 PASS（ctest 6/6、L1 轨迹/状态逐位一致、
+L2 门限全过，500 帧×3 轮 latency_p99≈25ms、valid_ratio=1.0）。旧 `benchmark.py`
+接口保留 A/B 对比能力；`test_trajectory_alignment` 不受影响。
+
+下一任务：M1.2 Relocalizer。

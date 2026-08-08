@@ -140,6 +140,8 @@ def main(argv=None):
     ap.add_argument("--alignment", choices=("se3", "sim3", "none"), default="se3",
                     help="双目默认 se3；单目使用 sim3")
     ap.add_argument("--max-time-diff", type=float, default=0.02)
+    ap.add_argument("--json", action="store_true",
+                    help="仅输出机器可读 JSON 摘要（benchmark.py 消费，不做正则解析）")
     args = ap.parse_args(argv)
 
     est, gt = load_tum(args.est), load_tum(args.gt)
@@ -157,18 +159,45 @@ def main(argv=None):
     steps, step_rot = continuity_metrics(est)
     est_len = float(steps.sum())
     gt_len = float(np.linalg.norm(np.diff(gt_pts, axis=0), axis=1).sum())
+    coverage = len(pairs) / len(gt) * 100.0
+
+    summary = {
+        "matched": len(pairs), "est_total": len(est), "gt_total": len(gt),
+        "coverage_pct": coverage,
+        "ate_rmse": rmse(ate), "ate_mean": float(np.mean(ate)),
+        "ate_std": float(np.std(ate)), "ate_max": float(np.max(ate)),
+        "ate_p95": float(np.percentile(ate, 95)),
+        "rpe_trans_rmse": rmse(rpe_t), "rpe_trans_mean": float(np.mean(rpe_t)),
+        "rpe_trans_max": float(np.max(rpe_t)),
+        "rpe_rot_rmse": rmse(rpe_r), "rpe_rot_mean": float(np.mean(rpe_r)),
+        "rpe_rot_max": float(np.max(rpe_r)),
+        "est_len": est_len, "gt_len": gt_len, "len_ratio": est_len / gt_len if gt_len else float("nan"),
+        "jumps_3m": int(np.count_nonzero(steps > 3.0)) if len(steps) else 0,
+        "jumps_5m": int(np.count_nonzero(steps > 5.0)) if len(steps) else 0,
+        "jumps_10m": int(np.count_nonzero(steps > 10.0)) if len(steps) else 0,
+        "step_p95": float(np.percentile(steps, 95)) if len(steps) else float("nan"),
+        "rot_step_p99": float(np.percentile(step_rot, 99)) if len(step_rot) else float("nan"),
+    }
+
+    if args.json:
+        import json
+        print(json.dumps(summary, indent=2))
+        return 0
 
     print(f"时间戳匹配: {len(pairs)} (估计 {len(est)} / 真值 {len(gt)}, "
-          f"覆盖率={len(pairs) / len(gt) * 100:.2f}%)")
+          f"覆盖率={coverage:.2f}%)")
     print(f"对齐模式: {args.alignment.upper()}  scale={scale:.6f} "
           f"旋转={rotation_angle_deg(R):.3f}deg 平移={np.linalg.norm(t):.3f}m")
     print(f"轨迹长度: 估计={est_len:.3f}m 匹配GT={gt_len:.3f}m 比值={est_len / gt_len:.6f}")
     print(f"ATE  RMSE = {rmse(ate):.3f} m")
     print(f"ATE  Mean = {np.mean(ate):.3f} m")
+    print(f"ATE  Std  = {np.std(ate):.3f} m")
     print(f"ATE  Max  = {np.max(ate):.3f} m")
     print(f"ATE  P95  = {np.percentile(ate, 95):.3f} m")
     print(f"RPE  Trans RMSE = {rmse(rpe_t):.3f} m/frame")
+    print(f"RPE  Trans Mean/Max = {np.mean(rpe_t):.3f}/{np.max(rpe_t):.3f} m")
     print(f"RPE  Rot RMSE = {rmse(rpe_r):.3f} deg/frame")
+    print(f"RPE  Rot Mean/Max = {np.mean(rpe_r):.3f}/{np.max(rpe_r):.3f} deg")
     if len(steps):
         print(f"Step P95/P99/Max = {np.percentile(steps, 95):.3f}/"
               f"{np.percentile(steps, 99):.3f}/{np.max(steps):.3f} m")

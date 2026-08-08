@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# pre-commit - 提交基准门（L0 单元测试 + L1 确定性回归 + L2 统计基准）
+#
+# 由 core.hooksPath 启用：git config core.hooksPath .githooks
+# 每次提交前强制跑 scripts/benchmark_gate.sh 快速档；失败则阻止提交。
+# 紧急绕过：git commit --no-verify（不推荐，需在 PR 说明原因）。
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/scripts/benchmark_gate.sh"

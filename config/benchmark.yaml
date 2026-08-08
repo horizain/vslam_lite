@@ -1,0 +1,35 @@
+# ============================================================
+# 生产级基准评估配置（M1.6 / §11.4）
+# 分层：L0 单元测试（ctest）→ L1 确定性回归（compare_trajectories.py）
+#       → L2 统计基准（本文件，多轮 mean/std/worst + 门限断言）
+#       → L3 长期/故障（release 阶段，未在此）
+#
+# 注意（§0.1）：首版门限是当前平台/数据集标定起点，不是按单个 KITTI 序列
+# 调参；后续只能根据 ≥3 类场景的机器人实录数据统一标定。benchmark.py 报告
+# mean/std/worst，禁止只看最好一轮。
+# ============================================================
+
+Benchmark:
+  dataset: "datasets/sequences/00"
+  config: "config/default.yaml"
+  format: "kitti"
+  # 真值轨迹（TUM）。留空则跳过 ATE 门限；提供后自动启用：
+  #   构建真值：scripts/kitti_gt_to_tum.py datasets/sequences/00/poses /tmp/kitti_gt.tum
+  gt: ""
+  alignment: "se3"        # 双目 SE3；单目用 sim3
+  runs: 5                 # 每配置轮数（§0.1：统计基准至少 5 轮）
+  window_frames: 0        # 0 = 全程；>0 = 只跑前 N 帧（提交门快速档用）
+  deadline_ms: 100        # 10Hz 地面机器人单帧延迟门限
+  measure_rss: false      # true = 用 /usr/bin/time -v 测 RSS 峰值（仅 Linux）
+
+# ---- 发布门限（worst 一轮断言；min=越高越好 / max=越低越好）----
+# ate_* 需提供 gt 才生效；无 GT 时自动 skip。
+Gates:
+  valid_ratio:        { min: 0.99 }    # §7.6：有效轨迹率每轮 ≥99%
+  lost_count:         { max: 30 }      # KITTI 00 基线约 8 次 LOST
+  submap_reinit:      { max: 1 }
+  jumps_10m:          { max: 0 }       # 连续有效帧 >10m 非物理跳变必须为 0
+  latency_p99_ms:     { max: 80.0 }    # §6.5：10Hz 配置跟踪 p99 <80ms
+  deadline_miss_ratio:{ max: 0.01 }    # §6.5：deadline miss <1%
+  ate_rmse:           { max: 40.0 }    # §7.6 M3 阶段门：ATE worst ≤40m
+  ate_std:            { max: 8.0 }     # §7.6：ATE std ≤8m

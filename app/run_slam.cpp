@@ -21,6 +21,7 @@
 #include "vslam/camera.h"
 #include "vslam/localizer.h"
 #include "perf_monitor.h"
+#include "metrics_json.h"
 
 #include <iostream>
 #include <string>
@@ -43,7 +44,9 @@ int main(int argc, char** argv) {
     bool use_localizer = false;  // M0.3 可选入口：用 Localizer Facade 包装同一 VO
     int max_frames = 0;  // 0 = 全程；>0 = 只处理前 N 帧（性能/回归测试用）
     int skip_frames = 0; // 跳过前 N 帧（性能分片测试用）
-    std::string status_csv_path;  // M1 确定性回归：逐帧状态/计数 CSV
+    std::string status_csv_path;    // M1 确定性回归：逐帧状态/计数 CSV
+    std::string metrics_json_path;  // 结构化指标 JSON（benchmark.py 消费）
+    long long deadline_ms = 100;    // 单帧延迟门限（10Hz 地面机器人默认 100ms）
     std::vector<std::string> positional;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -52,6 +55,8 @@ int main(int argc, char** argv) {
         else if (a == "--headless") headless = true;
         else if (a == "--localizer") use_localizer = true;
         else if (a == "--status-csv" && i + 1 < argc) status_csv_path = argv[++i];
+        else if (a == "--metrics-json" && i + 1 < argc) metrics_json_path = argv[++i];
+        else if (a == "--deadline-ms" && i + 1 < argc) deadline_ms = std::atoll(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--skip" && i + 1 < argc) skip_frames = std::atoi(argv[++i]);
         else if (a.starts_with("--")) {
@@ -214,6 +219,17 @@ int main(int argc, char** argv) {
 
     // VO 内部保留并回环修正完整 T_cw；这里只保存与有效位姿一一对应的时间戳。
     std::vector<double> valid_timestamps;
+    std::vector<double> latencies;  // 每帧 addFrame 耗时（ms），用于延迟分位
+
+    // ---- 结构化指标跟踪 ----
+    long long deadline_miss = 0;
+    long long lost_count = 0;
+    double lost_duration = 0.0;
+    bool in_lost = false;
+    double lost_start = 0.0;
+    double last_ts = 0.0;
+    unsigned long prev_submap_id = 0;
+    long long submap_reinit = 0;
 
     LOG_INFO("Starting SLAM pipeline (loop closure "
              << (vo.loopClosureEnabled() ? "ON" : "OFF")
@@ -223,14 +239,34 @@ int main(int argc, char** argv) {
            && (max_frames == 0 || frame_count < max_frames)
            && (headless || !viewer.shouldQuit())) {
         frame_count++;
+        last_ts = timestamp;
 
         // 运行一帧 SLAM（双目：左右目；单目：仅左目）
+        const auto t0 = std::chrono::steady_clock::now();
         vslam::SE3 pose = image_right.empty()
             ? vo.addFrame(image, timestamp)
             : vo.addFrame(image, image_right, timestamp);
+        const double frame_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        latencies.push_back(frame_ms);
+        if (frame_ms > static_cast<double>(deadline_ms)) deadline_miss++;
 
         auto st = vo.getStatus();
         if (st.pose_valid) valid_timestamps.push_back(timestamp);
+
+        // LOST 状态迁移计数 + 时长
+        if (st.state == vslam::VisualOdometry::State::LOST) {
+            if (!in_lost) { in_lost = true; lost_start = timestamp; }
+        } else if (in_lost) {
+            in_lost = false;
+            lost_count++;
+            lost_duration += timestamp - lost_start;
+        }
+        // 子地图重建计数（submap_id 递增）
+        if (st.submap_id > prev_submap_id) {
+            if (prev_submap_id != 0) submap_reinit++;
+            prev_submap_id = st.submap_id;
+        }
 
         if (status_ofs.is_open()) {
             status_ofs << frame_count - 1 << "," << timestamp << ","
@@ -318,6 +354,41 @@ int main(int argc, char** argv) {
 
     // 性能监测 dump（VSLAM_ENABLE_PERF 关闭时为空操作）
     vslam::perf_dump(traj_path + ".perf.csv");
+
+    // ---- 结构化指标 JSON（benchmark.py / 提交门消费）----
+    if (!metrics_json_path.empty()) {
+        vslam::RunMetrics m;
+        m.frames_processed = frame_count;
+        m.valid_poses = (long long)valid_timestamps.size();
+        m.valid_ratio = frame_count > 0
+            ? (double)valid_timestamps.size() / (double)frame_count : 0.0;
+        m.fps = total_time > 0 ? (double)frame_count * 1000.0 / (double)total_time : 0.0;
+        m.seconds = (double)total_time / 1000.0;
+        m.deadline_ms = deadline_ms;
+        m.deadline_miss = deadline_miss;
+        m.deadline_miss_ratio = frame_count > 0
+            ? (double)deadline_miss / (double)frame_count : 0.0;
+        if (!latencies.empty()) {
+            std::vector<double> sorted = latencies;
+            std::ranges::sort(sorted);
+            m.latency_p50_ms = vslam::percentile(sorted, 50.0);
+            m.latency_p95_ms = vslam::percentile(sorted, 95.0);
+            m.latency_p99_ms = vslam::percentile(sorted, 99.0);
+            m.latency_max_ms = sorted.back();
+        }
+        if (in_lost) {  // 收尾未关闭的 LOST 段
+            lost_count++;
+            lost_duration += last_ts - lost_start;
+        }
+        m.lost_count = lost_count;
+        m.lost_duration_s = lost_duration;
+        m.submap_reinit = submap_reinit;
+        m.loops = (long long)vo.loopClosureCount();
+        m.map_points = (long long)vo.getMap()->mapPointCount();
+        m.keyframes = (long long)vo.getMap()->keyFrameCount();
+        vslam::writeRunMetricsJson(metrics_json_path, m);
+        LOG_INFO("Structured metrics -> " << metrics_json_path);
+    }
 
     return 0;
 }

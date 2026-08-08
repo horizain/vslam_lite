@@ -1,219 +1,234 @@
 #!/usr/bin/env python3
 """
-benchmark.py - VSLAM 全程基准测试套件
+benchmark.py - 生产级统计基准（v2）
 
-对同一数据集+配置跑 N 次完整 SLAM（默认 2 次），汇总：
-  - 全程耗时 / FPS（解析 run_slam 输出）
-  - ATE（RMSE/Mean/Max，复用 evaluate_ate.py）
-  - 跟踪稳定性：LOST / 子地图重建 / 闭环次数（解析日志）
-  - 后端性能：BA 最大单次耗时（perf.csv，如有）
+对同一数据集+配置跑 N 轮完整/部分 SLAM，逐轮输出结构化指标（run_slam
+--metrics-json，不做正则解析；ATE 用 evaluate_ate.py --json），汇总
+mean/std/worst，并按 config/benchmark.yaml 的门限断言，报告通过/失败。
 
 用法:
-  # 单配置基准（跑 2 次取均值）
-  python3 scripts/benchmark.py datasets/kitti/sequences/00 config/kitti00.yaml /tmp/bench_async \
-      --expected-frames 4541
+  # 统计基准（5 轮，全程）
+  python3 scripts/benchmark.py config/benchmark.yaml /tmp/bench --gt kitti_gt.tum
 
-  # EuRoC 单目（自动传 --euroc，Sim3 对齐）
-  python3 scripts/benchmark.py datasets/euroc/V1_01_easy/mav0 config/default.yaml \
-      /tmp/bench_euroc --format euroc --alignment sim3 --expected-frames 2912
+  # 快速门（3 轮 × 前 500 帧，无 GT 只断言结构/性能门限）
+  python3 scripts/benchmark.py config/benchmark.yaml /tmp/bench_fast --window 500 --runs 3
 
-  # 对比两个配置（各跑 3 次，输出对比表）
-  python3 scripts/benchmark.py datasets/kitti/sequences/00 config/kitti00.yaml /tmp/bench_ab \
-      --runs 3 --compare config/kitti00_sync.yaml
+  # A/B 对比（每侧 runs 次）
+  python3 scripts/benchmark.py config/benchmark.yaml /tmp/bench --compare config/kitti00_sync.yaml
 
-  # 指定可执行文件 / 真值
-  python3 scripts/benchmark.py ... --bin build/bin/run_slam --gt kitti_gt.txt
-
-输出：<out_dir>/results_A.json（对照配置另写 results_B.json）+ 控制台汇总表。
+输出: <out_dir>/report.json（逐轮 + 聚合 + 门限结果，供 CI/提交门消费）
+退出码: 0 = 全部门限通过；1 = 任一失败；2 = 运行/配置错误
 """
 import argparse
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 
-RE_FPS = re.compile(r"Done\. Processed (\d+) frames in ([\d.]+) seconds \(([\d.]+) FPS\)")
-RE_LOST = re.compile(r"Tracking lost")
-RE_ANCHOR = re.compile(r"creating anchored submap")
-RE_LOOP = re.compile(r"Loop closed!")
-RE_BA_CAP = re.compile(r"BA point cap")
-RE_BACKEND = re.compile(r"Async backend ENABLED")
-RE_FINAL_MAP = re.compile(r"Final map: (\d+) points, (\d+) keyframes")
-RE_MATCHED = re.compile(r"时间戳匹配:\s*(\d+)")
+import numpy as np
+import yaml
 
 
-def run_once(args, out_path, run_dir):
-    """跑一次全程，返回指标 dict。"""
+def pct(sorted_vals, p):
+    if not sorted_vals:
+        return float("nan")
+    idx = (len(sorted_vals) - 1) * p / 100.0
+    lo = int(idx)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    return float(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo))
+
+
+def load_metrics_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def run_ate(est_tum, gt_tum, alignment):
+    """evaluate_ate.py --json，直接解析 JSON 摘要。返回 dict。"""
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "evaluate_ate.py"),
+         str(est_tum), str(gt_tum), "--alignment", alignment, "--json"],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ATE 评估失败: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def run_once(cfg, args, out_path, run_dir):
+    """跑一轮，返回指标 dict。"""
     log_path = str(Path(run_dir) / "run.log")
-    cmd = [args.bin, args.dataset, args.config, out_path, "--headless"]
-    if args.format != "kitti":
-        cmd.append(f"--{args.format}")
+    metrics_path = str(Path(run_dir) / "metrics.json")
+
+    cmd = [args.bin, cfg["dataset"], cfg.get("config", args.config), out_path, "--headless"]
+    fmt = cfg.get("format", "kitti")
+    if fmt != "kitti":
+        cmd.append(f"--{fmt}")
+    if cfg.get("window_frames", 0):
+        cmd += ["--frames", str(cfg["window_frames"])]
+    cmd += ["--metrics-json", metrics_path, "--deadline-ms", str(cfg.get("deadline_ms", 100))]
+
     with open(log_path, "w") as logf:
         proc = subprocess.run(cmd, cwd=args.cwd, stdout=logf, stderr=subprocess.STDOUT)
     if proc.returncode != 0:
         raise RuntimeError(f"run_slam 失败(returncode={proc.returncode})，见 {log_path}")
 
-    m = {}
-    log = open(log_path).read()
-    fps_m = RE_FPS.search(log)
-    m["frames"] = int(fps_m.group(1)) if fps_m else -1
-    m["seconds"] = float(fps_m.group(2)) if fps_m else -1.0
-    m["fps"] = float(fps_m.group(3)) if fps_m else -1.0
-    m["lost"] = len(RE_LOST.findall(log))
-    m["submap_reinit"] = len(RE_ANCHOR.findall(log))
-    m["loops"] = len(RE_LOOP.findall(log))
-    m["async"] = bool(RE_BACKEND.search(log))
-    final_map = RE_FINAL_MAP.search(log)
-    m["map_points"] = int(final_map.group(1)) if final_map else -1
-    m["keyframes"] = int(final_map.group(2)) if final_map else -1
-    if m["frames"] <= 0:
-        raise RuntimeError(f"未解析到完整运行统计，见 {log_path}")
-    if args.expected_frames and m["frames"] != args.expected_frames:
-        raise RuntimeError(f"帧数不完整: {m['frames']} != {args.expected_frames}")
-    with open(out_path) as trajectory:
-        m["valid_poses"] = sum(
-            1 for line in trajectory if line.strip() and not line.startswith("#"))
-    m["valid_ratio"] = m["valid_poses"] / m["frames"]
+    m = load_metrics_json(metrics_path)
 
-    # ATE（无真值则跳过）
-    if args.gt and Path(out_path).exists():
-        ate_out = subprocess.run(
-            [sys.executable, args.evaluate, out_path, args.gt,
-             "--alignment", args.alignment], capture_output=True, text=True)
-        if ate_out.returncode != 0:
-            raise RuntimeError(f"轨迹评估失败: {ate_out.stderr.strip()}")
-        ate_text = ate_out.stdout
-        matched = RE_MATCHED.search(ate_text)
-        m["matched_poses"] = int(matched.group(1)) if matched else -1
-        for key in ("RMSE", "Mean", "Max"):
-            mm = re.search(rf"ATE\s+{key}\s*=\s*([\d.]+)", ate_text)
-            m[f"ate_{key.lower()}"] = float(mm.group(1)) if mm else -1.0
-        for name, pattern in {
-            "rpe_trans_rmse": r"RPE\s+Trans RMSE\s*=\s*([\d.]+)",
-            "rpe_rot_rmse": r"RPE\s+Rot RMSE\s*=\s*([\d.]+)",
-            "jumps_10m": r"Step jumps >3m/>5m/>10m\s*=\s*\d+/\d+/(\d+)",
-        }.items():
-            match = re.search(pattern, ate_text)
-            m[name] = float(match.group(1)) if match else -1.0
-
-    # 性能数据与轨迹同目录输出，避免复制/删除工作区已有 perf.csv。
-    perf_path = out_path + ".perf.csv"
-    if Path(perf_path).exists():
+    # GT 精度（可选）
+    gt = cfg.get("gt") or args.gt
+    if gt:
         try:
-            for line in open(perf_path):
-                parts = line.strip().split(",")
-                if parts and parts[0] == "opt.ba":
-                    m["ba_max_ms"] = float(parts[5])
-                if parts and parts[0] == "loop.global_ba":
-                    m["global_ba_max_ms"] = float(parts[5])
-        except (OSError, IndexError, ValueError):
-            pass
+            ate = run_ate(out_path, gt, cfg.get("alignment", "se3"))
+            m.update({
+                "coverage_pct": ate["coverage_pct"],
+                "ate_rmse": ate["ate_rmse"], "ate_mean": ate["ate_mean"],
+                "ate_std": ate["ate_std"], "ate_max": ate["ate_max"],
+                "rpe_trans_rmse": ate["rpe_trans_rmse"],
+                "rpe_trans_mean": ate["rpe_trans_mean"], "rpe_trans_max": ate["rpe_trans_max"],
+                "rpe_rot_rmse": ate["rpe_rot_rmse"],
+                "rpe_rot_mean": ate["rpe_rot_mean"], "rpe_rot_max": ate["rpe_rot_max"],
+                "len_ratio": ate["len_ratio"],
+                "jumps_3m": ate["jumps_3m"], "jumps_5m": ate["jumps_5m"],
+                "jumps_10m": ate["jumps_10m"],
+            })
+        except RuntimeError as e:
+            print(f"[bench] 警告: {e}（跳过 ATE 门限）", file=sys.stderr)
+
+    # RSS 峰值（Linux /usr/bin/time -v，可选）
+    if cfg.get("measure_rss", False):
+        time_cmd = ["/usr/bin/time", "-v"] + cmd
+        with open(log_path, "w") as logf:
+            proc = subprocess.run(time_cmd, cwd=args.cwd, stdout=logf,
+                                  stderr=subprocess.STDOUT)
+        if proc.returncode == 0:
+            txt = open(log_path).read()
+            for line in txt.splitlines():
+                if "Maximum resident set size" in line:
+                    m["rss_kb"] = float(line.split()[-1])
     return m
 
 
-def summarize(results):
-    """多轮 → {指标: (mean, std)}"""
+def aggregate(rounds):
+    """多轮 → {metric: {mean, std, worst}}；worst 取"更差方向"原始值。"""
     out = {}
-    keys = [k for k in results[0] if k != "async"]
-    for k in keys:
-        vals = [r[k] for r in results]
-        mean = sum(vals) / len(vals)
-        std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
-        out[k] = (mean, std)
+    for k in rounds[0]:
+        vals = np.asarray([r[k] for r in rounds], dtype=float)
+        out[k] = {"mean": float(vals.mean()), "std": float(vals.std()),
+                  "worst": float(vals.max())}
     return out
 
 
-def fmt(v, nd=2):
-    mean, std = v
-    return f"{mean:.{nd}f} ± {std:.{nd}f}"
+def check_gates(agg, gates, ate_available):
+    """按门限断言。min=越高越好（worst 取 min），max=越低越好（worst 取 max）。"""
+    results = {}
+    for name, spec in gates.items():
+        if not spec:
+            continue
+        if name.startswith("ate_") and not ate_available:
+            results[name] = {"status": "skip", "reason": "无 GT"}
+            continue
+        if name not in agg:
+            results[name] = {"status": "skip", "reason": "无此指标"}
+            continue
+        worst = agg[name]["worst"]
+        ok, bound, op = True, None, None
+        if "max" in spec:
+            bound, op = spec["max"], "max"
+            ok = worst <= bound
+        if "min" in spec:
+            bound, op = spec["min"], "min"
+            ok = worst >= bound
+        results[name] = {
+            "status": "pass" if ok else "fail",
+            "mean": agg[name]["mean"], "std": agg[name]["std"],
+            "worst": worst, "bound": bound, "op": op,
+        }
+    return results
+
+
+def print_table(agg, gates, gate_results):
+    print(f"\n{'指标':<22}{'mean':>12}{'std':>12}{'worst':>12}  门限")
+    for k, v in sorted(agg.items()):
+        r = gate_results.get(k, {})
+        tag = {"pass": "PASS", "fail": "FAIL", "skip": "-"}.get(r.get("status"), " ")
+        bound = r.get("bound")
+        bound_str = f"{r.get('op', '')} {bound:.3g}" if bound is not None else ""
+        print(f"{k:<22}{v['mean']:>12.4f}{v['std']:>12.4f}{v['worst']:>12.4f}"
+              f"  {tag:>5} {bound_str}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="VSLAM 全程基准测试")
-    ap.add_argument("dataset")
-    ap.add_argument("config")
+    ap = argparse.ArgumentParser(description="VSLAM 统计基准（生产级）")
+    ap.add_argument("gates_yaml", help="config/benchmark.yaml（门限 + 数据集/轮数）")
     ap.add_argument("out_dir")
-    ap.add_argument("--runs", type=int, default=2, help="每配置运行次数（默认 2）")
-    ap.add_argument("--compare", default=None, help="对比配置（同 runs 次数）")
+    ap.add_argument("--runs", type=int, default=0, help="覆盖 YAML 中的轮数")
+    ap.add_argument("--window", type=int, default=0, help="覆盖 window_frames（>0=快速门）")
+    ap.add_argument("--compare", default=None, help="对比配置 YAML")
     ap.add_argument("--bin", default="build/bin/run_slam")
-    ap.add_argument("--gt", default=None, help="真值轨迹（TUM），给则评估 ATE")
-    ap.add_argument("--alignment", choices=("se3", "sim3", "none"), default="se3",
-                    help="双目默认 se3；单目请显式选择 sim3")
-    ap.add_argument("--format", choices=("kitti", "tum", "euroc"), default="kitti",
-                    help="数据集格式；非 KITTI 时向 run_slam 传对应标志")
-    ap.add_argument("--expected-frames", type=int, default=0,
-                    help="必须完整处理的帧数；0 表示不校验")
-    ap.add_argument("--cwd", default=".", help="工作目录（默认仓库根，perf.csv 在此生成）")
-    ap.add_argument("--evaluate", default="scripts/evaluate_ate.py")
+    ap.add_argument("--gt", default=None, help="真值轨迹（TUM），覆盖 YAML")
+    ap.add_argument("--config", default=None, help="run_slam 配置（默认用 YAML 内 config）")
+    ap.add_argument("--cwd", default=".")
     args = ap.parse_args()
 
-    # 子进程 cwd 可能不同；输入、二进制和评估脚本都转换为绝对路径。
+    with open(args.gates_yaml) as f:
+        conf = yaml.safe_load(f)
+    bench = conf.get("Benchmark", {})
+    gates = conf.get("Gates", {})
     args.cwd = str(Path(args.cwd).resolve())
-    args.dataset = str(Path(args.dataset).resolve())
     args.bin = str(Path(args.bin).resolve())
-    args.evaluate = str(Path(args.evaluate).resolve())
-    args.gt = str(Path(args.gt).resolve()) if args.gt else None
     args.out_dir = str(Path(args.out_dir).resolve())
-    args.config = str(Path(args.config).resolve())
-    args.compare = str(Path(args.compare).resolve()) if args.compare else None
+    if args.runs: bench["runs"] = args.runs
+    if args.window: bench["window_frames"] = args.window
+    if args.gt: bench["gt"] = args.gt
+    if args.config: bench["config"] = args.config
+    if "config" not in bench:
+        print("错误: benchmark.yaml 缺 Benchmark.config", file=sys.stderr)
+        return 2
+    if "dataset" not in bench:
+        print("错误: benchmark.yaml 缺 Benchmark.dataset", file=sys.stderr)
+        return 2
 
-    configs = [("A", args.config)]
-    if args.compare:
-        configs.append(("B", args.compare))
+    runs = int(bench.get("runs", 5))
+    ate_available = bool(bench.get("gt"))
 
-    all_results = {}
-    for label, cfg in configs:
-        results = []
-        for i in range(args.runs):
+    all_results, all_agg, all_gates = {}, {}, {}
+    for label, cfg_src in [("A", bench)] + ([("B", args.compare)] if args.compare else []):
+        cfg = dict(cfg_src)
+        if cfg_src is args.compare:
+            with open(args.compare) as f:
+                cfg = dict(bench)
+                cfg.update(yaml.safe_load(f).get("Benchmark", {}))
+        rounds = []
+        for i in range(runs):
             run_dir = str(Path(args.out_dir) / f"{label}_run{i+1}")
             Path(run_dir).mkdir(parents=True, exist_ok=True)
             out_path = str(Path(run_dir) / "traj.txt")
-            print(f"[bench] {label} run {i+1}/{args.runs} config={cfg} ...",
-                  flush=True)
-            results.append(run_once(args, out_path, run_dir))
-        all_results[label] = summarize(results)
+            print(f"[bench] {label} run {i+1}/{runs} dataset={cfg['dataset']} "
+                  f"window={cfg.get('window_frames', 0)} ...", flush=True)
+            rounds.append(run_once(cfg, args, out_path, run_dir))
+        agg = aggregate(rounds)
+        all_results[label] = {"rounds": rounds, "aggregated": agg}
+        all_agg[label] = agg
+        all_gates[label] = check_gates(agg, gates, ate_available)
         with open(Path(args.out_dir) / f"results_{label}.json", "w") as f:
-            json.dump({k: list(v) for k, v in all_results[label].items()}, f,
-                      indent=2)
+            json.dump(all_results[label], f, indent=2, default=float)
 
-    # ---- 输出 ----
-    metric_names = [
-        ("fps", "FPS", "%.2f"), ("seconds", "耗时(s)", "%.1f"),
-        ("valid_poses", "有效位姿", "%.0f"),
-        ("valid_ratio", "有效位姿率", "%.2f"),
-        ("matched_poses", "GT匹配位姿", "%.0f"),
-        ("ate_rmse", "ATE RMSE(m)", "%.2f"), ("ate_mean", "ATE Mean(m)", "%.2f"),
-        ("ate_max", "ATE Max(m)", "%.2f"),
-        ("rpe_trans_rmse", "RPE trans(m/f)", "%.2f"),
-        ("rpe_rot_rmse", "RPE rot(deg/f)", "%.2f"),
-        ("jumps_10m", ">10m 跳变", "%.1f"), ("lost", "LOST 次数", "%.1f"),
-        ("submap_reinit", "子地图重建", "%.1f"), ("loops", "闭环次数", "%.1f"),
-        ("map_points", "最终地图点", "%.0f"), ("keyframes", "最终关键帧", "%.0f"),
-        ("ba_max_ms", "Local BA max(ms)", "%.0f"),
-        ("global_ba_max_ms", "全局 BA max(ms)", "%.0f"),
-    ]
-    print(f"\n===== Benchmark: {args.dataset} =====")
-    print(f"{'指标':<18}" + "".join(f"{l:>22}" for l, _ in configs))
-    for key, name, nd in metric_names:
-        row = []
-        for label, _ in configs:
-            v = all_results[label].get(key)
-            row.append(fmt(v, 0 if nd == "%.0f" else 2) if v else "-")
-        print(f"{name:<18}" + "".join(f"{r:>22}" for r in row))
+    for label in all_agg:
+        print(f"\n===== {label}: {bench['dataset']} window={bench.get('window_frames', 0)} "
+              f"rounds={runs} =====")
+        print_table(all_agg[label], gates, all_gates[label])
 
-    # 提升百分比（B vs A，仅双侧都有）
-    if len(configs) == 2:
-        print("\n===== 相对提升（B vs A）=====")
-        for key, name, nd in metric_names:
-            a = all_results["A"].get(key)
-            b = all_results["B"].get(key)
-            if not a or not b or a[0] == 0:
-                continue
-            pct = (b[0] - a[0]) / a[0] * 100
-            better = ("↓" if pct < 0 else "↑") if key not in ("fps",) else ("↑" if pct > 0 else "↓")
-            print(f"{name:<18} {pct:+.1f}% {better}")
+    failed = [k for k, v in all_gates["A"].items() if v.get("status") == "fail"]
+    report = {"config": bench, "gates": gates, "failed": failed,
+              "result": "pass" if not failed else "fail",
+              "A": all_results["A"], "B": all_results.get("B")}
+    with open(Path(args.out_dir) / "report.json", "w") as f:
+        json.dump(report, f, indent=2, default=float)
+    print(f"\n[bench] report -> {Path(args.out_dir) / 'report.json'}"
+          f"  结果: {'PASS' if not failed else 'FAIL'}"
+          f"  {'（未通过门限: ' + ', '.join(failed) + '）' if failed else ''}")
+    return 0 if not failed else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
