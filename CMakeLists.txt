@@ -122,13 +122,15 @@ set(VSLAM_SOURCES
     src/viewer.cpp
     src/loop_closure.cpp
     src/tracking_state_machine.cpp
-    src/localizer.cpp)
+    src/localizer.cpp
+    src/pose_gate.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
     include/vslam/localization_types.h
     include/vslam/tracking_state_machine.h
     include/vslam/localizer.h
+    include/vslam/pose_gate.h
     include/vslam/camera.h
     include/vslam/dataset.h
     include/vslam/frame.h
@@ -240,6 +242,14 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME test_localizer_contract COMMAND test_localizer_contract)
 
+    # M1.1 PoseGate（独立 CTest）
+    add_executable(test_pose_gate test/test_pose_gate.cpp)
+    target_link_libraries(test_pose_gate vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_pose_gate PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_pose_gate COMMAND test_pose_gate)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME test_trajectory_alignment
@@ -256,3 +266,4 @@ install(TARGETS vslam
 install(DIRECTORY include/ DESTINATION include)
 install(FILES config/default.yaml DESTINATION share/vslam)
 install(FILES config/robot.yaml DESTINATION share/vslam)
+install(FILES config/deterministic.yaml DESTINATION share/vslam)

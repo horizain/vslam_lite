@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
     bool use_localizer = false;  // M0.3 可选入口：用 Localizer Facade 包装同一 VO
     int max_frames = 0;  // 0 = 全程；>0 = 只处理前 N 帧（性能/回归测试用）
     int skip_frames = 0; // 跳过前 N 帧（性能分片测试用）
+    std::string status_csv_path;  // M1 确定性回归：逐帧状态/计数 CSV
     std::vector<std::string> positional;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -50,6 +51,7 @@ int main(int argc, char** argv) {
         else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
         else if (a == "--headless") headless = true;
         else if (a == "--localizer") use_localizer = true;
+        else if (a == "--status-csv" && i + 1 < argc) status_csv_path = argv[++i];
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--skip" && i + 1 < argc) skip_frames = std::atoi(argv[++i]);
         else if (a.starts_with("--")) {
@@ -186,6 +188,18 @@ int main(int argc, char** argv) {
     vslam::Viewer viewer;
     if (!headless) viewer.start();
 
+    // ---- M1 确定性回归：逐帧状态 CSV（frame/state/pose_valid/kf/map revision）----
+    std::ofstream status_ofs;
+    if (!status_csv_path.empty()) {
+        status_ofs.open(status_csv_path);
+        if (status_ofs.is_open()) {
+            status_ofs << "frame_id,timestamp,state,pose_valid,tracking_valid,"
+                          "map_points,keyframes,submap_id,topology_revision,geometry_revision\n";
+        } else {
+            LOG_WARN("Cannot open status CSV: " << status_csv_path);
+        }
+    }
+
     // ---- 主循环 ----
     cv::Mat image, image_right;
     double timestamp;
@@ -217,6 +231,16 @@ int main(int argc, char** argv) {
 
         auto st = vo.getStatus();
         if (st.pose_valid) valid_timestamps.push_back(timestamp);
+
+        if (status_ofs.is_open()) {
+            status_ofs << frame_count - 1 << "," << timestamp << ","
+                       << static_cast<int>(st.state) << ","
+                       << (st.pose_valid ? 1 : 0) << ","
+                       << (st.tracking_valid ? 1 : 0) << ","
+                       << st.map_points << "," << st.keyframes << "," << st.submap_id << ","
+                       << vo.getMap()->topologyRevision() << ","
+                       << vo.getMap()->geometryRevision() << "\n";
+        }
 
         std::string state_str;
         switch (st.state) {

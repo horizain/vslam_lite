@@ -19,6 +19,7 @@
 #include "vslam/dataset.h"
 #include "vslam/feature.h"
 #include "vslam/vo.h"
+#include "vslam/pose_gate.h"
 #include "vslam/atlas.h"
 #include "vslam/mappoint.h"
 #include "vslam/optimizer.h"
@@ -932,8 +933,7 @@ void test_rotation_ambiguity() {
 void test_pose_acceptance() {
     using vslam::SE3;
     using vslam::Vec3;
-    using PoseQuality = vslam::VisualOdometry::PoseQuality;
-    using vslam::VisualOdometry;
+    using PoseQuality = vslam::PoseQuality;
     constexpr int    kMinInliers = 15;
     constexpr double kMinRatio   = 0.3;
     constexpr double kMaxRmse    = 2.5;
@@ -944,14 +944,14 @@ void test_pose_acceptance() {
         PoseQuality q;
         // 相机前进 2m（T_cw.t = -2）
         const SE3 ok_pose(Eigen::Quaterniond::Identity(), Vec3(-2, 0, 0));
-        assert(VisualOdometry::acceptPoseCandidate(
+        assert(vslam::PoseGate::acceptPoseCandidate(
             ok_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
             baseline_twc, 3.0, 0.35, q));
         assert(q.geometric_ok && q.motion_ok);
         assert(std::abs(q.translation - 2.0) < 1e-9);
         // 相机前进 4m → 超 3m 门限
         const SE3 bad_pose(Eigen::Quaterniond::Identity(), Vec3(-4, 0, 0));
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             bad_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
             baseline_twc, 3.0, 0.35, q));
         assert(q.geometric_ok && !q.motion_ok);
@@ -963,12 +963,12 @@ void test_pose_acceptance() {
         PoseQuality q;
         const SE3 ok_pose(
             Eigen::Quaterniond(Eigen::AngleAxisd(0.2, Vec3::UnitZ())), Vec3::Zero());
-        assert(VisualOdometry::acceptPoseCandidate(
+        assert(vslam::PoseGate::acceptPoseCandidate(
             ok_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
             baseline_twc, 3.0, 0.35, q));
         const SE3 bad_pose(
             Eigen::Quaterniond(Eigen::AngleAxisd(0.5, Vec3::UnitZ())), Vec3::Zero());
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             bad_pose, 20, 40, 1.0, kMinInliers, kMinRatio, kMaxRmse,
             baseline_twc, 3.0, 0.35, q));
         assert(q.geometric_ok && !q.motion_ok);
@@ -981,7 +981,7 @@ void test_pose_acceptance() {
         const SE3 baseline_twc(Eigen::Quaterniond::Identity(), Vec3(10, 0, 0));
         PoseQuality q;
         const SE3 far_pose(Eigen::Quaterniond::Identity(), Vec3(-268, 0, 0));
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             far_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 50.0, kRelocRot, q));
         assert(q.geometric_ok && !q.motion_ok);
@@ -993,7 +993,7 @@ void test_pose_acceptance() {
         PoseQuality q;
         // 相机在 12m 处（距基线 2m）
         const SE3 near_pose(Eigen::Quaterniond::Identity(), Vec3(-12, 0, 0));
-        assert(VisualOdometry::acceptPoseCandidate(
+        assert(vslam::PoseGate::acceptPoseCandidate(
             near_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 50.0, kRelocRot, q));
         assert(q.geometric_ok && q.motion_ok);
@@ -1005,12 +1005,12 @@ void test_pose_acceptance() {
         PoseQuality q;
         // 相机在 130m（距基线 80m）→ 通过
         const SE3 ok_pose(Eigen::Quaterniond::Identity(), Vec3(-130, 0, 0));
-        assert(VisualOdometry::acceptPoseCandidate(
+        assert(vslam::PoseGate::acceptPoseCandidate(
             ok_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 150.0, kRelocRot, q));
         // 相机在 250m（距基线 200m）→ 拒绝
         const SE3 bad_pose(Eigen::Quaterniond::Identity(), Vec3(-250, 0, 0));
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             bad_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 150.0, kRelocRot, q));
     } TEST_PASS();
@@ -1021,13 +1021,13 @@ void test_pose_acceptance() {
         const SE3 ok_pose(
             Eigen::Quaterniond(Eigen::AngleAxisd(45.0 * M_PI / 180.0, Vec3::UnitY())),
             Vec3(0, 0, 0));
-        assert(VisualOdometry::acceptPoseCandidate(
+        assert(vslam::PoseGate::acceptPoseCandidate(
             ok_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 50.0, kRelocRot, q));
         const SE3 bad_pose(
             Eigen::Quaterniond(Eigen::AngleAxisd(90.0 * M_PI / 180.0, Vec3::UnitY())),
             Vec3(0, 0, 0));
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             bad_pose, 30, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 50.0, kRelocRot, q));
     } TEST_PASS();
@@ -1037,15 +1037,15 @@ void test_pose_acceptance() {
         PoseQuality q;
         // rmse 5.0 > 2.5：即使运动贴近基线也拒绝
         const SE3 near_pose(Eigen::Quaterniond::Identity(), Vec3(-12, 0, 0));
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             near_pose, 30, 40, 5.0, 20, 0.4, kMaxRmse,
             baseline_twc, 50.0, kRelocRot, q));
         // 内点 5 < 20
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             near_pose, 5, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 50.0, kRelocRot, q));
         // 比例 0.1 < 0.4
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             near_pose, 4, 40, 0.5, 20, 0.4, kMaxRmse,
             baseline_twc, 50.0, kRelocRot, q));
         assert(!q.geometric_ok);
@@ -1055,10 +1055,10 @@ void test_pose_acceptance() {
         const std::optional<SE3> no_baseline;
         PoseQuality q;
         const SE3 pose(Eigen::Quaterniond::Identity(), Vec3(-300, 0, 0));
-        assert(VisualOdometry::acceptPoseCandidate(
+        assert(vslam::PoseGate::acceptPoseCandidate(
             pose, 30, 40, 0.5, 20, 0.4, kMaxRmse, no_baseline, 0.0, 0.0, q));
         assert(q.geometric_ok && q.motion_ok);
-        assert(!VisualOdometry::acceptPoseCandidate(
+        assert(!vslam::PoseGate::acceptPoseCandidate(
             pose, 3, 40, 0.5, 20, 0.4, kMaxRmse, no_baseline, 0.0, 0.0, q));
     } TEST_PASS();
 }

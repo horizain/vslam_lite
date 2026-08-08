@@ -1,0 +1,99 @@
+# ============================================================
+# 确定性回归配置（M1 §5.6）
+# 与 config/default.yaml 的差异：
+#   - Runtime.opencv_threads: 1   OpenCV 单线程
+#   - Runtime.rng_seed: 0x5A17    固定全局 RNG（solvePnPRansac 内部 RNG 确定性）
+#   - Runtime.async_backend: false  异步后端关闭（前端确定性）
+#   - Feature.orb_max_bands: 1    单带串行 ORB 提取（特征提取确定性）
+# 用途：M1 每个子任务前后用同一构建跑 KITTI 00 前 1000 帧做确定性回归。
+# ============================================================
+
+# ---- 相机内参 ----
+Camera:
+  fx: 718.856
+  fy: 718.856
+  cx: 607.193
+  cy: 185.216
+  width: 1241
+  height: 376
+  k1: 0.0
+  k2: 0.0
+  p1: 0.0
+  p2: 0.0
+  k3: 0.0
+
+# ---- 特征参数 ----
+Feature:
+  num_features: 1000
+  scale_factor: 1.2
+  pyramid_levels: 8
+  orb_max_bands: 1           # 单带串行提取（确定性；默认配置为 4）
+  match_ratio: 0.7
+  ransac_threshold: 3.0
+
+# ---- 运行时资源参数 ----
+Runtime:
+  opencv_threads: 1          # 单线程（确定性；默认配置为物理核数）
+  async_backend: false       # 异步后端关闭（确定性；默认配置为 true）
+  rng_seed: 0x5A17           # 固定全局 RNG（确定性；默认配置为 0=不设置）
+
+# ---- VO 参数 ----
+VO:
+  method: 0
+  min_parallax: 0.0175
+  min_init_inliers: 20
+  min_matches_init: 100
+  min_matches_track: 20
+  pnp_min_inliers: 15
+  pnp_min_inlier_ratio: 0.3
+  pnp_max_rmse: 2.5
+  max_tracking_failures: 5
+  max_relocalize_frames: 20
+  max_frame_translation: 3.0
+  max_frame_rotation: 0.35
+  keyframe_translation: 0.5
+  keyframe_rotation: 0.2
+  keyframe_min_inliers: 15
+  min_keyframe_interval: 10
+  max_keyframe_interval: 15
+  keyframe_max_count: 1800
+
+# ---- 优化参数 ----
+Optimizer:
+  local_window_size: 10
+  local_ba_iterations: 10
+  enable_local_ba: true
+  global_ba_iterations: 0
+
+# ---- 回环检测 ----
+LoopClosure:
+  enable_loop_closure: true
+  vocab_path: "config/ORBvoc.dbow3"
+  min_score: 0.1
+  temporal_window: 30
+  detection_interval: 10
+  pnp_inlier_ratio: 0.85
+  min_loop_inliers: 50
+  loop_cooldown_kfs: 20
+  top_candidates: 20
+  position_prior_dist: 40.0
+  position_prior_gap: 100
+
+# ---- 可视化 ----
+Viewer:
+  enabled: true
+  camera_size: 0.1
+  point_size: 2
+  trajectory_color: [0.0, 0.8, 1.0]
+
+# ---- 双目参数 ----
+Stereo:
+  baseline: 0.54
+  min_depth: 0.5
+  max_depth: 35.0
+  min_points: 40
+  rigid_min_inliers: 15
+  rigid_min_inlier_ratio: 0.5
+  rigid_ransac_threshold: 0.25
+  rigid_max_rmse: 0.25
+  keyframe_translation: 0.9

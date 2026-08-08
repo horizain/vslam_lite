@@ -1,4 +1,5 @@
 #include "vslam/vo.h"
+#include "vslam/pose_gate.h"
 #include "vslam/optimizer.h"
 #include "perf_monitor.h"
 #include <opencv2/calib3d.hpp>
@@ -159,6 +160,7 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
         if (auto r = root["Runtime"]) {
             if (r["opencv_threads"]) cfg.opencv_threads = r["opencv_threads"].as<int>();
             if (r["async_backend"])  cfg.async_backend  = r["async_backend"].as<bool>();
+            if (r["rng_seed"])       cfg.rng_seed       = r["rng_seed"].as<int>();
         }
         if (auto v = root["VO"]) {
             if (v["method"])              cfg.feature_method       = v["method"].as<int>();
@@ -229,6 +231,8 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
         cv::setNumThreads(cfg_.opencv_threads);
         LOG_INFO("OpenCV threads limited to " << cv::getNumThreads());
     }
+    // M1 确定性：固定全局 RNG（solvePnPRansac 等内部 RNG），配 deterministic.yaml
+    if (cfg_.rng_seed != 0) cv::setRNGSeed((unsigned)cfg_.rng_seed);
     feature_matcher_.setParams(cfg_.num_features, cfg_.scale_factor,
                                cfg_.pyramid_levels, cfg_.orb_max_bands);
     if (cfg_.feature_method != 0) {
@@ -935,29 +939,14 @@ bool VisualOdometry::tryInitialize() {
 
 // ============================================================
 // 跟踪
+// M1.1：pnpReprojectionRmse / acceptPoseCandidate / checkMotionContinuity
+// 已迁移至 PoseGate（pose_gate.{h,cpp}），公式与默认值保持不变。
 // ============================================================
-double VisualOdometry::pnpReprojectionRmse(
-    const std::vector<cv::Point3f>& pts3d,
-    const std::vector<cv::Point2f>& pts2d,
-    const cv::Mat& rvec, const cv::Mat& tvec,
-    const std::vector<int>& inliers) const {
-    if (inliers.empty()) return std::numeric_limits<double>::infinity();
-    std::vector<cv::Point2f> projected;
-    cv::projectPoints(pts3d, rvec, tvec, camera_->K(), cv::Mat(), projected);
-    double squared_error = 0.0;
-    int count = 0;
-    for (int idx : inliers) {
-        if (idx < 0 || idx >= (int)projected.size() || idx >= (int)pts2d.size()) continue;
-        const cv::Point2f error = projected[idx] - pts2d[idx];
-        squared_error += error.dot(error);
-        count++;
-    }
-    return count > 0 ? std::sqrt(squared_error / count)
-                     : std::numeric_limits<double>::infinity();
-}
 
 // ============================================================
 // M0：统一位姿验收（正常跟踪与重定位共用同一条通路）
+// M1.1：几何质量与连续性逻辑已迁移至 PoseGate；本函数只负责
+// 从 VO 状态计算运动基线与门限，再转调 PoseGate::acceptPoseCandidate。
 // ============================================================
 /// M5：重定位运动基线（世界系 T_wc）——丢失期匀速外推（单步 2.5m 限幅、
 /// 总量 60m，与 createSubmap 同一规则）。const：只读成员，不写 snap_。
@@ -1021,46 +1010,9 @@ bool VisualOdometry::acceptPose(
         }
     }
     // M3：候选位姿与基线均为世界系（调用方已组合 T_ws）
-    return acceptPoseCandidate(candidate_pose_world, inliers, total, rmse,
-                               min_inliers, min_ratio, max_rmse,
-                               baseline, max_translation, max_rotation, quality);
-}
-
-bool VisualOdometry::acceptPoseCandidate(
-    const SE3& candidate_pose_cs, int inliers, size_t total, double rmse,
-    int min_inliers, double min_ratio, double max_rmse,
-    const std::optional<SE3>& baseline_twc,
-    double max_translation, double max_rotation, PoseQuality& quality) {
-    quality.inlier_ratio = total > 0
-        ? static_cast<double>(inliers) / static_cast<double>(total) : 0.0;
-    quality.pose_rmse = rmse;
-    quality.translation = 0.0;
-    quality.rotation = 0.0;
-    quality.geometric_ok = inliers >= min_inliers
-        && quality.inlier_ratio >= min_ratio && rmse <= max_rmse;
-    if (!quality.geometric_ok) {
-        quality.motion_ok = false;
-        return false;
-    }
-    if (!baseline_twc) {  // 无运动基线 → 几何验收即最终验收
-        quality.motion_ok = true;
-        return true;
-    }
-    quality.motion_ok = checkMotionContinuity(
-        candidate_pose_cs, *baseline_twc, max_translation, max_rotation,
-        quality.translation, quality.rotation);
-    return quality.motion_ok;
-}
-
-bool VisualOdometry::checkMotionContinuity(
-    const SE3& candidate_pose_cs, const SE3& baseline_twc,
-    double max_translation, double max_rotation,
-    double& translation, double& rotation) {
-    const SE3 Twc_cand = candidate_pose_cs.inverse();
-    translation = (Twc_cand.t - baseline_twc.t).norm();
-    const Eigen::Quaterniond q_rel = Twc_cand.q * baseline_twc.q.inverse();
-    rotation = 2.0 * std::acos(std::clamp(std::abs(q_rel.w()), 0.0, 1.0));
-    return translation <= max_translation && rotation <= max_rotation;
+    return PoseGate::acceptPoseCandidate(candidate_pose_world, inliers, total, rmse,
+                                         min_inliers, min_ratio, max_rmse,
+                                         baseline, max_translation, max_rotation, quality);
 }
 
 SE3 VisualOdometry::trackFrame() {
@@ -1101,7 +1053,7 @@ SE3 VisualOdometry::trackFrame() {
             cv::Mat R;
             cv::Rodrigues(rvec, R);
             const SE3 candidate_pose = matToSE3(R, tvec);
-            const double rmse = pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers);
+            const double rmse = PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K());
             // M0：统一位姿验收（几何 + 连续性；正常跟踪基线 = 上一有效位姿）
             PoseQuality quality;
             // M3：局部位姿组合 T_ws → 世界系再验收（基线 = 世界系）
@@ -1338,7 +1290,7 @@ SE3 VisualOdometry::trackFrameLK() {
             cv::Mat R;
             cv::Rodrigues(rvec, R);
             const SE3 candidate_pose = matToSE3(R, tvec);
-            const double rmse = pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers);
+            const double rmse = PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K());
             // M0：统一位姿验收（与 ORB 跟踪同一通路）
             PoseQuality quality;
             // M3：局部位姿组合 T_ws → 世界系再验收（基线 = 世界系）
@@ -1449,7 +1401,7 @@ bool VisualOdometry::tryRelocalize() {
                                      false, 200, cfg_.ransac_pixel_threshold, 0.99, inliers);
         const double ratio = pts3d.empty() ? 0.0 : (double)inliers.size() / pts3d.size();
         const double rmse = ok
-            ? pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers)
+            ? PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K())
             : std::numeric_limits<double>::infinity();
         const int reloc_min_inliers = std::max(20, cfg_.pnp_min_inliers);
         if (ok && (int)inliers.size() >= reloc_min_inliers

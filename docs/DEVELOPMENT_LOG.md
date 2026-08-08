@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0 完成：类型契约/状态机/Localizer Facade §3.25-3.27）
+> 最后更新: 2026-08-08（M0 完成 + M1.1 PoseGate §3.25-3.28）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1428,3 +1428,35 @@ FrontendTracker 时改为对输入深拷贝或让 CLAHE 写临时缓冲，避免
 的非确定性。
 
 下一任务：M1.1 PoseGate（从 `vo.cpp` 提取纯几何质量与运动连续性）。
+
+### 3.28 M1.1 PoseGate 拆分（Strangler Fig 第一步，2026-08-08）
+
+按 §5.1/§5.2 从 `VisualOdometry` 提取纯几何质量与运动连续性门，公式与默认值
+保持不变，确定性验收全部通过。
+
+- 新增 `include/vslam/pose_gate.h` + `src/pose_gate.cpp`：迁移
+  `pnpReprojectionRmse`（K 改为参数传入）、`acceptPoseCandidate`、
+  `checkMotionContinuity`；`PoseQuality` 提升为顶层 `vslam::PoseQuality`。
+  新增 §5.2 统一入口 `PoseGate::evaluate(PoseCandidate, MotionPrediction,
+  TrackingQuality, dt)`，只接收值对象，不访问 Map/Atlas/Viewer/全局状态/线程；
+  `dt` 为 M3 §7.4 时间归一化连续性保留。
+- `vo.{h,cpp}`：删除已迁移实现；`acceptPose` 保留 VO 侧运动基线计算后转调
+  `PoseGate::acceptPoseCandidate`；三个 `pnpReprojectionRmse` 调用点改传
+  `camera_->K()`。
+- M1 确定性基建：`VOConfig.rng_seed`（非 0 时构造 `cv::setRNGSeed`）；
+  `config/deterministic.yaml`（opencv_threads=1、orb_max_bands=1、
+  rng_seed=0x5A17、async_backend=false）；`run_slam --status-csv` 逐帧状态/计数
+  日志；`scripts/compare_trajectories.py`（含数值稳定四元数差角，避免 6 位小数
+  文件与 acos 病态引入伪差异）。
+- 新增独立 CTest `test/test_pose_gate.cpp`（11 项）；`test_vo.cpp` 位姿验收测试
+  改调 `vslam::PoseGate::acceptPoseCandidate`。
+
+**M1.6 确定性验收（KITTI 00 前 1000 帧，deterministic.yaml，重构前后同一构建）**：
+- 状态序列（frame_id/state/pose_valid/map_points/keyframes/topology/geometry
+  revision）逐行完全一致（`diff` 为空）。
+- 轨迹 sha256 完全一致：平移差最大 0.000e+00 m（<1e-6）、旋转差最大 5.5e-17 rad
+  （<1e-8）。
+- 耗时 161119ms → 160980ms（重构后略快，FPS 无退化；RSS 无明显变化，热路径无新增
+  分配）。
+
+下一任务：M1.2 Relocalizer（候选与几何验证，只返回结果）。

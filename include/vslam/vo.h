@@ -9,6 +9,7 @@
 #include "vslam/loop_closure.h"
 #include "vslam/optimizer.h"
 #include "vslam/backend_committer.h"
+#include "vslam/pose_gate.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -55,6 +56,8 @@ struct VOConfig {
     double ransac_pixel_threshold = 3.0;    // PnP RANSAC 重投影误差阈值(px)
     int    orb_max_bands          = 8;      // ORB 外层并行分带上限（1=单带）
     int    opencv_threads         = 0;      // OpenCV 线程数（0=保持库默认值）
+    int    rng_seed               = 0;      // M1 确定性：非 0 时构造调用 cv::setRNGSeed(rng_seed)
+                                            // （固定 solvePnPRansac 等内部 RNG，见 config/deterministic.yaml）
     int    min_matches_init       = 100;    // 初始化最小匹配数
     int    min_init_inliers       = 20;     // 初始化最小对极几何内点数
     double min_parallax           = 0.0175; // 单目初始化最小三角化角（弧度，约1°）
@@ -257,25 +260,8 @@ public:
     /// 等待异步后端队列排空并停止线程。批量评估必须先调用，再读取最终轨迹/统计。
     void finishPendingBackendWork();
 
-    /// M0：位姿验收结果（正常跟踪/重定位共用，供状态栏与日志）
-    struct PoseQuality {
-        double inlier_ratio = 0.0;
-        double pose_rmse    = 0.0;
-        double translation  = 0.0;   // 相对运动基线的平移 (m)
-        double rotation     = 0.0;   // 相对运动基线的旋转 (rad)
-        bool   geometric_ok = false; // 内点/比例/RMSE 达标
-        bool   motion_ok    = false; // 连续性达标（无运动基线时恒 true）
-    };
-
-    /// M0 位姿验收纯函数：几何（内点/比例/RMSE）+ 连续性（相对运动基线平移/旋转）。
-    /// baseline_twc 为空 → 跳过连续性（无运动模型场景，如初始化首帧/单目）。
-    /// 验收失败由调用方保证实时状态完全不变（不写位姿、不换子地图）。
-    [[nodiscard]] static bool acceptPoseCandidate(
-        const SE3& candidate_pose_cs, int inliers, size_t total, double rmse,
-        int min_inliers, double min_ratio, double max_rmse,
-        const std::optional<SE3>& baseline_twc,
-        double max_translation, double max_rotation,
-        PoseQuality& quality);
+    /// M1.1：位姿验收已迁移至 PoseGate（pose_gate.h）。保留 acceptPose 作
+    /// 为 VO 侧的决策入口（计算运动基线后转调 PoseGate::acceptPoseCandidate）。
 
 private:
     void updateStatus(int matches, int inliers, double parallax);
@@ -299,12 +285,7 @@ private:
     /// 成功时更新全部子地图 T_ws 并返回 true。调用方必须持有
     /// map_mutex_ 独占锁；本函数不获取该锁，也不允许锁内回调。
     bool solveAtlasConstraints();
-    /// 跟踪/重定位共用：计算候选位姿相对运动基线的平移/旋转（角度），
-    /// 并判定是否在 [max_translation, max_rotation] 门限内（validateMotion 的通用版）。
-    static bool checkMotionContinuity(const SE3& candidate_pose_cs,
-                                      const SE3& baseline_twc,
-                                      double max_translation, double max_rotation,
-                                      double& translation, double& rotation);
+    /// M1.1：跟踪/重定位共用的运动连续性已迁移至 PoseGate::checkMotionContinuity。
     /// 双目/RGB-D：为当前帧的每个特征点计算相机系 3D 观测 pts_c
     void computeStereoDepths();
     /// 双目/RGB-D：从当前帧 pts_c 直接创建地图点（单帧绝对尺度建点）
@@ -321,11 +302,6 @@ private:
     /// 双目/RGB-D：3D-3D 位姿估计（ref 世界系点 vs 当前帧 pts_c，绝对尺度、旋转鲁棒）。
     /// PnP 失败或旋转-平移歧义（假平移跳变）时使用；成功返回 true 并写入 pose_cs
     bool tryTrack3D3D(const std::vector<cv::DMatch>& matches);
-    /// 计算 PnP 内点的重投影 RMSE。
-    double pnpReprojectionRmse(const std::vector<cv::Point3f>& pts3d,
-                               const std::vector<cv::Point2f>& pts2d,
-                               const cv::Mat& rvec, const cv::Mat& tvec,
-                               const std::vector<int>& inliers) const;
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
     /// 子地图重建成功后与历史轨迹做 Umeyama 刚体对齐（双目），
