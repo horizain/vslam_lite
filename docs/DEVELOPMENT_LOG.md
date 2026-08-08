@@ -1,10 +1,11 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-07（Phase 0/1 收口与跨数据集完整基准 §3.22-3.23）
+> 最后更新: 2026-08-08（M0.1 定位契约类型落地 §3.25）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
+> 产品化实施以 `PRODUCTION_LOCALIZATION_PLAN.md` 为准（§3.25 起）。
 
 ---
 
@@ -1346,3 +1347,22 @@ ESKF，以及 CI/24 小时灰度发布。
 位姿不得伪装为有效定位；生产默认使用只读地图；控制器使用连续 `T_ob`，回环只更新
 `T_wo`，全局规划位姿按 `T_wb=T_wo*T_ob` 组合。该文档目前是实施规格，M0～M7 尚未
 落地，不能把规划参数当成当前代码已具备的能力或当前 benchmark 结果。
+
+### 3.25 M0.1 定位契约类型落地（2026-08-08）
+
+按 `PRODUCTION_LOCALIZATION_PLAN.md` 的 M0.1（类型契约）实施第一个产品化任务，
+只新增类型与契约谓词，不改任何 `VisualOdometry`/Map/Atlas 算法。
+
+- 新增 `include/vslam/localization_types.h`：`LocalizationMode`（§1.3）、
+  `TrackingState`（§4.2）、`FailureReason`（§4.1，11 种原因码）、`PoseEstimate`
+  （§4.1 字段与默认值全对齐），以及 §3 硬不变量的静态谓词：
+  `isUnitQuaternion`、`isFinite(SE3)`、`isValidTimestamp`、
+  `isPositiveDefiniteCovariance`（对称 + 正定 + 有限）、`isPublishable`。
+- `include/vslam/common.h` 仅补通用矩阵别名 `Vec6`/`Mat6`（6 自由度切空间/协方差）。
+- 新增独立 CTest `test/test_localization_types.cpp`（19 项契约测试），不并入
+  `test_vo.cpp`，满足"M0 契约测试至少 12 项"的起点。
+- `CMakeLists.txt` 注册 `test_localization_types` 独立 CTest。
+
+验证：`./build/test_localization_types` 19/19 PASSED；`ctest --test-dir build`
+3/3 通过（含旧 `test_vo` 5.28s 全过与 `test_trajectory_alignment`）。纯类型新增，
+无算法/轨迹/状态变化，M0.1 不涉及 KITTI 轨迹基准。下一任务：M0.2 状态机。

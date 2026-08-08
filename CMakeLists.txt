@@ -208,6 +208,15 @@ if(BUILD_TESTS)
         target_compile_options(test_vo PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_vo COMMAND test_vo)
+
+    # M0.1 定位契约类型（独立 CTest，不与 test_vo 混排）
+    add_executable(test_localization_types test/test_localization_types.cpp)
+    target_link_libraries(test_localization_types vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_localization_types PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_localization_types COMMAND test_localization_types)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME test_trajectory_alignment
