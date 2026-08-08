@@ -10,6 +10,7 @@
 #include "vslam/optimizer.h"
 #include "vslam/backend_committer.h"
 #include "vslam/pose_gate.h"
+#include "vslam/relocalizer.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -317,7 +318,6 @@ private:
     std::vector<Frame::Ptr> selectLocalWindow(int n) const;
     void triangulateNewPoints(const Frame::Ptr& f1, const Frame::Ptr& f2,
                               const std::vector<cv::DMatch>& matches);
-    static SE3 matToSE3(const cv::Mat& R, const cv::Mat& t);  // cv::Mat → SE3
 
     // ---- 异步后端（P2-1）----
     /// 后台线程主循环：取任务 → 快照（锁内）→ 锁外优化 → 写回（锁内）
@@ -382,6 +382,8 @@ private:
     Frame::Ptr prev_frame_;  // 上一帧（LK 光流模式用）
 
     FeatureMatcher feature_matcher_;
+    /// M1.2：重定位候选几何验证（tryRelocalize 转调；只返回结果，不提交）
+    Relocalizer relocalizer_;
 
     // 轨迹记录（M4）：锚定关键帧 + 局部运动，世界位姿读时组合。
     // 回环校正/子地图对齐只更新锚点，轨迹自动跟随，无需全量插值重写。

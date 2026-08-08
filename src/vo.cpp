@@ -225,7 +225,9 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
 }
 
 VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
-    : camera_(camera), cfg_(cfg), atlas_(std::make_shared<Atlas>()) {
+    : camera_(camera), cfg_(cfg), atlas_(std::make_shared<Atlas>()),
+      relocalizer_(camera, cfg.num_features, cfg.scale_factor,
+                   cfg.pyramid_levels, cfg.orb_max_bands) {
     map_ = atlas_->createSubmap(SE3()).map;
     if (cfg_.opencv_threads > 0) {
         cv::setNumThreads(cfg_.opencv_threads);
@@ -1052,7 +1054,7 @@ SE3 VisualOdometry::trackFrame() {
         if (ok) {
             cv::Mat R;
             cv::Rodrigues(rvec, R);
-            const SE3 candidate_pose = matToSE3(R, tvec);
+            const SE3 candidate_pose = Relocalizer::matToSE3(R, tvec);
             const double rmse = PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K());
             // M0：统一位姿验收（几何 + 连续性；正常跟踪基线 = 上一有效位姿）
             PoseQuality quality;
@@ -1103,7 +1105,7 @@ SE3 VisualOdometry::trackFrame() {
         cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_->K(), cv::RANSAC, 0.999, 1.0);
         cv::Mat R, t;
         cv::recoverPose(E, pts1, pts2, camera_->K(), R, t);
-        SE3 T_rel = matToSE3(R, t);
+        SE3 T_rel = Relocalizer::matToSE3(R, t);
         curr_frame_->pose_cs = T_rel * ref_pose_cs;
         inliers_cnt = (int)matches.size();
         // 对极恢复的 t 只有方向无尺度，组合后可能跳变 → 同样做跳变保护
@@ -1289,7 +1291,7 @@ SE3 VisualOdometry::trackFrameLK() {
         if (ok) {
             cv::Mat R;
             cv::Rodrigues(rvec, R);
-            const SE3 candidate_pose = matToSE3(R, tvec);
+            const SE3 candidate_pose = Relocalizer::matToSE3(R, tvec);
             const double rmse = PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K());
             // M0：统一位姿验收（与 ORB 跟踪同一通路）
             PoseQuality quality;
@@ -1354,92 +1356,58 @@ bool VisualOdometry::tryRelocalize() {
     if (curr_frame_->descriptors.empty())
         feature_matcher_.extract(curr_frame_);
 
-    int best_inliers = 0;
-    size_t best_total = 0;
-    SE3 best_pose;
-    Frame::Ptr best_kf;
-    Map::Ptr best_map;
-    uint64_t best_geometry_revision = 0;
-    unsigned long best_submap_id = 0;
-
-    // 对单个关键帧做 PnP 匹配，内点达标(20)即返回 true
-    double best_rmse = std::numeric_limits<double>::infinity();
-    auto try_kf = [&](unsigned long submap_id, const Frame::Ptr& kf) -> bool {
-        // 重定位不做 F 矩阵 RANSAC：外点由下方 solvePnPRansac 自己剔除
-        //（与 trackFrame 的注释一致；F 矩阵在重定位场景是纯冗余开销）
-        auto matches = feature_matcher_.match(kf, curr_frame_, cfg_.match_ratio, false);
-        // 重定位用较低门槛（min_matches_init=100 是初始化专用，RANSAC 后常达不到）
-        if ((int)matches.size() < 30) return false;
-
-        std::vector<cv::Point3f> pts3d;
-        std::vector<cv::Point2f> pts2d;
-        Map::Ptr candidate_map;
-        uint64_t candidate_geometry_revision = 0;
-        {
-            std::shared_lock<std::shared_mutex> lock(map_mutex_);  // P1：读路径共享锁
-            const auto* submap = atlas_->getSubmap(submap_id);
-            if (!submap || !submap->map ||
-                submap->map->getKeyFrame(kf->id).get() != kf.get()) {
-                return false;
-            }
-            candidate_map = submap->map;
-            candidate_geometry_revision = candidate_map->geometryRevision();
-            for (auto& m : matches) {
-                auto& mp = kf->map_points[m.queryIdx];
-                if (mp) {
-                    pts3d.emplace_back((float)mp->pos_s.x(), (float)mp->pos_s.y(), (float)mp->pos_s.z());
-                    pts2d.push_back(curr_frame_->keypoints[m.trainIdx].pt);
-                }
+    // M1.2：候选的粗筛 + ORB 匹配 + PnP 几何验证已迁移至 Relocalizer（§5.3）。
+    // 这里只负责构造查询（候选列表 + 锁内 3D-2D 对应供应）并转调；候选排序与
+    // "首个内点达标即返回"语义与原 try_kf 循环逐行等价。Relocalizer 只返回结果，
+    // 不切换 Atlas、不写 Map、不写轨迹——提交仍在下方独占锁事务中完成。
+    const int reloc_min_inliers = std::max(20, cfg_.pnp_min_inliers);
+    Relocalizer::Query query;
+    query.curr_frame = curr_frame_;
+    query.candidates = std::move(candidates);
+    query.min_inliers = reloc_min_inliers;
+    query.min_ratio = std::max(0.4, cfg_.pnp_min_inlier_ratio);
+    query.max_rmse = cfg_.pnp_max_rmse;
+    query.match_ratio = cfg_.match_ratio;
+    query.ransac_pixel_threshold = cfg_.ransac_pixel_threshold;
+    query.supply_points = [this](unsigned long submap_id, const Frame::Ptr& kf,
+                                 const std::vector<cv::DMatch>& matches,
+                                 RelocalizationPointSet& out) {
+        // P1：读路径共享锁。身份/版本检查与点收集与原 try_kf 逐行一致——
+        // 同一子地图内必须能按 kf->id 取回同一对象，防止后台 BA/回环在
+        // PnP 前替换参考 KF/点。
+        std::shared_lock<std::shared_mutex> lock(map_mutex_);
+        const auto* submap = atlas_->getSubmap(submap_id);
+        if (!submap || !submap->map ||
+            submap->map->getKeyFrame(kf->id).get() != kf.get()) {
+            return false;
+        }
+        out.map = submap->map;
+        out.geometry_revision = out.map->geometryRevision();
+        out.submap_id = submap_id;
+        for (auto& m : matches) {
+            auto& mp = kf->map_points[m.queryIdx];
+            if (mp) {
+                out.pts3d.emplace_back((float)mp->pos_s.x(), (float)mp->pos_s.y(), (float)mp->pos_s.z());
+                out.pts2d.push_back(curr_frame_->keypoints[m.trainIdx].pt);
             }
         }
-        if (pts3d.size() < 10) return false;
-
-        cv::Mat rvec, tvec;
-        std::vector<int> inliers;
-        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
-                                     cv::Mat(), rvec, tvec,
-                                     false, 200, cfg_.ransac_pixel_threshold, 0.99, inliers);
-        const double ratio = pts3d.empty() ? 0.0 : (double)inliers.size() / pts3d.size();
-        const double rmse = ok
-            ? PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K())
-            : std::numeric_limits<double>::infinity();
-        const int reloc_min_inliers = std::max(20, cfg_.pnp_min_inliers);
-        if (ok && (int)inliers.size() >= reloc_min_inliers
-            && ratio >= std::max(0.4, cfg_.pnp_min_inlier_ratio)
-            && rmse <= cfg_.pnp_max_rmse
-            && (int)inliers.size() > best_inliers) {
-            best_inliers = (int)inliers.size();
-            best_total = pts3d.size();
-            best_pose = matToSE3(cv::Mat(rvec), tvec);
-            best_kf = kf;
-            best_map = candidate_map;
-            best_geometry_revision = candidate_geometry_revision;
-            best_submap_id = submap_id;
-            best_rmse = rmse;
-        }
-        return best_inliers >= reloc_min_inliers;
+        return true;
     };
-
-    // 最近关键帧优先；如果当前子地图失效，继续尝试历史子地图。
-    // 粗筛先行：256 描述子子集 BF 匹配数不足的直接跳过（~0.5ms/候选），
-    // 只对相似候选做全量 BF + PnP。候选最多 60 个，全量匹配+PnP 每个
-    // ~10ms+，粗筛把 LOST 帧的单帧开销从秒级降到几十毫秒。
-    constexpr int kQuickMatchThreshold = 20;
-    int quick_checked = 0, quick_passed = 0;
-    for (const auto& [submap_id, kf] : candidates) {
-        quick_checked++;
-        if (feature_matcher_.quickMatchCount(kf->descriptors,
-                                             curr_frame_->descriptors,
-                                             256, 64.0) < kQuickMatchThreshold)
-            continue;
-        quick_passed++;
-        if (try_kf(submap_id, kf)) break;
-    }
-    if (quick_passed > 0)
-        LOG_INFO("Reloc prefilter: " << quick_passed << "/" << quick_checked
+    const RelocalizationResult reloc = relocalizer_.relocalize(query);
+    if (reloc.quick_passed > 0)
+        LOG_INFO("Reloc prefilter: " << reloc.quick_passed << "/" << reloc.quick_checked
                  << " candidates passed");
 
-    if (best_inliers >= 20) {
+    if (reloc.accepted) {
+        const int best_inliers = reloc.inliers;
+        const size_t best_total = reloc.total;
+        const SE3 best_pose = reloc.T_cs;
+        const Frame::Ptr best_kf = reloc.kf;
+        const Map::Ptr best_map = reloc.map;
+        const uint64_t best_geometry_revision = reloc.geometry_revision;
+        const unsigned long best_submap_id = reloc.submap_id;
+        const double best_rmse = reloc.rmse;
+
         // M0：重定位与正常跟踪共用同一验收通路（几何 + 连续性）。
         // §3.19 根因：正常 PnP 已按 3m/0.35rad 门限拒绝 258.8m 等坏解，随后
         // tryRelocalize 只查内点/RMSE 又把相同解接受为重定位 → 单帧大跳变。
@@ -2460,17 +2428,8 @@ std::vector<Frame::Ptr> VisualOdometry::selectLocalWindow(int n) const {
 // ============================================================
 // 辅助
 // ============================================================
-SE3 VisualOdometry::matToSE3(const cv::Mat& R, const cv::Mat& t) {
-    cv::Mat rmat = R;
-    if (R.rows == 3 && R.cols == 1)  // rvec input
-        cv::Rodrigues(R, rmat);
-    Eigen::Matrix3d Re;
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-            Re(i, j) = rmat.at<double>(i, j);
-    return SE3(Eigen::Quaterniond(Re),
-               Vec3(t.at<double>(0), t.at<double>(1), t.at<double>(2)));
-}
+// M1.2：matToSE3（cv::Mat → SE3）已迁移至 Relocalizer::matToSE3，
+// 公式与默认值保持不变。
 
 void VisualOdometry::triangulateNewPoints(
     const Frame::Ptr& f1, const Frame::Ptr& f2,

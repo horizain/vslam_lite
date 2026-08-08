@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0 完成 + M1.1 PoseGate + 基准方案与当前版本评估 §3.25-3.30）
+> 最后更新: 2026-08-08（M0 完成 + M1.1 PoseGate + M1.2 Relocalizer + 基准方案 §3.25-3.31）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1489,7 +1489,35 @@ FrontendTracker 时改为对输入深拷贝或让 CLAHE 写临时缓冲，避免
 L2 门限全过，500 帧×3 轮 latency_p99≈25ms、valid_ratio=1.0）。旧 `benchmark.py`
 接口保留 A/B 对比能力；`test_trajectory_alignment` 不受影响。
 
-下一任务：M1.2 Relocalizer。
+### 3.31 M1.2 Relocalizer 拆分（2026-08-08）
+
+按 §5.3 从 `VisualOdometry::tryRelocalize` 提取候选几何验证到独立 `Relocalizer`
+（`relocalizer.{h,cpp}`，行为保持不变）：
+
+- **新增 API**（§5.3 值对象风格）：`RelocalizationResult{accepted, submap_id,
+  geometry_revision, map, kf, T_cs, inliers, total, rmse, quick_*}` 与
+  `RelocalizationPointSet`。`Relocalizer::relocalize(Query)` 负责候选粗筛
+  （quickMatchCount）→ 全量 ORB 匹配 → `solvePnPRansac` + 内点 RMSE（转调
+  `PoseGate::pnpReprojectionRmse`）→ 内点最多候选 / 首个达标即返回。
+- **职责边界**：Relocalizer 只返回结果，不切换 Atlas、不写 Map/轨迹、不持锁；
+  3D-2D 对应由调用方在 `map_mutex_` 读锁内供应（身份 + geometry revision 绑定），
+  提交仍由 VO 在独占锁事务中完成（stale 检查 → 跨子地图 Atlas 约束 → acceptPose
+  → activate + 快照）。
+- `matToSE3` 迁移为 `Relocalizer::matToSE3`，vo.cpp 其余 3 处转调。
+- 测试 `test_relocalizer.cpp`（9 项）：matToSE3、identity 位姿恢复、verifyCandidate、
+  空候选 / stale / 弱几何 / 不相关描述子 / 门槛拒绝路径。
+
+**验收**：
+- CTest 7/7 全过（新增 test_relocalizer 注册为独立 CTest）。
+- §5.6 确定性：KITTI 00 前 1000 帧（deterministic.yaml）轨迹逐位一致
+  （max_translation_diff=0 m、max_rotation_diff=5.5e-17 rad），状态序列 1000 行一致。
+- §3.30 完整基准复测（default.yaml × 5 轮 + GT）：ATE RMSE mean 41.6m（§3.30 46.8m）、
+  FPS 43.1（+4%）、latency p99 50.0ms、valid_ratio 0.9915——无退化；仍在门限的
+  ate_rmse/std、jumps_10m、submap_reinit 与 §3.30 一致，属 M3/M5 收敛目标。
+  注：default.yaml 不固定 RNG/异步开启，轮间关键帧数（112~132 正常；个别轮次
+  因无子地图重建可达 ~1000）属运行间 RNG 方差，非拆分引入。
+
+下一任务：M1.3 BackendScheduler。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 

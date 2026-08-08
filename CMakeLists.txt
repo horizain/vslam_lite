@@ -123,7 +123,8 @@ set(VSLAM_SOURCES
     src/loop_closure.cpp
     src/tracking_state_machine.cpp
     src/localizer.cpp
-    src/pose_gate.cpp)
+    src/pose_gate.cpp
+    src/relocalizer.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
@@ -131,6 +132,7 @@ set(VSLAM_HEADERS
     include/vslam/tracking_state_machine.h
     include/vslam/localizer.h
     include/vslam/pose_gate.h
+    include/vslam/relocalizer.h
     include/vslam/camera.h
     include/vslam/dataset.h
     include/vslam/frame.h
@@ -249,6 +251,14 @@ if(BUILD_TESTS)
         target_compile_options(test_pose_gate PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_pose_gate COMMAND test_pose_gate)
+
+    # M1.2 Relocalizer（独立 CTest）
+    add_executable(test_relocalizer test/test_relocalizer.cpp)
+    target_link_libraries(test_relocalizer vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_relocalizer PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_relocalizer COMMAND test_relocalizer)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
