@@ -120,10 +120,13 @@ set(VSLAM_SOURCES
     src/vo.cpp
     src/optimizer.cpp
     src/viewer.cpp
-    src/loop_closure.cpp)
+    src/loop_closure.cpp
+    src/tracking_state_machine.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
+    include/vslam/localization_types.h
+    include/vslam/tracking_state_machine.h
     include/vslam/camera.h
     include/vslam/dataset.h
     include/vslam/frame.h
@@ -216,6 +219,14 @@ if(BUILD_TESTS)
         target_compile_options(test_localization_types PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_localization_types COMMAND test_localization_types)
+
+    # M0.2 定位状态机（独立 CTest）
+    add_executable(test_tracking_state_machine test/test_tracking_state_machine.cpp)
+    target_link_libraries(test_tracking_state_machine vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_tracking_state_machine PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_tracking_state_machine COMMAND test_tracking_state_machine)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

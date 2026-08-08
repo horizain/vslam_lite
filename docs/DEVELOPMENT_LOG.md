@@ -1366,3 +1366,25 @@ ESKF，以及 CI/24 小时灰度发布。
 验证：`./build/test_localization_types` 19/19 PASSED；`ctest --test-dir build`
 3/3 通过（含旧 `test_vo` 5.28s 全过与 `test_trajectory_alignment`）。纯类型新增，
 无算法/轨迹/状态变化，M0.1 不涉及 KITTI 轨迹基准。下一任务：M0.2 状态机。
+
+### 3.26 M0.2 定位状态机落地（2026-08-08）
+
+在 M0.1 类型契约基础上实现 `TrackingStateMachine`（§4.2 确定性有限状态机），
+不修改 `VisualOdometry`。
+
+- 新增 `include/vslam/tracking_state_machine.h` + `src/tracking_state_machine.cpp`：
+  状态转换表按 §4.2 逐条落地（Initializing→Tracking 连续 3 帧完整验收；
+  Tracking⇄Degraded 连续 2 帧弱质量 / 连续 3 帧完整恢复；
+  Tracking/Degraded→Relocalizing 连续 5 帧失败；Relocalizing→Lost 20 帧或 2.0 s；
+  Lost/Relocalizing 经有效全局重定位→Tracking；任意状态 stop()→Stopped）。
+- 输出语义（§4.2/§3-2）：Full/Weak 帧 `pose_valid=true`（Weak 帧由调用方把协方差
+  ×4）；Failed 帧在 `prediction_timeout_s=0.5` 内只发布预测
+  （`prediction_only=true`），超过后 `pose_valid=false`；Initializing/Relocalizing/
+  Lost 不发布有效位姿。
+- 新增独立 CTest `test/test_tracking_state_machine.cpp`（24 项，含重复 stop、
+  stop 后输入、自定义 Params）。
+- `CMakeLists.txt` 注册模块源/头与 `test_tracking_state_machine` CTest。
+
+验证：`./build/test_tracking_state_machine` 24/24 PASSED；`ctest --test-dir build`
+4/4 通过（含旧 `test_vo` 5.36s 全过）。纯状态机新增，无算法/轨迹/状态变化。
+下一任务：M0.3 Facade（Localizer 包装 run_slam 输出一致性验收）。
