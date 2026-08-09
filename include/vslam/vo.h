@@ -9,6 +9,7 @@
 #include "vslam/loop_closure.h"
 #include "vslam/optimizer.h"
 #include "vslam/backend_committer.h"
+#include "vslam/backend_scheduler.h"
 #include "vslam/pose_gate.h"
 #include "vslam/relocalizer.h"
 #include <atomic>
@@ -22,17 +23,6 @@
 #include <unordered_set>
 
 namespace vslam {
-
-/// 异步后端任务（P2-1）：Local BA / 回环检测+校正，由后台线程执行。
-struct BackendTask {
-    enum class Type { LocalBA, LoopClosure };
-    Type type = Type::LocalBA;
-    Map::Ptr map;                       // 入队时所属 Map；revision 不能替代实例身份
-    unsigned long submap_id = 0;       // 入队时所属 Submap
-    std::vector<Frame::Ptr> window;   // LocalBA：窗口关键帧（快照在后台锁内构造）
-    KeyframeId anchor_kf_id = 0;      // LocalBA：提交时的当前/锚定 KF 身份
-    Frame::Ptr curr_kf;               // LoopClosure：当前关键帧
-};
 
 /// 回环事务的身份边界；候选发现后只携带 Map/submap/KF 身份进入事务。
 /// 最终验证必须在事务独占 map 锁内重新执行，revision 仅用于记录候选发现时的
@@ -320,12 +310,11 @@ private:
                               const std::vector<cv::DMatch>& matches);
 
     // ---- 异步后端（P2-1）----
-    /// 后台线程主循环：取任务 → 快照（锁内）→ 锁外优化 → 写回（锁内）
-    void backendLoop();
-    /// 提交任务到有界队列（满则丢弃最旧的低频任务，防止任务无限堆积）
+    /// M1.3：后台任务生命周期与优先级已迁移至 BackendScheduler（backend_scheduler.h，
+    /// §5.4）。本函数是调度器 worker 的任务分发入口（LocalBA / LoopClosure）。
+    void runBackendTask(BackendTask& task);
+    /// 提交任务到后台调度器（覆盖式单任务槽，永不阻塞）
     void submitBackendTask(BackendTask task);
-    void startBackend();
-    void stopBackend();
 
     // ---- M1：Optimizer 只读快照 / Result / 提交 ----
     /// 构建 Local BA 只读快照（调用方需持 map_mutex_ 读锁；窗口内已被
@@ -403,12 +392,9 @@ private:
     // 写者饥饿由前端周期性独占锁（insertKeyFrame）天然消解。
     mutable std::shared_mutex map_mutex_;  // 保护地图集合/KF 位姿/点坐标/edges 的读写
     mutable std::mutex traj_mutex_;  // 保护 pose_records_（getter 为 const）
-    std::mutex backend_mutex_;   // 保护任务队列（锁顺序：backend → map/traj，无嵌套持锁）
-    std::condition_variable backend_cv_;
-    std::deque<BackendTask> backend_tasks_;
-    std::thread backend_thread_;
-    std::atomic<bool> backend_stop_{false};
-    std::atomic<bool> backend_running_{false};
+    /// M1.3：单后台线程 + 覆盖式单任务槽（§5.4）。锁序：scheduler 的槽锁绝不
+    /// 与 map/traj 嵌套持锁（worker 在槽锁外执行任务分发）。
+    BackendScheduler backend_scheduler_;
 
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）

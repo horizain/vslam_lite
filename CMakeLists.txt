@@ -115,6 +115,7 @@ set(VSLAM_SOURCES
     src/mappoint.cpp
     src/map.cpp
     src/backend_committer.cpp
+    src/backend_scheduler.cpp
     src/atlas.cpp
     src/feature.cpp
     src/vo.cpp
@@ -133,6 +134,7 @@ set(VSLAM_HEADERS
     include/vslam/localizer.h
     include/vslam/pose_gate.h
     include/vslam/relocalizer.h
+    include/vslam/backend_scheduler.h
     include/vslam/camera.h
     include/vslam/dataset.h
     include/vslam/frame.h
@@ -259,6 +261,14 @@ if(BUILD_TESTS)
         target_compile_options(test_relocalizer PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_relocalizer COMMAND test_relocalizer)
+
+    # M1.3 BackendScheduler（独立 CTest）
+    add_executable(test_backend_scheduler test/test_backend_scheduler.cpp)
+    target_link_libraries(test_backend_scheduler vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_backend_scheduler PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_backend_scheduler COMMAND test_backend_scheduler)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

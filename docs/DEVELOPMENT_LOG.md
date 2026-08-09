@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0 完成 + M1.1 PoseGate + M1.2 Relocalizer + 基准方案 §3.25-3.31）
+> 最后更新: 2026-08-08（M0 完成 + M1.1~M1.3 + 基准方案 §3.25-3.32）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1517,7 +1517,32 @@ L2 门限全过，500 帧×3 轮 latency_p99≈25ms、valid_ratio=1.0）。旧 `
   注：default.yaml 不固定 RNG/异步开启，轮间关键帧数（112~132 正常；个别轮次
   因无子地图重建可达 ~1000）属运行间 RNG 方差，非拆分引入。
 
-下一任务：M1.3 BackendScheduler。
+### 3.32 M1.3 BackendScheduler 拆分（2026-08-08）
+
+按 §5.4 把后台调度从 vo.cpp 提取到独立 `BackendScheduler`（`backend_scheduler.{h,cpp}`）：
+
+- `BackendTask` 迁至 `backend_scheduler.h`；**单后台线程 + 覆盖式单任务槽（容量 1）**。
+- 排队语义（§5.4 明确、用户确认，与旧 `kMaxQueued=4 + LocalBA 队首` 不同）：
+  - LoopClosure 覆盖任何等待任务（回环优先于局部 BA）；
+  - 同类 Local BA 新任务覆盖旧 Local BA（等待槽恒为最新）；
+  - 等待槽被 LoopClosure 占住时新 Local BA 直接丢弃（槽满不阻塞）；
+  - 正在执行的任务不强制取消，结果由 `BackendCommitter` stale gate 丢弃；
+  - `stop()` = 置标志 → notify → join（排空槽内任务后退出，不 detach）。
+- VO 侧仅保留任务分发 `runBackendTask`（LocalBA/LoopClosure）与兼容转发
+  `submitBackendTask`；`finishPendingBackendWork` 改调 `backend_scheduler_.stop()`。
+- 测试 `test_backend_scheduler.cpp`（7 项）：基础执行、同类覆盖、LoopClosure 优先、
+  LocalBA 不覆盖等待 LoopClosure、stop 排空 join、未 start/重复 stop、析构自动 join。
+
+**验收**：
+- CTest 8/8 全过（新增 test_backend_scheduler 独立 CTest）。
+- §5.6 确定性：KITTI 00 前 1000 帧轨迹逐位一致（max_translation_diff=0 m、
+  max_rotation_diff=5.5e-17 rad）、状态序列 1000 行一致。
+- 完整基准复测（default.yaml × 5 轮 + GT）：ATE RMSE mean 43.5m、FPS 43.0、
+  latency p99 55.5ms、valid_ratio 0.9891、keyframes 116.4——与 §3.30/M1.2 同噪声带，
+  优先级变更（LoopClosure 优先）未引入退化；仍在门限的 ate_rmse/std、jumps_10m、
+  submap_reinit 与 §3.30 一致，属 M3/M5 收敛目标。
+
+下一任务：M1.4 FrontendTracker。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 

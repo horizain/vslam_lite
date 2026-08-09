@@ -227,7 +227,8 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
 VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
     : camera_(camera), cfg_(cfg), atlas_(std::make_shared<Atlas>()),
       relocalizer_(camera, cfg.num_features, cfg.scale_factor,
-                   cfg.pyramid_levels, cfg.orb_max_bands) {
+                   cfg.pyramid_levels, cfg.orb_max_bands),
+      backend_scheduler_([this](BackendTask& task) { runBackendTask(task); }) {
     map_ = atlas_->createSubmap(SE3()).map;
     if (cfg_.opencv_threads > 0) {
         cv::setNumThreads(cfg_.opencv_threads);
@@ -244,13 +245,13 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
     if (cfg_.enable_loop_closure && !cfg_.vocab_path.empty())
         enableLoopClosure(cfg_.vocab_path);
     if (cfg_.async_backend) {
-        startBackend();
+        backend_scheduler_.start();
         LOG_INFO("Async backend ENABLED (BA/loop on background thread)");
     }
 }
 
 VisualOdometry::~VisualOdometry() {
-    if (cfg_.async_backend) stopBackend();
+    if (cfg_.async_backend) backend_scheduler_.stop();
 }
 
 bool VisualOdometry::enableLoopClosure(const std::string& vocab_path) {
@@ -2245,68 +2246,26 @@ CommitStatus VisualOdometry::applyLocalBAResult(
     }
 }
 
-void VisualOdometry::startBackend() {
-    if (backend_running_.exchange(true)) return;
-    backend_thread_ = std::thread(&VisualOdometry::backendLoop, this);
-}
-
-void VisualOdometry::stopBackend() {
-    {
-        std::lock_guard<std::mutex> lock(backend_mutex_);
-        backend_stop_ = true;
-    }
-    backend_cv_.notify_all();
-    if (backend_thread_.joinable()) backend_thread_.join();
-    backend_running_ = false;
-}
-
 void VisualOdometry::finishPendingBackendWork() {
-    if (backend_running_.load()) stopBackend();
+    // M1.3：排空槽内任务并 join（stop 语义：设置标志 → notify → join，不 detach）
+    if (backend_scheduler_.running()) backend_scheduler_.stop();
 }
 
 void VisualOdometry::submitBackendTask(BackendTask task) {
-    // 覆盖式有界队列（P1）：Local BA 的窗口是"最近 N 个关键帧"，新任务包含
-    // 旧任务的全部关键帧 → 旧 LocalBA 必然被超车，直接丢弃（滞后有界 ≤1 窗口，
-    // 前端 PnP 恒用最新窗口数据，解决 §3.15 的数据陈旧/滞后无界问题）。
-    // 回环任务低频且可被后到的检测覆盖，超限时丢最旧，杜绝"队列满→调用方同步
-    // 执行→前端阻塞"的旧路径。
-    constexpr size_t kMaxQueued = 4;
-    {
-        std::lock_guard<std::mutex> lock(backend_mutex_);
-        if (task.type == BackendTask::Type::LocalBA) {
-            auto it = std::remove_if(backend_tasks_.begin(), backend_tasks_.end(),
-                [](const BackendTask& t) {
-                    return t.type == BackendTask::Type::LocalBA;
-                });
-            backend_tasks_.erase(it, backend_tasks_.end());
-            // 队首优先：局部 BA 是保新鲜的最高优先级，先于回环长任务执行
-            backend_tasks_.push_front(std::move(task));
-        } else {
-            backend_tasks_.push_back(std::move(task));
-        }
-        while (backend_tasks_.size() > kMaxQueued)
-            backend_tasks_.pop_back();
-    }
-    backend_cv_.notify_one();
+    // M1.3：提交到覆盖式单任务槽（§5.4）。覆盖语义（LoopClosure 优先 / 同类
+    // Local BA 覆盖 / 等待槽容量 1）与内存边界由 BackendScheduler 负责；
+    // 本函数是 VO 侧兼容 Facade 的转发入口，永不阻塞。
+    backend_scheduler_.submit(std::move(task));
 }
 
-void VisualOdometry::backendLoop() {
-    while (true) {
-        BackendTask task;
-        {
-            std::unique_lock<std::mutex> lock(backend_mutex_);
-            backend_cv_.wait(lock, [&] {
-                return backend_stop_.load() || !backend_tasks_.empty();
-            });
-            if (backend_stop_.load() && backend_tasks_.empty()) break;
-            task = std::move(backend_tasks_.front());
-            backend_tasks_.pop_front();
-        }
-        if (task.type == BackendTask::Type::LocalBA)
-            runBackendLocalBA(task);
-        else
-            runBackendLoopClosure(task.curr_kf);
-    }
+void VisualOdometry::runBackendTask(BackendTask& task) {
+    // M1.3：调度器 worker 的任务分发（原 backendLoop 的任务执行部分）。
+    // 锁序：本函数在调度器槽锁之外执行；任务内部再按需获取 map/traj 锁，
+    // 不嵌套持锁（backend → map/traj 的旧顺序不再需要）。
+    if (task.type == BackendTask::Type::LocalBA)
+        runBackendLocalBA(task);
+    else
+        runBackendLoopClosure(task.curr_kf);
 }
 
 void VisualOdometry::runBackendLocalBA(const BackendTask& task) {
