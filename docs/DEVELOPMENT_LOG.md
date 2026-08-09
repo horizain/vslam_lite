@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0 完成 + M1.1~M1.4 + 基准方案 §3.25-3.33）
+> 最后更新: 2026-08-08（M0 + M1 完成 + M2.1 输入队列 §3.25-3.35）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1573,7 +1573,69 @@ L2 门限全过，500 帧×3 轮 latency_p99≈25ms、valid_ratio=1.0）。旧 `
   FPS 43.3、latency p99 54.5ms、valid_ratio 0.9899——无退化且精度略好；
   仍在门限的 ate_rmse/std、jumps_10m、submap_reinit 与 §3.30 一致，属 M3/M5 目标。
 
-下一任务：M1.5 LocalMapper。
+### 3.34 M1.5 LocalMapper 拆分（2026-08-08）
+
+按 §5.1/§5.5 把局部建图计算从 vo.cpp 提取到独立 `LocalMapper`
+（`local_mapper.{h,cpp}`，行为保持不变），M1 拆分至此全部完成：
+
+- **迁移的算法**（公式/Map API 调用/顺序逐行不变）：
+  - `createMapPointsFromStereo` → 双目单帧建点 + 正式观测绑定；
+  - `triangulateNewPoints` → 两帧三角化建点 + 全有全无观测；
+  - `selectLocalWindow` → 共视窗口 / 兜底最近 n 帧；
+  - `buildLocalBASnapshot` → min_observed 门槛 + anchor 连通分量裁剪。
+- `includeLocalBALandmark` 迁至 local_mapper.h（vo.h 移除声明，test_vo 引用不变）。
+- **职责边界**（§5.5）：LocalMapper 只通过 Map API 操作传入的 Map/Frame，
+  不持有 VO 状态、不切换子地图、不执行优化求解、不创建线程；调用方按旧
+  约定持 map_mutex_ 相应锁。insertKeyFrame 编排（快照几何检查/对齐/回环/
+  调度）仍留在 VO 作为兼容 Facade。
+- 测试 `test_local_mapper.cpp`（5 项）：观测门槛、双目单帧建点、两帧三角化、
+  共视窗口兜底、BA 快照过滤与裁剪。
+
+**验收**：
+- CTest 10/10 全过（新增 test_local_mapper 独立 CTest）。
+- §5.6 确定性：KITTI 00 前 1000 帧轨迹逐位一致（max_translation_diff=0 m、
+  max_rotation_diff=5.5e-17 rad）、状态序列 1000 行一致。
+- 完整基准复测（default.yaml × 5 轮 + GT）：ATE RMSE mean 46.0m、FPS 42.7、
+  latency p99 52.8ms、valid_ratio 0.9899——与 §3.30 同噪声带，无退化；
+  仍在门限的 ate_rmse/std、jumps_10m、submap_reinit 与 §3.30 一致，属 M3/M5 目标。
+
+M1 里程碑总结：vo.cpp 从 2600 行拆出 5 个独立模块（PoseGate/Relocalizer/
+BackendScheduler/FrontendTracker/LocalMapper），共 38 项独立 CTest；唯一行为
+变更是 M1.3 按 §5.4 的 LoopClosure 优先调度语义（用户确认）。确定性验收全程
+逐位一致，完整基准各轮均在 RNG 噪声带内无退化。
+
+### 3.35 M2.1 输入队列 + 异步 Localizer（2026-08-08）
+
+按 §6.1/§6.2 落地输入路径的有界队列与异步调度：
+
+- **`bounded_queue.h`**（header-only 模板）：固定容量 ring buffer；`push` 永不
+  阻塞（满丢最旧、保最新），消费者阻塞在 condition_variable（空闲不自旋）；
+  `stop()` 唤醒并排空剩余元素（与 BackendScheduler 语义一致）；记录
+  high water mark 与 dropped 计数（§6.4 指标）。
+- **`sensor_packet.h`**：`SensorPacket{sequence, timestamp, right_timestamp,
+  left, right}`，图像浅拷贝——提交后调用方不得复用/修改缓冲直至消费（文档化）。
+- **Localizer 异步模式**（§6.1：传感器回调只校验并入队，不运行 ORB/PnP）：
+  - `LocalizerConfig.enable_async_input / input_queue_capacity`（robot.yaml
+    `Robot.Runtime` 段，§6.2 首版参数一并写入文档）；
+  - `submitFrame()`：§4.3 校验（提交侧时间戳基线，与 worker 处理进度解耦）+
+    入队，返回 bool，永不阻塞；
+  - 跟踪 worker：阻塞消费 FIFO，结果经 `latestPose()` 轮询；worker 线程按
+    `vo_cfg_.rng_seed` 单独播种 OpenCV RNG（M1 确定性规则，线程局部 RNG）；
+  - `state()/latestPose()` 与 worker 通过 `result_mutex_` 并发安全；
+  - `stop()`：停队列 → join worker → 排空 VO 后台 → 停状态机（§6.2
+    shutdown_timeout_ms=2000 内，幂等）。
+- 测试 `test_bounded_queue.cpp`（11 项）：FIFO/丢最旧/hwm/dropped/tryPop/
+  pop 唤醒/stop 唤醒/stop 排空拒绝 + 异步 Localizer 集成（8 帧快速提交容量 3
+  队列 → 丢最旧保最新：最新帧 ts=0.7 存活、hwm<=3、dropped>=3、进入 Tracking、
+  提交侧校验、stop 后拒绝、同步模式 submitFrame 拒绝）。
+
+**验收**：
+- CTest 11/11 全过（新增 test_bounded_queue 独立 CTest）。
+- L1 确定性（run_slam 路径不受 localizer.* 改动影响）：KITTI 00 前 1000 帧
+  轨迹逐位一致。
+- 本任务不改 VO/算法路径，完整基准不做复测（提交门 L2 快速档自动覆盖）。
+
+下一任务：M2.2 资源预算（`resource_budget.{h,cpp}`，§6.3 回收顺序）。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 

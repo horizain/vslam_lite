@@ -28,6 +28,14 @@ LocalizerConfig LocalizerConfig::fromYaml(const std::string& path) {
     if (robot["stereo_max_time_diff_s"]) {
         cfg.stereo_max_time_diff_s = robot["stereo_max_time_diff_s"].as<double>();
     }
+    if (root["Robot"]["Runtime"]) {
+        // M2.1（§6.1/§6.2）：异步输入 + 输入队列容量
+        const auto& rt = root["Robot"]["Runtime"];
+        if (rt["enable_async_input"])
+            cfg.enable_async_input = rt["enable_async_input"].as<bool>();
+        if (rt["input_queue_capacity"])
+            cfg.input_queue_capacity = rt["input_queue_capacity"].as<int>();
+    }
     if (robot["T_bc"]) {
         const auto& tbc = robot["T_bc"];
         if (tbc["translation"] && tbc["quaternion"] &&
@@ -50,19 +58,26 @@ LocalizerConfig LocalizerConfig::fromYaml(const std::string& path) {
 
 Localizer::Localizer(const Camera& camera, const VOConfig& vo_cfg,
                      const LocalizerConfig& cfg)
-    : camera_(camera), vo_cfg_(vo_cfg), cfg_(cfg) {
+    : camera_(camera), vo_cfg_(vo_cfg), cfg_(cfg),
+      input_queue_(static_cast<size_t>(cfg.input_queue_capacity)) {
     if (!camera_)
         throw std::invalid_argument("Localizer: camera is null");
     if (!isFinite(cfg_.T_bc) || !isUnitQuaternion(cfg_.T_bc.q))
         throw std::invalid_argument(
             "Localizer: T_bc must be finite with unit quaternion (norm error < 1e-6)");
     vo_ = std::make_unique<VisualOdometry>(camera_, vo_cfg_);
+    // M2.1（§6.1）：异步模式启动跟踪 worker（传感器回调只入队）
+    if (cfg_.enable_async_input) {
+        worker_ = std::thread(&Localizer::trackingLoop, this);
+        worker_started_.store(true);
+    }
 }
 
 Localizer::~Localizer() { stop(); }
 
 bool Localizer::validateInput(const cv::Mat& left, const cv::Mat& right,
                               double timestamp, double right_timestamp,
+                              double last_ts, bool has_last_ts,
                               FailureReason& reason) const {
     if (!cfg_.enable_input_validation) {
         reason = FailureReason::None;
@@ -73,7 +88,7 @@ bool Localizer::validateInput(const cv::Mat& left, const cv::Mat& right,
         reason = FailureReason::InvalidInput;
         return false;
     }
-    if (has_last_timestamp_ && timestamp <= last_timestamp_) {
+    if (has_last_ts && timestamp <= last_ts) {
         reason = FailureReason::TimestampRollback;
         return false;
     }
@@ -106,16 +121,67 @@ bool Localizer::validateInput(const cv::Mat& left, const cv::Mat& right,
 
 PoseEstimate Localizer::processFrame(const cv::Mat& left, const cv::Mat& right,
                                      double timestamp, double right_timestamp) {
+    // M2.1：异步模式下 processFrame 不可用（会与 worker 并发驱动 VO）
+    if (cfg_.enable_async_input) return stoppedOutput();
     if (stopped_) return stoppedOutput();
 
     FailureReason reason;
-    if (!validateInput(left, right, timestamp, right_timestamp, reason))
+    if (!validateInput(left, right, timestamp, right_timestamp,
+                       last_timestamp_, has_last_timestamp_, reason))
         return rejectedOutput(timestamp, reason);
     return processValidFrame(left, right, timestamp);
 }
 
 PoseEstimate Localizer::processFrame(const cv::Mat& image, double timestamp) {
     return processFrame(image, cv::Mat(), timestamp);
+}
+
+bool Localizer::submitFrame(const cv::Mat& left, const cv::Mat& right,
+                            double timestamp, double right_timestamp) {
+    // M2.1（§6.1）：传感器回调只校验并入队，不运行 ORB/PnP，永不阻塞。
+    if (!cfg_.enable_async_input || stopped_) return false;
+    FailureReason reason;
+    // 提交侧按"已提交的最大时间戳"校验（与 worker 处理进度解耦）
+    if (!validateInput(left, right, timestamp, right_timestamp,
+                       last_submitted_timestamp_, has_last_submitted_, reason))
+        return false;
+    SensorPacket pkt;
+    pkt.sequence = ++packet_seq_;
+    pkt.timestamp = timestamp;
+    pkt.right_timestamp = right_timestamp;
+    pkt.left = left;
+    pkt.right = right;
+    input_queue_.push(std::move(pkt));  // 满丢最旧、保最新（永不阻塞）
+    last_submitted_timestamp_ = timestamp;
+    has_last_submitted_ = true;
+    return true;
+}
+
+PoseEstimate Localizer::latestPose() const {
+    std::lock_guard<std::mutex> lock(result_mutex_);
+    return latest_estimate_;
+}
+
+size_t Localizer::inputQueueHighWaterMark() const {
+    return input_queue_.highWaterMark();
+}
+
+size_t Localizer::inputQueueDroppedCount() const {
+    return input_queue_.droppedCount();
+}
+
+void Localizer::trackingLoop() {
+    // M1 确定性：OpenCV RNG 是线程局部的——异步 worker 线程必须按配置
+    // 单独播种（与 VisualOdometry 构造函数同一规则；rng_seed=0 保持默认）
+    if (vo_cfg_.rng_seed != 0)
+        cv::setRNGSeed(static_cast<unsigned>(vo_cfg_.rng_seed));
+    // M2.1（§6.1）：跟踪 worker——阻塞在队列上（空闲不自旋），
+    // 消费按 FIFO；stop 后排空剩余帧（丢最旧语义保证均为最新帧）再退出。
+    while (true) {
+        SensorPacket pkt;
+        if (!input_queue_.pop(pkt)) break;
+        processValidFrame(pkt.left, pkt.right, pkt.timestamp);
+    }
 }
 
 PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& right,
@@ -135,7 +201,6 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
 
     // M0 质量映射：pose_valid → Full，否则 Failed；Weak 细分留给 M3 质量门。
     const FrameQuality q = st.pose_valid ? FrameQuality::Full : FrameQuality::Failed;
-    const StateMachineOutput sm_out = state_machine_.on_tracking(q, dt, seq);
 
     PoseEstimate out;
     out.sequence = seq;
@@ -143,12 +208,19 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
     const SE3 T_wc = T_cw.inverse();
     out.T_wb = T_wc * cfg_.T_bc.inverse();  // §2：T_wb = T_wc · T_bc⁻¹
     out.T_ob = out.T_wb;                    // M0：odom 系 = 全局系，M6 后由 T_wo 分离
-    out.covariance = Mat6::Identity();      // M0 占位；M3 数值 Jacobian 替换
-    if (sm_out.quality == FrameQuality::Weak) out.covariance *= 4.0;  // §4.2 弱质量 ×4
-    out.state = sm_out.state;
-    out.reason = sm_out.reason;
-    out.pose_valid = sm_out.pose_valid;
-    out.prediction_only = sm_out.prediction_only;
+    // M2.1：状态机写入 + 结果发布在 result_mutex_ 内（异步模式 worker 写、
+    // 调用方 state()/latestPose() 并发读；同步模式单线程无竞争）
+    {
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        const StateMachineOutput sm_out = state_machine_.on_tracking(q, dt, seq);
+        out.covariance = Mat6::Identity();  // M0 占位；M3 数值 Jacobian 替换
+        if (sm_out.quality == FrameQuality::Weak) out.covariance *= 4.0;  // §4.2 弱质量 ×4
+        out.state = sm_out.state;
+        out.reason = sm_out.reason;
+        out.pose_valid = sm_out.pose_valid;
+        out.prediction_only = sm_out.prediction_only;
+        latest_estimate_ = out;
+    }
     out.map_generation = vo_->getMap()->topologyRevision();
     return out;
 }
@@ -174,11 +246,22 @@ PoseEstimate Localizer::stoppedOutput() const {
 void Localizer::stop() {
     if (stopped_) return;
     stopped_ = true;
+    // M2.1：先停输入队列并 join 跟踪 worker（§6.2 shutdown_timeout_ms=2000 内），
+    // 再排空 VO 后台任务；锁序：worker 在队列锁外执行 VO，无嵌套持锁。
+    input_queue_.stop();
+    if (worker_started_.load() && worker_.joinable()) worker_.join();
     if (vo_) vo_->finishPendingBackendWork();
-    state_machine_.stop();
+    {
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        state_machine_.stop();
+    }
 }
 
-TrackingState Localizer::state() const { return state_machine_.state(); }
+TrackingState Localizer::state() const {
+    // M2.1：异步模式与 worker 并发读 → 与状态机写入共用 result_mutex_
+    std::lock_guard<std::mutex> lock(result_mutex_);
+    return state_machine_.state();
+}
 
 uint64_t Localizer::mapTopologyRevision() const {
     return vo_ ? vo_->getMap()->topologyRevision() : 0;

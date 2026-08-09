@@ -3,8 +3,16 @@
 #
 # 由 core.hooksPath 启用：git config core.hooksPath .githooks
 # 每次提交前强制跑 scripts/benchmark_gate.sh 快速档；失败则阻止提交。
+# 纯文档提交（仅 docs/ 下文件或根级 *.md）跳过基准门——文档不改行为，无需回归。
 # 紧急绕过：git commit --no-verify（不推荐，需在 PR 说明原因）。
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-exec "$ROOT/scripts/benchmark_gate.sh"
+
+# 纯文档提交判定：staged 文件全部为 docs/ 下文件或根级 *.md 时跳过基准门。
+# grep -v 无输出（全部匹配）→ 返回 1 → 跳过；任一非文档文件 → 返回 0 → 跑门。
+if git diff --cached --name-only -z | tr '\0' '\n' \
+        | grep -qvE '^(docs/.*|[^/]*\.md)$'; then
+    exec "$ROOT/scripts/benchmark_gate.sh"
+fi
+echo "[gate] 纯文档提交（docs/* 或根级 *.md），跳过基准门"

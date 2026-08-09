@@ -1,7 +1,7 @@
 # 从教学 SLAM 到机器人长期定位组件：实施规格
 
-> 状态：M0 完成；M1.1 PoseGate、M1.2 Relocalizer、M1.3 BackendScheduler、
-> M1.4 FrontendTracker 完成（均确定性验收通过），M1.5 LocalMapper 进行中
+> 状态：M0 完成；M1 全部完成（均确定性验收通过）；M2.1 输入队列完成，
+> M2.2 资源预算 进行中
 > 基线：`7a22edd`，2026-08-07
 > 适用范围：把当前单目/双目 VO + Local BA + DBoW3 回环 + Atlas 原型，演进为
 > 可供机器人连续运行 8～24 小时的核心定位组件。
@@ -790,8 +790,8 @@ M0
 | 里程碑 | 状态 | 当前证据/下一步 |
 |---|---|---|
 | M0 API/状态机 | 完成 | M0.1/M0.2/M0.3 全部落地（契约 19 + 状态机 24 + Facade 16 项测试，6/6 CTest 全过） |
-| M1 模块拆分 | 进行中 | M1.1~M1.4 已落地（PoseGate/Relocalizer/BackendScheduler/FrontendTracker，11+9+7+6 项测试，9/9 CTest 全过，1000 帧确定性验收通过：轨迹逐位一致、旋转差 5.5e-17 rad）；M1.6 基准门已落地（`--metrics-json` + benchmark.py v2 多轮 mean/std/worst + `.githooks/pre-commit`）；下一步 M1.5 LocalMapper |
-| M2 实时/资源/指标 | 未开始 | 现有异步后端可复用，但缺输入队列和硬预算 |
+| M1 模块拆分 | 完成 | M1.1~M1.5 全部落地（PoseGate 11 + Relocalizer 9 + BackendScheduler 7 + FrontendTracker 6 + LocalMapper 5 项测试，10/10 CTest 全过，1000 帧确定性验收通过：轨迹逐位一致、旋转差 5.5e-17 rad）；M1.6 基准门已落地（`--metrics-json` + benchmark.py v2 多轮 mean/std/worst + `.githooks/pre-commit`）；下一步 M2 |
+| M2 实时/资源/指标 | 进行中 | M2.1 输入队列已落地（`bounded_queue.h` 固定容量 ring buffer + 丢最旧保最新 + `sensor_packet.h` + Localizer 异步模式：submitFrame 只校验入队、跟踪 worker 消费、hwm/dropped 指标，11 项队列测试）；下一步 M2.2 资源预算（`resource_budget.{h,cpp}`） |
 | M3 前端鲁棒/协方差 | 未开始 | 现有质量 gate 为基础 |
 | M4 地图持久化/纯定位 | 未开始 | 当前无版本化 MapStore |
 | M5 多会话/Atlas 融合 | 未开始 | 当前 Atlas 只连坐标，不融合点 |

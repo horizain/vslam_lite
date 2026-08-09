@@ -126,7 +126,8 @@ set(VSLAM_SOURCES
     src/localizer.cpp
     src/pose_gate.cpp
     src/relocalizer.cpp
-    src/frontend_tracker.cpp)
+    src/frontend_tracker.cpp
+    src/local_mapper.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
@@ -136,6 +137,9 @@ set(VSLAM_HEADERS
     include/vslam/pose_gate.h
     include/vslam/relocalizer.h
     include/vslam/frontend_tracker.h
+    include/vslam/local_mapper.h
+    include/vslam/bounded_queue.h
+    include/vslam/sensor_packet.h
     include/vslam/backend_scheduler.h
     include/vslam/camera.h
     include/vslam/dataset.h
@@ -279,6 +283,22 @@ if(BUILD_TESTS)
         target_compile_options(test_frontend_tracker PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_frontend_tracker COMMAND test_frontend_tracker)
+
+    # M1.5 LocalMapper（独立 CTest）
+    add_executable(test_local_mapper test/test_local_mapper.cpp)
+    target_link_libraries(test_local_mapper vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_local_mapper PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_local_mapper COMMAND test_local_mapper)
+
+    # M2.1 输入队列 + 异步 Localizer（独立 CTest）
+    add_executable(test_bounded_queue test/test_bounded_queue.cpp)
+    target_link_libraries(test_bounded_queue vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_bounded_queue PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_bounded_queue COMMAND test_bounded_queue)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
