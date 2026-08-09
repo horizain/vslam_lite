@@ -62,6 +62,39 @@ void Map::cullMapPoints(int min_observations) {
         bumpTopology();
 }
 
+bool Map::removeKeyFrame(KeyframeId id) {
+    auto it = keyframes_.find(id);
+    if (it == keyframes_.end()) return false;
+    const auto keyframe = it->second;
+    // 撤销该 KF 上全部正式观测（反向集合 + 共视计数），并清空 slot。
+    // 调用方持有写锁时，这整个序列对其他地图读者是一个原子事务。
+    for (size_t i = 0; i < keyframe->map_points.size(); i++) {
+        const auto map_point = keyframe->map_points[i];
+        if (!map_point) continue;
+        const Observation observation{id, static_cast<FeatureIndex>(i)};
+        if (map_point->hasObservation(observation)) {
+            removeCovisibilityUnlocked(observation, map_point);
+            map_point->removeObservation(observation);
+        }
+        keyframe->map_points[i].reset();
+    }
+    keyframes_.erase(it);
+    kf_count_.fetch_sub(1, std::memory_order_relaxed);
+    bumpTopology();
+    return true;
+}
+
+void Map::recordTrackingHit(MapPointId map_point_id) {
+    // M2.2：旁路统计（§6.3）。普通帧的临时关联也计入"最近命中"，
+    // 与 observed_count 语义无关；地图清空时一并重置。
+    last_hit_kf_[map_point_id] = kf_count_.load(std::memory_order_relaxed);
+}
+
+size_t Map::lastHitKeyframeCount(MapPointId map_point_id) const {
+    auto it = last_hit_kf_.find(map_point_id);
+    return (it != last_hit_kf_.end()) ? it->second : 0;
+}
+
 bool Map::setObservation(const Frame::Ptr& keyframe,
                          FeatureIndex feature_index,
                          const MapPoint::Ptr& map_point) {
@@ -239,6 +272,8 @@ bool Map::addObservationUnlocked(const Observation& observation,
     if (!map_point || !map_point->addObservation(observation)) return false;
     // 只有反向正式观测确实插入后才增加共视，避免失败路径单边加权。
     addCovisibilityUnlocked(observation, map_point);
+    // M2.2：正式观测即一次"跟踪命中"，记录当前关键帧计数（§6.3 旁路统计）。
+    last_hit_kf_[map_point->id] = kf_count_.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -281,6 +316,8 @@ void Map::removeMapPointsUnlocked(
             removeCovisibilityUnlocked(observation, map_point);
             map_point->removeObservation(observation);
         }
+        // M2.2：随点删除清理"最近命中 KF"旁路统计（§6.3）。
+        last_hit_kf_.erase(map_point->id);
     }
     // 兼容迁移期间可能存在的旧 stale slot；整个批次只扫描一次所有 KF。
     for (const auto& [id, keyframe] : keyframes_) {
@@ -398,6 +435,7 @@ void Map::clear() {
     map_points_.clear();
     keyframes_.clear();
     covisibility_.clear();
+    last_hit_kf_.clear();
     mp_count_.store(0, std::memory_order_relaxed);
     kf_count_.store(0, std::memory_order_relaxed);
     bumpTopology();

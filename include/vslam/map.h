@@ -48,6 +48,21 @@ public:
     /// 剔除观测次数不足的地图点
     void cullMapPoints(int min_observations = 2);
 
+    // ---- 资源预算（M2.2，§6.3）----
+    /// 原子移除关键帧：清空该 KF 全部正式观测（反向集合 + 共视计数）与
+    /// slot 后从地图集合删除。调用方必须持有 map_mutex_ 独占锁；
+    /// 不存在时幂等返回 false。
+    bool removeKeyFrame(KeyframeId id);
+
+    /// 记录一次跟踪命中（旁路统计，§6.3 第 2 步的"最近命中 KF"）。
+    /// 与 observed_count 语义无关：普通帧的临时关联也计入，用于弱点回收
+    /// 判断。调用方须持 map_mutex_ 写锁；正式观测建立时自动记录。
+    void recordTrackingHit(MapPointId map_point_id);
+
+    /// 该点最后一次命中时的关键帧计数（0 = 从未命中）。
+    /// 用于"超过 30 个 KF 未被跟踪命中"的陈旧判断。
+    [[nodiscard]] size_t lastHitKeyframeCount(MapPointId map_point_id) const;
+
     // ---- 正式观测关系（调用方必须持有 map_mutex_ 独占锁）----
     /// 原子维护关键帧 feature slot 与 MapPoint 反向观测。
     /// 传入的关键帧和地图点必须已经注册到本 Map。
@@ -117,6 +132,10 @@ private:
 
     // 以无向 KF 对为键的持久共视计数；唯一来源仍是 MapPoint 观测集合。
     std::map<std::pair<KeyframeId, KeyframeId>, size_t> covisibility_;
+
+    // M2.2：地图点"最近命中 KF"旁路统计（§6.3 第 2 步）。记录命中时的
+    // 关键帧计数，与 observed_count 无关；随点删除/清图一并清理。
+    std::map<MapPointId, size_t> last_hit_kf_;
 
     std::atomic<size_t> mp_count_{0};  // 地图点数量（原子，锁外可读）
     std::atomic<size_t> kf_count_{0};  // 关键帧数量（原子，锁外可读）

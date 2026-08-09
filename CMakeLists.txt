@@ -127,7 +127,8 @@ set(VSLAM_SOURCES
     src/pose_gate.cpp
     src/relocalizer.cpp
     src/frontend_tracker.cpp
-    src/local_mapper.cpp)
+    src/local_mapper.cpp
+    src/resource_budget.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
@@ -138,6 +139,7 @@ set(VSLAM_HEADERS
     include/vslam/relocalizer.h
     include/vslam/frontend_tracker.h
     include/vslam/local_mapper.h
+    include/vslam/resource_budget.h
     include/vslam/bounded_queue.h
     include/vslam/sensor_packet.h
     include/vslam/backend_scheduler.h
@@ -299,6 +301,14 @@ if(BUILD_TESTS)
         target_compile_options(test_bounded_queue PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_bounded_queue COMMAND test_bounded_queue)
+
+    # M2.2 资源预算（独立 CTest）
+    add_executable(test_resource_budget test/test_resource_budget.cpp)
+    target_link_libraries(test_resource_budget vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_resource_budget PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_resource_budget COMMAND test_resource_budget)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

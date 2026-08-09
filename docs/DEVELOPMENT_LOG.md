@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0 + M1 完成 + M2.1 输入队列 §3.25-3.35）
+> 最后更新: 2026-08-10（M0 + M1 完成 + M2.1 输入队列 + M2.2 资源预算 §3.25-3.36）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1636,6 +1636,54 @@ BackendScheduler/FrontendTracker/LocalMapper），共 38 项独立 CTest；唯�
 - 本任务不改 VO/算法路径，完整基准不做复测（提交门 L2 快速档自动覆盖）。
 
 下一任务：M2.2 资源预算（`resource_budget.{h,cpp}`，§6.3 回收顺序）。
+
+### 3.36 M2.2 资源预算引擎 + Map 移除/命中旁路统计（2026-08-10）
+
+按 §6.2/§6.3 落地地图资源硬预算与固定顺序回收：
+
+- **`resource_budget.{h,cpp}`**（§6.3 六步引擎，无锁、无线程、不持有 Map/Atlas
+  状态，调用方持 map_mutex_ 独占锁）：
+  - `MapBudgetConfig`：§6.2 首版参数（max_active_keyframes 1200、max_active_points
+    120000、max_descriptor_mb 256、max_snapshot_mb 256、max_total_estimated_mb 900）
+    + §6.3 回收参数（弱观察窗口 30 KF、共视重叠 0.9、相邻位姿差 0.15 m/3 deg、
+    最近图像保留窗口 2、非活动子地图上限 2）；robot.yaml `Robot.MapBudget` 段同步；
+  - `evaluate(map, snapshot_bytes)`：只读估算 KF/点/描述子/图像/在途快照字节与
+    总量（含 KF/点开销常量），逐项判定超限；
+  - `reclaim()`：按 §6.3 固定顺序回收，任一步回到预算内立即返回：
+    1. 删除 0 个正式 Observation 的点；
+    2. 删除 `observationCount < 2` 且超过 30 个 KF 未被跟踪命中的点（旁路统计，
+       禁止复用 observed_count 语义）；
+    3. 卸载非活动 KF 原图/灰度图（`Frame::releaseImages`，保留关键点/描述子/
+       位姿/观测），最近窗口 KF 保留图像；
+    4. 冗余 KF 剔除：共视重叠率 >0.9 且相邻位姿差 <0.15 m/3 deg，回环/子地图
+       锚点（protected 集）与最近窗口 KF 必须保留，循环到关键帧回预算或无可剔除；
+    5. 冻结超过 2 个的非活动子地图（保留最新 2 个）并卸载其 KF 图像缓存；
+       冻结标志属于 Atlas 状态，M4 前只做图像卸载与计数，不做磁盘换出；
+    6. 仍超预算 → `stopped_map_growth`（调用方上报 Degraded + BackendOverloaded），
+       不随机删除锚点/强点。
+- **Map 扩展**（§6.3）：
+  - `removeKeyFrame(id)`：原子移除 KF（撤销全部正式观测/共视/slot + 计数 + 拓扑
+    bump，幂等）；
+  - `recordTrackingHit(mp_id)` + `lastHitKeyframeCount(mp_id)`：地图点"最近命中
+    KF"旁路统计表，正式观测建立时自动记录，随点删除/清图清理；
+  - 命中/清理均为旁路写入，不改 VO 行为。
+- 测试 `test_resource_budget.cpp`（14 项）：evaluate 五项超限判定 + 六步回收各自
+  语义（含锚点保护、最近窗口保留、非活动子地图冻结、stopped_map_growth）+ Map
+  新 API（removeKeyFrame 双向一致性、命中旁路统计）+ 组合场景全量观测一致性。
+
+**验收**：
+- CTest 12/12 全过（新增 test_resource_budget 独立 CTest）。
+- 确定性回归（§5.6）：map.* 属 run_slam 共享路径，用 a4e425a（M2.1）构建
+  baseline 与当前构建各跑 KITTI 00 前 1000 帧（deterministic.yaml）：
+  轨迹逐位一致（最大平移差 0 m、最大旋转差 5.551e-17 rad < 1e-8）。
+- 本任务不改 VO/算法路径，完整基准不做复测（提交门 L2 快速档自动覆盖）。
+
+**未验证边界**：① 预算在生产路径的触发点（vo.cpp 周期性 cull 钩子替换）与
+snapshot_bytes 上报接线未接，留待 M2.3 指标任务；② 第 5 步的"冻结"语义只做
+图像卸载与计数，Atlas 冻结标志与磁盘换出留待 M4；③ 对象开销估算常量（KF 16 KB/
+点 2 KB）为保守估计，M7 前按实测统一标定。
+
+下一任务：M2.3 结构化指标（`metrics.{h,cpp}` + `soak_test.py`，§6.4）。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 
