@@ -57,6 +57,12 @@ VO:
   min_keyframe_interval: 10
   max_keyframe_interval: 15
   keyframe_max_count: 1800
+  guided_match: true
+  guided_search_radius_px: 25.0
+  local_map_tracking: true
+  local_map_min_shared: 2
+  local_map_max_points: 400
+  local_map_search_radius_px: 30.0
 
 # ---- 优化参数 ----
 Optimizer:

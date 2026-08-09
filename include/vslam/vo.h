@@ -85,6 +85,14 @@ struct VOConfig {
     double rigid_ransac_threshold = 0.25;   // 3D-3D RANSAC 距离阈值(m)
     double rigid_max_rmse         = 0.25;   // 3D-3D 刚体拟合最大 RMSE(m)
 
+    // ---- 前端跟踪增强（方案 A/B）----
+    bool   guided_match            = true;  // 方案 A：运动模型引导匹配开关
+    double guided_search_radius_px = 25.0;  // 引导匹配投影邻域搜索半径(px)
+    bool   local_map_tracking      = true;  // 方案 B：共视图局部地图投影匹配开关
+    int    local_map_min_shared    = 2;     // 局部地图共视 KF 最小共视点数
+    int    local_map_max_points    = 400;   // 局部地图点预算（按共视降序截断）
+    double local_map_search_radius_px = 30.0; // 局部地图投影搜索半径(px)
+
     // ---- 回环检测 (Phase 2) ----
     bool   enable_loop_closure   = false;   // run_slam 默认开、run_vo 默认关（A/B 对比）
     std::string vocab_path       = "";      // 词袋词典路径（config/ORBvoc.dbow3）
@@ -247,6 +255,13 @@ public:
         SE3 ref_pose_cs;                  // 参考帧位姿（子地图局部系 T_cs）
         std::vector<std::shared_ptr<MapPoint>> ref_mps;  // 参考帧 map_points（索引对齐）
         std::vector<Vec3> ref_points_s;   // 对应局部坐标拷贝（版本绑定）
+        // 方案 B：共视图局部地图（参考 KF 及其共视 KF 的地图点快照，索引对齐）。
+        // 只在参考 KF 变化时由 captureTrackingSnapshot 刷新一次（covisibleKeyframes
+        // 是 O(KF²) 全量扫描，不能每帧都做）；锁内拷贝保证与几何版本一致。
+        std::vector<Vec3> local_points_s;
+        std::vector<cv::Mat> local_descs;
+        std::vector<std::shared_ptr<MapPoint>> local_mps;
+        unsigned long local_map_kf_id = 0; // 局部地图对应的参考 KF id（缓存判据）
     };
 
     /// 等待异步后端队列排空并停止线程。批量评估必须先调用，再读取最终轨迹/统计。
@@ -346,8 +361,10 @@ private:
         unsigned long expected_submap_id);
 
     // ---- M2：前端只读快照 ----
-    /// 捕获前端只读快照（调用方需持 map_mutex_ 读锁；每帧开头一次）
-    TrackingSnapshot captureTrackingSnapshot() const;
+    /// 捕获前端只读快照（调用方需持 map_mutex_ 读锁；每帧开头一次）。
+    /// 方案 B：局部地图按（参考 KF id, geometry revision）缓存，只在任一
+    /// 变化时重新收集——covisibleKeyframes 是 O(KF²) 全量扫描，不能每帧做。
+    TrackingSnapshot captureTrackingSnapshot();
 
     /// 快照一个关键帧：pose_cs 拷贝；keep_points 为空则全部 map_points 深拷贝，
     /// 否则只深拷贝 keep_points 中的点（其余置 nullptr，与 keypoints 索引对齐）。
@@ -417,6 +434,12 @@ private:
     int relocalization_frames_ = 0;
     Status status_;  // 当前详细状态（初始化/跟踪/丢失信息）
     TrackingSnapshot snap_;  // 前端只读快照（M2，每帧开头捕获）
+    // 方案 B：局部地图缓存（captureTrackingSnapshot 内按 ref KF + 几何版本刷新）
+    unsigned long snap_local_map_kf_id_ = 0;
+    uint64_t snap_local_map_geo_rev_ = std::numeric_limits<uint64_t>::max();
+    std::vector<Vec3> snap_local_points_s_;
+    std::vector<cv::Mat> snap_local_descs_;
+    std::vector<std::shared_ptr<MapPoint>> snap_local_mps_;
 };
 
 } // namespace vslam

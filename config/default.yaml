@@ -59,6 +59,13 @@ VO:
   min_keyframe_interval: 10 # 弱匹配触发关键帧的最小间隔
   max_keyframe_interval: 15 # 最长关键帧间隔，防止参考帧过旧
   keyframe_max_count: 1800       # KF 规模软阈值：超过后平移阈值放大 1.5 倍
+  guided_match: true             # 方案 A：运动模型引导匹配开关（预测位姿投影邻域匹配）
+  guided_search_radius_px: 25.0  # 引导匹配投影邻域搜索半径(px)；通用默认值，
+                                 # 覆盖典型 10Hz 双目帧间位移，非数据集标定
+  local_map_tracking: true       # 方案 B：共视图局部地图投影匹配开关
+  local_map_min_shared: 2        # 局部地图共视 KF 最小共视点数
+  local_map_max_points: 400      # 局部地图点预算（按共视降序截断）
+  local_map_search_radius_px: 30.0 # 局部地图投影搜索半径(px)
 
 # ---- 优化参数 (Phase 1) ----
 Optimizer:

@@ -32,6 +32,18 @@ struct TrackerConfig {
     double pnp_max_rmse = 2.5;
     double max_frame_translation = 3.0;
     double max_frame_rotation = 0.35;
+    // 运动模型引导匹配（方案 A）：用预测位姿把参考帧 3D 点投影到当前帧，
+    // 只在投影点邻域内做描述子匹配，替代全图 BF。通用默认值：25px 覆盖
+    // 典型 10Hz 双目帧间像素位移；视角/帧率差异大的场景可通过配置调整。
+    bool   guided_match = true;
+    double guided_search_radius_px = 25.0;
+    // 共视图局部地图投影匹配（方案 B）：首轮 PnP 成功后把共视 KF 的地图点
+    // 投影进当前帧补充 3D-2D 对应，再精修位姿。通用默认值：共视≥2 的 KF、
+    // 最多 400 个点、30px 搜索半径，均为量级预算而非数据集标定。
+    bool   local_map_tracking = true;
+    int    local_map_min_shared = 2;
+    int    local_map_max_points = 400;
+    double local_map_search_radius_px = 30.0;
     // 双目深度
     double stereo_min_depth = 0.5;
     double stereo_max_depth = 35.0;
@@ -66,6 +78,11 @@ struct RefView {
     SE3 T_ws;                              // 活动子地图锚（世界组合用）
     std::vector<Vec3> ref_points_s;        // 参考帧点局部坐标拷贝（索引对齐）
     std::vector<MapPoint::Ptr> ref_mps;    // 参考帧 map_points（索引对齐）
+    // 共视图局部地图（方案 B）：参考 KF 及其共视 KF 的地图点快照。
+    // 局部地图投影匹配用它补 3D-2D 对应；与 ref 点同一"版本绑定拷贝"规则。
+    std::vector<Vec3> local_points_s;      // 局部地图点局部坐标（索引对齐）
+    std::vector<cv::Mat> local_descs;      // 局部地图点描述子（索引对齐）
+    std::vector<MapPoint::Ptr> local_mps;  // 局部地图点指针（关联写引用用）
 };
 
 /// 运动基线/门限（M1.4，值对象）：由调用方（VO）从自身状态计算后传入。
@@ -74,6 +91,9 @@ struct MotionBaseline {
     std::optional<SE3> baseline_twc;
     double max_translation = 0.0;
     double max_rotation = 0.0;
+    // 方案 A：匀速模型预测的当前帧位姿（子地图局部系 T_cs）。由 VO 用
+    // 相邻有效帧相对运动外推得到；为空时前端退化为全图 BF 匹配。
+    std::optional<SE3> predicted_pose_cs;
 };
 
 /// 跟踪结果（M1.4，§5.5）：FrontendTracker 只输出结果，不写地图/状态/
@@ -92,6 +112,10 @@ struct TrackingResult {
     std::vector<int> pnp_inlier_indices;   // PnP 内点在 pts3d 中的索引（关联用）
     // 关联的地图点：trainIdx → MapPoint（普通帧不产生正式观测）
     std::vector<std::pair<int, MapPoint::Ptr>> associations;
+    // 与 associations 逐位对齐的"版本绑定快照坐标"（pos_s 拷贝）。跟踪在
+    // 锁外读 live mp->pos_s 违反 M1.4 快照约定（后端 BA 可改写坐标）——
+    // 局部地图精修等后续步骤必须复用这份快照，而不是 live 指针坐标。
+    std::vector<Vec3> association_points_s;
 };
 
 /// 3D-3D 刚体估计结果（M1.4，值对象）
@@ -103,6 +127,15 @@ struct RigidResult {
     double ratio = 0.0;
     double rmse = std::numeric_limits<double>::infinity();
     std::vector<unsigned char> inlier_mask;  // 掩码（与输入点对齐，关联用）
+};
+
+/// 共视图局部地图投影匹配结果（方案 B，值对象）
+struct LocalMapTrackResult {
+    int added = 0;                         // 新增 3D-2D 对应数
+    std::vector<cv::Point3f> pts3d;        // 局部地图点（子地图局部系）
+    std::vector<cv::Point2f> pts2d;        // 当前帧像素
+    std::vector<MapPoint::Ptr> mps;        // 与 pts2d 对齐的地图点指针
+    std::vector<int> curr_feature_indices; // 已占用的当前帧特征索引（防重复）
 };
 
 /// 关键帧提议（M1.4，§5.5）
@@ -144,6 +177,18 @@ public:
         const MotionBaseline& motion,
         int min_inliers, double min_ratio, double max_rmse) const;
 
+    /// 确定性位姿精修（局部地图补匹配后复用）：在给定初始位姿上用
+    /// cv::solvePnP（iterative + useExtrinsicGuess）做纯几何精修，不做
+    /// RANSAC——不消耗全局 RNG，与 solvePnPRansac 交替调用时保持两路
+    /// 确定性同步（test_localizer_contract 等价性要求）。外点由调用方
+    /// 提前过滤（首轮内点 + 窗口匹配新增），这里只负责数值优化。
+    [[nodiscard]] TrackingResult refinePnP(
+        const std::vector<cv::Point3f>& pts3d,
+        const std::vector<cv::Point2f>& pts2d,
+        const SE3& initial_pose_cs, const SE3& T_ws,
+        const MotionBaseline& motion,
+        int min_inliers, double min_ratio, double max_rmse) const;
+
     /// 3D-3D 刚体拟合（Kabsch，RANSAC 内点）：纯几何，不验收。
     /// 通过 RANSAC 内点/比例/退化检查时返回 ok=true；max_rmse 由调用方验收。
     [[nodiscard]] RigidResult estimateRigid3D3D(
@@ -158,6 +203,28 @@ public:
         const RefView& ref, const MotionBaseline& motion,
         const StereoStats& stereo) const;
 
+    /// 方案 A：运动模型引导匹配。用预测位姿把参考帧有 3D 点的特征投影到
+    /// 当前帧，只在投影点邻域（网格桶窗口）内做描述子比率匹配，替代全图 BF。
+    /// queryIdx 属于 ref_frame，trainIdx 属于 curr_frame（与 match 同一约定）。
+    /// 返回空表示预测失效（调用方回退全图匹配）。
+    [[nodiscard]] std::vector<cv::DMatch> matchGuided(
+        const Frame::Ptr& ref_frame, const Frame::Ptr& curr_frame,
+        const std::vector<Vec3>& ref_points_s,   // 版本绑定快照坐标（索引对齐）
+        const SE3& T_cs_pred,                    // 预测当前帧位姿（子地图局部系）
+        double search_radius_px, double ratio_thresh) const;
+
+    /// 方案 B：共视图局部地图投影匹配。把局部地图点投影进当前帧（用首轮
+    /// PnP 位姿），窗口内做描述子比率匹配，补充 3D-2D 对应。occupied_features
+    /// 是已被首轮匹配占用的当前帧特征索引，避免同一特征匹配多个点。
+    [[nodiscard]] LocalMapTrackResult trackLocalMap(
+        const Frame::Ptr& curr_frame,
+        const std::vector<Vec3>& local_points_s,
+        const std::vector<cv::Mat>& local_descs,
+        const std::vector<MapPoint::Ptr>& local_mps,
+        const std::vector<int>& occupied_features,
+        const SE3& T_cs,                        // 当前帧位姿（子地图局部系）
+        double search_radius_px, double ratio_thresh) const;
+
     /// 关键帧提议（原 needNewKeyFrame 判定，§5.5）。
     [[nodiscard]] KeyframeProposal proposeKeyFrame(const KeyframeInput& input) const;
 
@@ -165,6 +232,20 @@ private:
     Camera camera_;
     mutable FeatureMatcher matcher_;  // 仅供前端线程使用；const 方法内可匹配
     TrackerConfig cfg_;
+
+    /// 构建当前帧特征点的像素网格索引（cell = search_radius_px），
+    /// 供投影点窗口搜索用。返回 cell → keypoint 索引列表。
+    [[nodiscard]] std::vector<std::vector<int>> buildKeypointGrid(
+        const Frame::Ptr& frame, double cell_size_px) const;
+    /// 在窗口候选集中做描述子比率匹配（BF Hamming），返回 best match 与
+    /// best/second 距离（比率测试用）。单候选时退化为"距离 < max_dist 即接受"
+    /// ——局部地图精修不做 RANSAC 外点过滤，窗口匹配必须设距离上限，
+    /// 防止随机近邻拉偏位姿（max_dist 与 quickMatchCount 默认 64 一致）。
+    [[nodiscard]] bool windowRatioMatch(
+        const cv::Mat& query_desc, const cv::Mat& train_desc,
+        const std::vector<int>& candidates,
+        double ratio_thresh, float max_dist, int& best_train_idx,
+        float& best_dist, float& second_dist) const;
 };
 
 } // namespace vslam

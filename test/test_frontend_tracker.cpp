@@ -6,6 +6,9 @@
  *   2. trackPnP：合成 3D-2D 恢复 identity、运动连续性拒绝
  *   3. computeStereoDepths：单目（无深度）全零 pts_c
  *   4. proposeKeyFrame：平移/旋转/弱匹配/最远间隔四种触发
+ *   5. 方案 A matchGuided：预测位姿正确时窗口匹配召回、预测偏离时召回下降
+ *   6. 方案 B trackLocalMap：投影补匹配、occupied 防重复
+ *   7. 方案 B refinePnP：确定性精修不消耗 RNG（与 trackPnP 交替调用一致）
  *
  * 编译: cmake -DBUILD_TESTS=ON .. && make test_frontend_tracker
  * 运行: ./build/test_frontend_tracker（独立 CTest）
@@ -220,6 +223,202 @@ void test_propose_keyframe() {
     } TEST_PASS();
 }
 
+// ============================================================
+// 方案 A：运动模型引导匹配
+// 合成两帧：ref 帧 3D 点 → 真位姿投影生成 curr 帧特征，描述子相同
+// （投影噪声 < 搜索半径内）。预测位姿正确时窗口匹配应召回绝大多数；
+// 预测位姿大幅偏离时（真值 + 大平移），投影点越出窗口 → 召回骤降。
+// ============================================================
+void test_match_guided_recall() {
+    TEST("matchGuided: 预测位姿正确时窗口匹配召回（>90%）") {
+        const vslam::Camera cam = makeMonocular();
+        FrontendTracker tracker(cam);
+
+        // ref 帧：100 个 3D 点（相机前方），描述子 = 确定性伪随机 32B
+        auto ref_frame = std::make_shared<Frame>(0, 0.0);
+        cv::RNG rng(0x5A17);
+        std::vector<Vec3> ref_points_s;
+        for (int i = 0; i < 100; i++) {
+            const double u = rng.uniform(80.0, 560.0);
+            const double v = rng.uniform(80.0, 400.0);
+            const double d = rng.uniform(3.0, 10.0);
+            const Vec3 p = cam->pixel2camera(Vec2(u, v), d);
+            ref_points_s.push_back(p);
+            ref_frame->keypoints.emplace_back((float)u, (float)v, 20.0f);
+            cv::Mat desc(1, 32, CV_8U);
+            for (int b = 0; b < 32; b++) desc.at<uchar>(b) = (uchar)rng.uniform(0, 256);
+            ref_frame->descriptors.push_back(desc);
+            ref_frame->map_points.push_back(std::make_shared<vslam::MapPoint>((unsigned long)i));
+        }
+
+        // 真位姿：绕 Y 轴 5°，平移 (0.2, 0, 0.3)
+        const Eigen::Matrix3d R =
+            Eigen::AngleAxisd(0.0873, Eigen::Vector3d::UnitY()).toRotationMatrix();
+        const SE3 T_true(Eigen::Quaterniond(R), Vec3(0.2, 0.0, 0.3));
+
+        // curr 帧：ref 点经真位姿投影，加 1px 噪声
+        auto curr_frame = std::make_shared<Frame>(1, 0.1);
+        for (size_t i = 0; i < ref_points_s.size(); i++) {
+            const Vec2 px = cam->world2pixel(ref_points_s[i], T_true);
+            curr_frame->keypoints.emplace_back(
+                (float)(px.x() + rng.uniform(-1.0, 1.0)),
+                (float)(px.y() + rng.uniform(-1.0, 1.0)), 20.0f);
+            curr_frame->descriptors.push_back(ref_frame->descriptors.row((int)i));
+        }
+
+        // 预测位姿 = 真位姿（理想情况）
+        const auto matches = tracker.matchGuided(ref_frame, curr_frame, ref_points_s,
+                                                 T_true, 25.0, 0.7);
+        assert(matches.size() >= 90 && "正确预测下窗口匹配应召回 ≥90%");
+        // 匹配的 queryIdx/trainIdx 应对齐（投影噪声小）
+        int aligned = 0;
+        for (const auto& m : matches)
+            if (m.queryIdx == m.trainIdx) aligned++;
+        assert(aligned >= 90 && "投影噪声 1px 内应保持索引对齐");
+    } TEST_PASS();
+
+    TEST("matchGuided: 预测位姿大幅偏离 → 召回骤降（回退全图匹配的依据）") {
+        const vslam::Camera cam = makeMonocular();
+        FrontendTracker tracker(cam);
+
+        auto ref_frame = std::make_shared<Frame>(0, 0.0);
+        cv::RNG rng(0x5A17);
+        std::vector<Vec3> ref_points_s;
+        for (int i = 0; i < 100; i++) {
+            const double u = rng.uniform(80.0, 560.0);
+            const double v = rng.uniform(80.0, 400.0);
+            const double d = rng.uniform(3.0, 10.0);
+            const Vec3 p = cam->pixel2camera(Vec2(u, v), d);
+            ref_points_s.push_back(p);
+            ref_frame->keypoints.emplace_back((float)u, (float)v, 20.0f);
+            cv::Mat desc(1, 32, CV_8U);
+            for (int b = 0; b < 32; b++) desc.at<uchar>(b) = (uchar)rng.uniform(0, 256);
+            ref_frame->descriptors.push_back(desc);
+            ref_frame->map_points.push_back(std::make_shared<vslam::MapPoint>((unsigned long)i));
+        }
+
+        const Eigen::Matrix3d R =
+            Eigen::AngleAxisd(0.0873, Eigen::Vector3d::UnitY()).toRotationMatrix();
+        const SE3 T_true(Eigen::Quaterniond(R), Vec3(0.2, 0.0, 0.3));
+
+        auto curr_frame = std::make_shared<Frame>(1, 0.1);
+        for (size_t i = 0; i < ref_points_s.size(); i++) {
+            const Vec2 px = cam->world2pixel(ref_points_s[i], T_true);
+            curr_frame->keypoints.emplace_back((float)px.x(), (float)px.y(), 20.0f);
+            curr_frame->descriptors.push_back(ref_frame->descriptors.row((int)i));
+        }
+
+        // 预测位姿偏离真值 0.8m（远大于 25px 搜索半径在 5m 深度处的覆盖）
+        const SE3 T_wrong(Eigen::Quaterniond(R), Vec3(1.0, 0.0, 0.3));
+        const auto matches = tracker.matchGuided(ref_frame, curr_frame, ref_points_s,
+                                                 T_wrong, 25.0, 0.7);
+        assert(matches.size() < 30 && "偏离预测必须显著降低窗口匹配召回");
+    } TEST_PASS();
+}
+
+// ============================================================
+// 方案 B：共视图局部地图投影匹配
+// 合成局部地图点（相机前方）→ 用真位姿投影到 curr 帧特征；
+// 部分特征已被首轮占用（occupied）→ 不重复关联。
+// ============================================================
+void test_track_local_map() {
+    TEST("trackLocalMap: 投影补匹配 + occupied 防重复") {
+        const vslam::Camera cam = makeMonocular();
+        FrontendTracker tracker(cam);
+
+        const Eigen::Matrix3d R =
+            Eigen::AngleAxisd(0.05, Eigen::Vector3d::UnitY()).toRotationMatrix();
+        const SE3 T_cs(Eigen::Quaterniond(R), Vec3(0.1, 0.0, 0.2));
+
+        auto curr_frame = std::make_shared<Frame>(1, 0.1);
+        cv::RNG rng(0x5A17);
+        std::vector<Vec3> local_points_s;
+        std::vector<cv::Mat> local_descs;
+        std::vector<vslam::MapPoint::Ptr> local_mps;
+        for (int i = 0; i < 50; i++) {
+            const double u = rng.uniform(100.0, 540.0);
+            const double v = rng.uniform(100.0, 380.0);
+            const double d = rng.uniform(3.0, 10.0);
+            const Vec3 p = cam->pixel2camera(Vec2(u, v), d);
+            local_points_s.push_back(p);
+            local_descs.push_back(cv::Mat(1, 32, CV_8U));
+            for (int b = 0; b < 32; b++)
+                local_descs.back().at<uchar>(b) = (uchar)rng.uniform(0, 256);
+            local_mps.push_back(std::make_shared<vslam::MapPoint>((unsigned long)i));
+        }
+        // curr 帧特征 = 局部点经 T_cs 投影（注意 world2pixel 用 T_cw；此处
+        // T_cs 是子地图局部系 T_cs，语义一致）
+        for (size_t i = 0; i < local_points_s.size(); i++) {
+            const Vec2 px = cam->world2pixel(local_points_s[i], T_cs);
+            curr_frame->keypoints.emplace_back((float)px.x(), (float)px.y(), 20.0f);
+            curr_frame->descriptors.push_back(local_descs[i]);
+        }
+
+        // 前 10 个特征已被首轮占用
+        std::vector<int> occupied;
+        for (int i = 0; i < 10; i++) occupied.push_back(i);
+
+        const auto result = tracker.trackLocalMap(
+            curr_frame, local_points_s, local_descs, local_mps, occupied,
+            T_cs, 30.0, 0.7);
+        assert(result.added >= 35 && "未被占用的局部点应被投影匹配找回");
+        assert(result.pts3d.size() == result.curr_feature_indices.size());
+        assert(result.mps.size() == result.curr_feature_indices.size());
+        for (int ti : result.curr_feature_indices)
+            assert(ti >= 10 && "occupied 特征不得被重复匹配");
+    } TEST_PASS();
+
+    TEST("trackLocalMap: 空描述子/空点 → 空结果") {
+        FrontendTracker tracker(makeMonocular());
+        auto curr_frame = std::make_shared<Frame>(1, 0.1);
+        const auto result = tracker.trackLocalMap(
+            curr_frame, {}, {}, {}, {}, SE3(), 30.0, 0.7);
+        assert(result.added == 0 && result.pts3d.empty());
+    } TEST_PASS();
+}
+
+// ============================================================
+// 方案 B：确定性精修
+// refinePnP 用 solvePnP(iterative + useExtrinsicGuess)，不消耗全局 RNG。
+// 验证：交替调用 trackPnP/refinePnP 与只调 trackPnP 后，全局 RNG 状态
+// 保持一致（确定性等价的前提）。
+// ============================================================
+void test_refine_pnp_deterministic() {
+    TEST("refinePnP: 不消耗全局 RNG（solvePnP iterative 确定性）") {
+        const vslam::Camera cam = makeMonocular();
+        FrontendTracker tracker(cam);
+
+        std::vector<cv::Point3f> pts3d;
+        std::vector<cv::Point2f> pts2d;
+        cv::RNG rng(0x5A17);
+        for (int i = 0; i < 80; i++) {
+            const double u = rng.uniform(60.0, 580.0);
+            const double v = rng.uniform(60.0, 420.0);
+            const double depth = rng.uniform(3.0, 12.0);
+            const Vec3 p = cam->pixel2camera(Vec2(u, v), depth);
+            pts3d.emplace_back((float)p.x(), (float)p.y(), (float)p.z());
+            pts2d.emplace_back((float)u, (float)v);
+        }
+
+        // 参考：只跑 trackPnP（消耗 RNG），读取其后 RNG 状态
+        cv::setRNGSeed(0x5A17);
+        const MotionBaseline motion;
+        (void)tracker.trackPnP(pts3d, pts2d, SE3(), motion, 15, 0.3, 2.5);
+        const unsigned rng_after_track = cv::theRNG().next();
+
+        // 实验：重置后先 refinePnP 再 trackPnP，RNG 状态应仍等于上面
+        cv::setRNGSeed(0x5A17);
+        const SE3 initial(Eigen::Quaterniond::Identity(), Vec3::Zero());
+        (void)tracker.refinePnP(pts3d, pts2d, initial, SE3(), motion,
+                                15, 0.3, 2.5);
+        (void)tracker.trackPnP(pts3d, pts2d, SE3(), motion, 15, 0.3, 2.5);
+        const unsigned rng_after_refine = cv::theRNG().next();
+
+        assert(rng_after_track == rng_after_refine
+               && "refinePnP 不得消耗全局 RNG（否则破坏双实例确定性等价）");
+    } TEST_PASS();
+}
+
 }  // namespace
 
 int main() {
@@ -234,6 +433,9 @@ int main() {
     test_track_pnp_continuity_rejects();
     test_compute_stereo_depths_monocular();
     test_propose_keyframe();
+    test_match_guided_recall();
+    test_track_local_map();
+    test_refine_pnp_deterministic();
 
     std::cout << "全部通过" << std::endl;
     return 0;

@@ -9,6 +9,8 @@
 #include <cmath>
 #include <limits>
 #include <ranges>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace vslam {
 
@@ -108,6 +110,57 @@ TrackingResult FrontendTracker::trackPnP(
     return r;
 }
 
+TrackingResult FrontendTracker::refinePnP(
+    const std::vector<cv::Point3f>& pts3d, const std::vector<cv::Point2f>& pts2d,
+    const SE3& initial_pose_cs, const SE3& T_ws,
+    const MotionBaseline& motion,
+    int min_inliers, double min_ratio, double max_rmse) const {
+    TrackingResult r;
+    if (pts3d.size() < 6) return r;
+
+    // 确定性精修：不重跑 RANSAC（避免消耗全局 RNG，破坏双实例交替驱动的
+    // 确定性等价），而是用首轮位姿作初值做纯迭代优化。solvePnP 的
+    // rvec/tvec 语义与 trackPnP 一致：p_c = R·p_s + t，即 T_cs。
+    const Mat33 R_e = initial_pose_cs.q.toRotationMatrix();
+    cv::Mat R_init(3, 3, CV_64F);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            R_init.at<double>(i, j) = R_e(i, j);
+    cv::Mat rvec_init, tvec_init;
+    cv::Rodrigues(R_init, rvec_init);
+    tvec_init = (cv::Mat_<double>(3, 1) << initial_pose_cs.t.x(),
+                 initial_pose_cs.t.y(), initial_pose_cs.t.z());
+
+    cv::Mat rvec = rvec_init.clone(), tvec = tvec_init.clone();
+    const bool ok = cv::solvePnP(pts3d, pts2d, camera_->K(), cv::Mat(),
+                                 rvec, tvec, true, cv::SOLVEPNP_ITERATIVE);
+    if (!ok) return r;
+
+    cv::Mat R;
+    cv::Rodrigues(rvec, R);
+    const SE3 candidate_pose = Relocalizer::matToSE3(R, tvec);
+    const double rmse = PoseGate::pnpReprojectionRmse(
+        pts3d, pts2d, rvec, tvec, std::vector<int>(pts3d.size()), camera_->K());
+
+    // 与 trackPnP 相同的统一验收（几何 + 连续性）
+    PoseQuality quality;
+    const bool accepted = PoseGate::acceptPoseCandidate(
+        candidate_pose * T_ws.inverse(), (int)pts3d.size(), pts3d.size(), rmse,
+        min_inliers, min_ratio, max_rmse,
+        motion.baseline_twc, motion.max_translation, motion.max_rotation, quality);
+
+    r.inlier_ratio = quality.inlier_ratio;
+    r.pose_rmse = quality.pose_rmse;
+    r.translation_delta = quality.translation;
+    r.rotation_delta = quality.rotation;
+    r.inliers = (int)pts3d.size();   // 确定性精修不筛外点，内点集由调用方提供
+    if (accepted) {
+        r.pose_cs = candidate_pose;
+        r.valid = true;
+    }
+    return r;
+}
+
 RigidResult FrontendTracker::estimateRigid3D3D(
     const std::vector<cv::Point3f>& pts_w, const std::vector<cv::Point3f>& pts_c,
     int min_inliers, double min_ratio) const {
@@ -181,6 +234,175 @@ RigidResult FrontendTracker::estimateRigid3D3D(
     return r;
 }
 
+// ============================================================
+// 方案 A/B 公共：像素网格索引 + 窗口描述子比率匹配
+// ============================================================
+std::vector<std::vector<int>> FrontendTracker::buildKeypointGrid(
+    const Frame::Ptr& frame, double cell_size_px) const {
+    std::vector<std::vector<int>> grid;
+    if (!frame) return grid;
+    const int cell_w = std::max(1, (int)std::ceil(cell_size_px));
+    const int cols = std::max(1, camera_->width() / cell_w + 1);
+    const int rows = std::max(1, camera_->height() / cell_w + 1);
+    grid.resize((size_t)cols * rows);
+    for (size_t i = 0; i < frame->keypoints.size(); i++) {
+        const int cx = (int)frame->keypoints[i].pt.x / cell_w;
+        const int cy = (int)frame->keypoints[i].pt.y / cell_w;
+        if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
+        grid[(size_t)cy * cols + cx].push_back((int)i);
+    }
+    return grid;
+}
+
+bool FrontendTracker::windowRatioMatch(
+    const cv::Mat& query_desc, const cv::Mat& train_desc,
+    const std::vector<int>& candidates,
+    double ratio_thresh, float max_dist, int& best_train_idx, float& best_dist,
+    float& second_dist) const {
+    best_train_idx = -1;
+    best_dist = std::numeric_limits<float>::max();
+    second_dist = std::numeric_limits<float>::max();
+    for (int ti : candidates) {
+        if (ti < 0 || ti >= train_desc.rows) continue;
+        const float d = cv::norm(query_desc, train_desc.row(ti), cv::NORM_HAMMING);
+        if (d < best_dist) {
+            second_dist = best_dist;
+            best_dist = d;
+            best_train_idx = ti;
+        } else if (d < second_dist) {
+            second_dist = d;
+        }
+    }
+    if (best_train_idx < 0) return false;
+    // 绝对距离上限：ORB 256 位描述子的典型匹配距离 < 64（与 quickMatchCount
+    // 默认一致）。窗口匹配不能只靠比率——单候选时无条件接受会把窗口内的
+    // 随机近邻当作匹配，而局部地图精修（refinePnP）不做 RANSAC 外点过滤，
+    // 这类错误对应会直接拉偏位姿。
+    if (best_dist > max_dist) return false;
+    // 候选不足 2 个时退化为最近邻直取（窗口约束 + 距离上限已过滤误匹配）
+    return second_dist == std::numeric_limits<float>::max()
+        || best_dist < ratio_thresh * second_dist;
+}
+
+// ============================================================
+// 方案 A：运动模型引导匹配
+// 用预测位姿把参考帧有 3D 点的特征投影到当前帧，只在投影点邻域内做
+// 描述子比率匹配。相比全图 BF：少误匹配（空间先验）+ 少计算（窗口小）。
+// ============================================================
+std::vector<cv::DMatch> FrontendTracker::matchGuided(
+    const Frame::Ptr& ref_frame, const Frame::Ptr& curr_frame,
+    const std::vector<Vec3>& ref_points_s,
+    const SE3& T_cs_pred, double search_radius_px, double ratio_thresh) const {
+    std::vector<cv::DMatch> matches;
+    if (!ref_frame || !curr_frame || ref_frame->descriptors.empty()
+        || curr_frame->descriptors.empty()) return matches;
+
+    const auto grid = buildKeypointGrid(curr_frame, search_radius_px);
+    const int cell_w = std::max(1, (int)std::ceil(search_radius_px));
+    const int cols = std::max(1, camera_->width() / cell_w + 1);
+    const int rows = std::max(1, camera_->height() / cell_w + 1);
+    const int radius_cells = std::max(1, (int)std::ceil(search_radius_px / cell_w));
+
+    const size_t n = std::min(ref_frame->keypoints.size(), ref_points_s.size());
+    for (size_t qi = 0; qi < n; qi++) {
+        // 只对有 3D 点的特征做引导匹配（无点无法投影，交给全图匹配回退）
+        if (ref_points_s[qi].isZero(1e-12)) continue;
+        const Vec3 p_c = T_cs_pred * ref_points_s[qi];
+        if (p_c.z() <= 0.01) continue;   // 预测位姿下点在相机后方 → 跳过
+        const Vec2 px = camera_->camera2pixel(p_c);
+        if (px.x() < 0 || px.y() < 0 || px.x() >= camera_->width()
+            || px.y() >= camera_->height()) continue;
+        const int gx = (int)px.x() / cell_w;
+        const int gy = (int)px.y() / cell_w;
+
+        // 收集投影点邻域所有格子的候选特征
+        std::vector<int> candidates;
+        candidates.reserve(64);
+        for (int dy = -radius_cells; dy <= radius_cells; dy++) {
+            for (int dx = -radius_cells; dx <= radius_cells; dx++) {
+                const int cx = gx + dx, cy = gy + dy;
+                if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
+                const auto& cell = grid[(size_t)cy * cols + cx];
+                candidates.insert(candidates.end(), cell.begin(), cell.end());
+            }
+        }
+        if (candidates.empty()) continue;
+
+        int best_ti = -1;
+        float best_d = 0.0f, second_d = 0.0f;
+        if (!windowRatioMatch(ref_frame->descriptors.row((int)qi),
+                              curr_frame->descriptors, candidates,
+                              ratio_thresh, 64.0f, best_ti, best_d, second_d))
+            continue;
+        matches.emplace_back((int)qi, best_ti, best_d);
+    }
+    return matches;
+}
+
+// ============================================================
+// 方案 B：共视图局部地图投影匹配
+// 首轮 PnP 成功后，把参考 KF 共视的地图点投影进当前帧补匹配，扩大
+// 3D-2D 对应集（特征稀疏/视角变化大时保住 PnP）。
+// ============================================================
+LocalMapTrackResult FrontendTracker::trackLocalMap(
+    const Frame::Ptr& curr_frame,
+    const std::vector<Vec3>& local_points_s,
+    const std::vector<cv::Mat>& local_descs,
+    const std::vector<MapPoint::Ptr>& local_mps,
+    const std::vector<int>& occupied_features,
+    const SE3& T_cs, double search_radius_px, double ratio_thresh) const {
+    LocalMapTrackResult result;
+    if (!curr_frame || curr_frame->descriptors.empty()
+        || local_points_s.size() != local_descs.size()
+        || local_points_s.size() != local_mps.size()) return result;
+
+    std::unordered_set<int> occupied(occupied_features.begin(), occupied_features.end());
+    const auto grid = buildKeypointGrid(curr_frame, search_radius_px);
+    const int cell_w = std::max(1, (int)std::ceil(search_radius_px));
+    const int cols = std::max(1, camera_->width() / cell_w + 1);
+    const int rows = std::max(1, camera_->height() / cell_w + 1);
+    const int radius_cells = std::max(1, (int)std::ceil(search_radius_px / cell_w));
+
+    for (size_t pi = 0; pi < local_points_s.size(); pi++) {
+        const Vec3 p_c = T_cs * local_points_s[pi];
+        if (p_c.z() <= 0.01) continue;
+        const Vec2 px = camera_->camera2pixel(p_c);
+        if (px.x() < 0 || px.y() < 0 || px.x() >= camera_->width()
+            || px.y() >= camera_->height()) continue;
+        const int gx = (int)px.x() / cell_w;
+        const int gy = (int)px.y() / cell_w;
+
+        std::vector<int> candidates;
+        candidates.reserve(64);
+        for (int dy = -radius_cells; dy <= radius_cells; dy++) {
+            for (int dx = -radius_cells; dx <= radius_cells; dx++) {
+                const int cx = gx + dx, cy = gy + dy;
+                if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
+                const auto& cell = grid[(size_t)cy * cols + cx];
+                candidates.insert(candidates.end(), cell.begin(), cell.end());
+            }
+        }
+        // 剔除已被首轮匹配占用的特征（同一特征不能关联两个 3D 点）
+        std::erase_if(candidates, [&](int ti) { return occupied.contains(ti); });
+        if (candidates.empty()) continue;
+
+        int best_ti = -1;
+        float best_d = 0.0f, second_d = 0.0f;
+        if (!windowRatioMatch(local_descs[pi], curr_frame->descriptors,
+                              candidates, ratio_thresh, 64.0f,
+                              best_ti, best_d, second_d))
+            continue;
+        const Vec3& p = local_points_s[pi];
+        result.pts3d.emplace_back((float)p.x(), (float)p.y(), (float)p.z());
+        result.pts2d.emplace_back(curr_frame->keypoints[best_ti].pt);
+        result.mps.push_back(local_mps[pi]);
+        result.curr_feature_indices.push_back(best_ti);
+        occupied.insert(best_ti);
+        result.added++;
+    }
+    return result;
+}
+
 TrackingResult FrontendTracker::trackOrb(
     const Frame::Ptr& curr_frame, const Frame::Ptr& ref_frame,
     const RefView& ref, const MotionBaseline& motion,
@@ -189,7 +411,21 @@ TrackingResult FrontendTracker::trackOrb(
 
     // 跟踪匹配不做基础矩阵 RANSAC（省时，且避免共面场景 F 矩阵退化误剔）：
     // 外点交给下方 solvePnPRansac 自己剔除；仅初始化/回退分支保留 F 矩阵 RANSAC
-    auto matches = matcher_.match(ref_frame, curr_frame, cfg_.match_ratio, false);
+    // 方案 A：有预测位姿且配置开启时先走运动模型引导匹配（投影邻域内搜索），
+    // 匹配数不足说明预测失效/视角变化大，回退全图 BF（与旧行为一致）。
+    std::vector<cv::DMatch> matches;
+    if (cfg_.guided_match && ref.has_ref && motion.predicted_pose_cs) {
+        matches = matchGuided(ref_frame, curr_frame, ref.ref_points_s,
+                              *motion.predicted_pose_cs,
+                              cfg_.guided_search_radius_px, cfg_.match_ratio);
+        if ((int)matches.size() < cfg_.min_matches_track) {
+            LOG_WARN("Guided match degraded (" << matches.size()
+                     << "), fallback to full BF");
+            matches = matcher_.match(ref_frame, curr_frame, cfg_.match_ratio, false);
+        }
+    } else {
+        matches = matcher_.match(ref_frame, curr_frame, cfg_.match_ratio, false);
+    }
 
     // 收集 3D-2D 对应（保留 pts3d[i] 与 matches 的映射，供内点观测计数）
     std::vector<cv::Point3f> pts3d;
@@ -225,8 +461,14 @@ TrackingResult FrontendTracker::trackOrb(
             // 位姿通过全部质量检查后才关联地图点，避免被拒绝的解污染共视统计。
             for (int idx : pnp.pnp_inlier_indices) {
                 if (idx < 0 || idx >= (int)match_idx.size()) continue;
-                auto& mp = ref.ref_mps[matches[match_idx[idx]].queryIdx];
-                if (mp) r.associations.emplace_back(matches[match_idx[idx]].trainIdx, mp);
+                const auto& m = matches[match_idx[idx]];
+                auto& mp = ref.ref_mps[m.queryIdx];
+                if (mp) {
+                    r.associations.emplace_back(m.trainIdx, mp);
+                    // 快照坐标与关联逐位对齐（refine 等后续步骤必须用快照，
+                    // 不能读 live mp->pos_s——后端 BA 可能已改写）
+                    r.association_points_s.push_back(ref.ref_points_s[m.queryIdx]);
+                }
             }
         } else {
             r.inliers = 0;
@@ -285,8 +527,13 @@ TrackingResult FrontendTracker::trackOrb(
                     for (size_t i = 0; i < rigid.inlier_mask.size() && i < idx3.size(); i++) {
                         if (!rigid.inlier_mask[i]) continue;
                         const int k = idx3[i];
-                        auto& mp = ref.ref_mps[matches[k].queryIdx];
-                        if (mp) r.associations.emplace_back(matches[k].trainIdx, mp);
+                        const auto& m = matches[k];
+                        auto& mp = ref.ref_mps[m.queryIdx];
+                        if (mp) {
+                            r.associations.emplace_back(m.trainIdx, mp);
+                            r.association_points_s.push_back(
+                                ref.ref_points_s[m.queryIdx]);
+                        }
                     }
                 }
             }

@@ -37,6 +37,12 @@ Vec2 CameraBase::world2pixel(const Vec3& p_w, const SE3& T_cw) const {
                 fy * p_c.y() * inv_z + cy);
 }
 
+Vec2 CameraBase::camera2pixel(const Vec3& p_c) const {
+    double inv_z = 1.0 / p_c.z();
+    return Vec2(fx * p_c.x() * inv_z + cx,
+                fy * p_c.y() * inv_z + cy);
+}
+
 Vec3 CameraBase::pixel2camera(const Vec2& pixel, double depth) const {
     return Vec3((pixel.x() - cx) / fx * depth,
                 (pixel.y() - cy) / fy * depth,

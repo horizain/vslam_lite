@@ -1609,3 +1609,52 @@ L2 门限全过，500 帧×3 轮 latency_p99≈25ms、valid_ratio=1.0）。旧 `
 子地图重建路径会破坏 §11.4 的"连续有效帧非物理跳变 = 0"。这些正是 M3（鲁棒性/连续性）
 与 M5（回环/重定位）要收敛的目标，当前按 M0/M1 阶段如实记录；提交门快速档（500 帧×3
 轮）不受影响，继续通过。
+
+### 3.34 前端跟踪增强：运动模型引导匹配 + 共视图局部地图投影（2026-08-10）
+
+在 fe/guided-localmap 分支落地两个纯前端改进（不碰 Map/BA/回环，符合 M1.4
+FrontendTracker 只输出结果的职责边界）：
+
+**方案 A 运动模型引导匹配**：`MotionBaseline` 携带匀速模型预测位姿
+（`per_frame_motion_` 外推，vo.cpp normalMotionBaseline），`FrontendTracker::matchGuided`
+把参考帧有 3D 点的特征投影到当前帧，在投影点邻域网格桶内做描述子比率匹配；
+匹配数不足自动回退全图 BF。收益：空间先验减少误匹配 + 窗口搜索替代全图匹配。
+
+**方案 B 共视图局部地图投影匹配**：快照（captureTrackingSnapshot）按（参考 KF id,
+geometry revision）缓存参考 KF 及其共视 KF 的地图点（去重、预算上限、descriptor 非空
+过滤）；`trackLocalMap` 用首轮 PnP 位姿投影局部点、窗口匹配补 3D-2D 对应；
+`refinePnP`（solvePnP iterative + useExtrinsicGuess）确定性精修——不重跑 RANSAC，
+避免额外消耗全局 RNG 破坏双实例交替驱动的确定性等价（test_localizer_contract 逐位
+一致的前提）。
+
+**修复过程中发现并解决的三个问题**（均写入代码注释）：
+1. **快照约定**：refine 首轮对应必须用 trackOrb 返回的版本绑定快照坐标
+   （`TrackingResult::association_points_s`），不能读 live `mp->pos_s`——后端 BA
+   改写坐标会污染精修（等价性测试 3e-8 rad 分叉的直接根因）。
+2. **窗口匹配距离上限**：单候选时无条件接受会把窗口内随机近邻当匹配，而精修无
+   RANSAC 外点过滤 → 加绝对距离上限（与 quickMatchCount 默认 64 一致）。
+3. **精修前确定性重投影筛选**：窗口匹配只保证描述子相似不保证几何一致；地图膨胀
+   后错配率上升，全量最小二乘被拉偏（完整 KITTI 00 无筛选时长度比 1.04 → 1.12、
+   ATE 恶化）。用首轮位姿投影剔除重投影误差 > ransac_pixel_threshold 的对应。
+
+**验证（KITTI 00，功能开 vs 关）**：
+
+| 配置 | 轨迹长度比 | ATE RMSE | 回环数 |
+|---|---|---|---|
+| deterministic 关（基线） | 1.038 | 42.9m | 1 |
+| deterministic 开（最终） | **1.0003** | **16.1m** | **4** |
+| default 关（基线） | 1.061 | 38.7m | 2 |
+| default 开（最终） | **1.003** | **26.9m** | 2 |
+| 前 1000 帧（deterministic） | - | 9.1m → **7.9m** | - |
+
+轨迹长度比从 ~1.04 收敛到 ~1.000（双目绝对尺度几乎无漂移），完整序列 ATE 降
+~38-63%。参数均为通用默认值（25px/30px 搜索半径、400 点预算、64 描述子距离上限），
+合成测试覆盖召回/回退/occupied 防重复/RNG 确定性，无数据集特化。
+
+**变更**：camera2pixel、FrontendTracker::matchGuided/trackLocalMap/refinePnP/
+buildKeypointGrid/windowRatioMatch、TrackingResult::association_points_s、快照局部
+地图缓存、VOConfig/TrackerConfig 新字段、config 新参数、test_frontend_tracker 新增
+5 项测试、L1 参考随行为变更更新（benchmark_gate --update-reference）。
+
+**验收**：ctest 9/9 全过（含新增 test_frontend_tracker 5 项）；benchmark_gate 提交门
+PASSED（L1 参考更新后 L0+L1+L2 快速档全绿）。

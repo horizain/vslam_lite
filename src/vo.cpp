@@ -42,6 +42,12 @@ TrackerConfig buildTrackerConfig(const VOConfig& cfg) {
     tc.rigid_min_inlier_ratio = cfg.rigid_min_inlier_ratio;
     tc.rigid_ransac_threshold = cfg.rigid_ransac_threshold;
     tc.rigid_max_rmse = cfg.rigid_max_rmse;
+    tc.guided_match = cfg.guided_match;
+    tc.guided_search_radius_px = cfg.guided_search_radius_px;
+    tc.local_map_tracking = cfg.local_map_tracking;
+    tc.local_map_min_shared = cfg.local_map_min_shared;
+    tc.local_map_max_points = cfg.local_map_max_points;
+    tc.local_map_search_radius_px = cfg.local_map_search_radius_px;
     tc.keyframe_translation = cfg.keyframe_translation;
     tc.keyframe_translation_stereo = cfg.keyframe_translation_stereo;
     tc.keyframe_max_count = cfg.keyframe_max_count;
@@ -214,6 +220,12 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (v["keyframe_max_count"])   cfg.keyframe_max_count   = v["keyframe_max_count"].as<int>();
             if (v["min_keyframe_interval"]) cfg.min_keyframe_interval = v["min_keyframe_interval"].as<int>();
             if (v["max_keyframe_interval"]) cfg.max_keyframe_interval = v["max_keyframe_interval"].as<int>();
+            if (v["guided_match"])             cfg.guided_match            = v["guided_match"].as<bool>();
+            if (v["guided_search_radius_px"])  cfg.guided_search_radius_px = v["guided_search_radius_px"].as<double>();
+            if (v["local_map_tracking"])       cfg.local_map_tracking      = v["local_map_tracking"].as<bool>();
+            if (v["local_map_min_shared"])     cfg.local_map_min_shared    = v["local_map_min_shared"].as<int>();
+            if (v["local_map_max_points"])     cfg.local_map_max_points    = v["local_map_max_points"].as<int>();
+            if (v["local_map_search_radius_px"]) cfg.local_map_search_radius_px = v["local_map_search_radius_px"].as<double>();
         }
         if (auto o = root["Optimizer"]) {
             if (o["local_window_size"])   cfg.local_window_size   = o["local_window_size"].as<int>();
@@ -1022,10 +1034,97 @@ SE3 VisualOdometry::trackFrame() {
     ref.T_ws = snap_.T_ws;
     ref.ref_points_s = snap_.ref_points_s;
     ref.ref_mps = snap_.ref_mps;
+    // 方案 B：共视图局部地图（锁内快照拷贝，前端只消费拷贝）
+    ref.local_points_s = snap_.local_points_s;
+    ref.local_descs = snap_.local_descs;
+    ref.local_mps = snap_.local_mps;
     const StereoStats stereo{status_.stereo_points, status_.median_disparity,
                              status_.median_depth};
-    const TrackingResult r = frontend_tracker_.trackOrb(
+    TrackingResult r = frontend_tracker_.trackOrb(
         curr_frame_, ref_frame_, ref, normalMotionBaseline(), stereo);
+
+    // ---- 方案 B：局部地图投影补匹配 + 精修位姿 ----
+    // 首轮 PnP 成功后，把参考 KF 共视的地图点投影进当前帧补充 3D-2D 对应，
+    // 合并后重跑 PnP：新增对应 > 阈值且内点数不减时才采纳（外点交给
+    // solvePnPRansac 过滤；连续性验收由 PoseGate 复用正常跟踪门限）。
+    if (r.valid && cfg_.local_map_tracking
+        && !snap_.local_mps.empty() && !snap_.local_points_s.empty()) {
+        std::vector<int> occupied;
+        occupied.reserve(r.associations.size());
+        for (const auto& [train_idx, mp] : r.associations)
+            occupied.push_back(train_idx);
+        const LocalMapTrackResult local = frontend_tracker_.trackLocalMap(
+            curr_frame_, snap_.local_points_s, snap_.local_descs,
+            snap_.local_mps, occupied, r.pose_cs,
+            cfg_.local_map_search_radius_px, cfg_.match_ratio);
+        if (local.added >= 8) {
+            // 合并首轮 3D-2D 与局部地图新增对应，做确定性位姿精修。
+            // 首轮对应必须用 trackOrb 返回的版本绑定快照坐标（association_points_s），
+            // 不能读 live mp->pos_s——后端 BA 可能已改写坐标，违反快照约定。
+            // 精修用 refinePnP（solvePnP iterative + useExtrinsicGuess），
+            // 不重跑 RANSAC：避免额外消耗全局 RNG 破坏双实例交替驱动的
+            // 确定性等价（test_localizer_contract），也避免内点集抖动。
+            std::vector<cv::Point3f> pts3d = local.pts3d;
+            std::vector<cv::Point2f> pts2d = local.pts2d;
+            std::vector<char> keep_local(pts3d.size(), 0);
+            for (size_t k = 0; k < r.associations.size(); k++) {
+                const auto& [train_idx, mp] = r.associations[k];
+                (void)mp;
+                if (k >= r.association_points_s.size()
+                    || train_idx < 0
+                    || train_idx >= (int)curr_frame_->keypoints.size()) continue;
+                const Vec3& p_s = r.association_points_s[k];
+                pts3d.emplace_back((float)p_s.x(), (float)p_s.y(), (float)p_s.z());
+                pts2d.push_back(curr_frame_->keypoints[train_idx].pt);
+            }
+            // 确定性外点筛选：用首轮位姿投影，剔除重投影误差过大的对应。
+            // 窗口匹配只保证"描述子相似"，不保证"几何一致"——局部地图点
+            // 坐标陈旧或首轮位姿有误差时，投影到错误位置附近碰巧匹配到
+            // 相似描述子的概率随地图膨胀上升；refinePnP 是全量最小二乘
+            //（无 RANSAC），这类错配会直接拉偏位姿（完整 KITTI 00 实测
+            // 无筛选时轨迹长度比 1.04 → 1.12、ATE 恶化）。筛选保持确定性
+            //（不消耗 RNG），阈值沿用 PnP RANSAC 像素阈值，非数据集特化。
+            std::vector<cv::Point3f> pts3d_f;
+            std::vector<cv::Point2f> pts2d_f;
+            std::vector<char> keep_all(pts3d.size(), 0);
+            for (size_t i = 0; i < pts3d.size(); i++) {
+                const Vec3 p_c = r.pose_cs * Vec3(pts3d[i].x, pts3d[i].y, pts3d[i].z);
+                if (p_c.z() <= 0.01) continue;
+                const Vec2 px = camera_->camera2pixel(p_c);
+                const Vec2 obs(pts2d[i].x, pts2d[i].y);
+                if ((px - obs).norm() > cfg_.ransac_pixel_threshold) continue;
+                pts3d_f.push_back(pts3d[i]);
+                pts2d_f.push_back(pts2d[i]);
+                keep_all[i] = 1;
+            }
+            if (pts3d_f.size() < 6) {
+                LOG_WARN("Local map refine: reprojection filter too few (" << pts3d_f.size() << ")");
+            } else {
+                const TrackingResult refined = frontend_tracker_.refinePnP(
+                    pts3d_f, pts2d_f, r.pose_cs, snap_.T_ws, normalMotionBaseline(),
+                    cfg_.pnp_min_inliers, cfg_.pnp_min_inlier_ratio, cfg_.pnp_max_rmse);
+                if (refined.valid && refined.inliers >= r.inliers) {
+                    LOG_INFO("Local map refine: +" << local.added
+                             << " corr, kept " << pts3d_f.size()
+                             << " after filter, inliers " << r.inliers
+                             << " -> " << refined.inliers);
+                    r.pose_cs = refined.pose_cs;
+                    r.inliers = refined.inliers;
+                    r.inlier_ratio = refined.inlier_ratio;
+                    r.pose_rmse = refined.pose_rmse;
+                    r.translation_delta = refined.translation_delta;
+                    r.rotation_delta = refined.rotation_delta;
+                    // 关联通过重投影筛选的局部地图新增匹配（合并集靠前 = local 部分）
+                    for (size_t i = 0; i < keep_local.size(); i++) {
+                        if (!keep_local[i] || !keep_all[i]) continue;
+                        const int ti = local.curr_feature_indices[i];
+                        if (ti >= 0 && ti < (int)curr_frame_->map_points.size())
+                            curr_frame_->map_points[ti] = local.mps[i];
+                    }
+                }
+            }
+        }
+    }
 
     // 应用结果（与旧内联逻辑逐项等价）
     curr_frame_->pose_cs = r.pose_cs;
@@ -1054,6 +1153,16 @@ MotionBaseline VisualOdometry::normalMotionBaseline() const {
         motion.baseline_twc = last_valid_pose_world_.inverse();
         motion.max_translation = cfg_.max_frame_translation;
         motion.max_rotation = cfg_.max_frame_rotation;
+    }
+    // 方案 A：匀速模型预测当前帧位姿（子地图局部系 T_cs）。
+    // X_cur = X_last · per_frame_motion_（X 为世界系 T_wc）→
+    // T_cs_pred = X_cur⁻¹ · T_ws = per_frame_motion_⁻¹ · X_last⁻¹ · T_ws。
+    // 单目尺度归一化下 per_frame_motion_ 仍可作投影先验（引导匹配只是
+    // 缩小搜索窗口，预测不准时前端自动回退全图 BF），故不限制传感器。
+    if (has_per_frame_motion_) {
+        const SE3 X_last = last_valid_pose_world_.inverse();
+        const SE3 X_pred = X_last * per_frame_motion_;
+        motion.predicted_pose_cs = X_pred.inverse() * snap_.T_ws;
     }
     return motion;
 }
@@ -1827,7 +1936,7 @@ Frame::Ptr VisualOdometry::snapshotFrame(
 // ============================================================
 // M2：前端只读快照
 // ============================================================
-VisualOdometry::TrackingSnapshot VisualOdometry::captureTrackingSnapshot() const {
+VisualOdometry::TrackingSnapshot VisualOdometry::captureTrackingSnapshot() {
     TrackingSnapshot snap;
     snap.map = map_;
     snap.topology_revision = map_->topologyRevision();
@@ -1844,6 +1953,46 @@ VisualOdometry::TrackingSnapshot VisualOdometry::captureTrackingSnapshot() const
         for (size_t i = 0; i < ref_frame_->map_points.size(); i++) {
             if (ref_frame_->map_points[i])
                 snap.ref_points_s[i] = ref_frame_->map_points[i]->pos_s;
+        }
+
+        // ---- 方案 B：共视图局部地图（按 ref KF + 几何版本缓存）----
+        // covisibleKeyframes 是 O(KF²) 全量扫描；只在参考 KF 或几何版本
+        // 变化时重收集（后端 BA/回环提交会 bumpGeometry，缓存自动失效）。
+        // 点预算按共视降序截断，避免大图上每帧拷贝全部点。
+        snap.local_map_kf_id = ref_frame_->id;
+        if (cfg_.local_map_tracking &&
+            (snap_local_map_kf_id_ != ref_frame_->id ||
+             snap_local_map_geo_rev_ != map_->geometryRevision())) {
+            snap_local_map_kf_id_ = ref_frame_->id;
+            snap_local_map_geo_rev_ = map_->geometryRevision();
+            snap_local_points_s_.clear();
+            snap_local_descs_.clear();
+            snap_local_mps_.clear();
+            std::unordered_set<MapPointId> seen;
+            auto add_local_point = [&](const MapPoint::Ptr& mp) {
+                if (!mp || mp->descriptor.empty()) return;
+                if (!seen.insert(mp->id).second) return;   // 去重（共视 KF 共享点）
+                if ((int)snap_local_mps_.size() >= cfg_.local_map_max_points) return;
+                snap_local_points_s_.push_back(mp->pos_s);
+                snap_local_descs_.push_back(mp->descriptor.clone());
+                snap_local_mps_.push_back(mp);
+            };
+            // 参考 KF 自身的点优先（与 ref 跟踪同源，最可信）
+            for (const auto& mp : ref_frame_->map_points) add_local_point(mp);
+            // 再按共视点数降序补充共视 KF 的点
+            for (const auto& cov : map_->covisibleKeyframes(
+                     ref_frame_->id, (size_t)cfg_.local_map_min_shared)) {
+                if ((int)snap_local_mps_.size() >= cfg_.local_map_max_points) break;
+                const auto kf = map_->getKeyFrame(cov.keyframe_id);
+                if (!kf || kf.get() == ref_frame_.get()) continue;
+                for (const auto& mp : kf->map_points) add_local_point(mp);
+            }
+        }
+        if (cfg_.local_map_tracking &&
+            snap_local_map_kf_id_ == ref_frame_->id) {
+            snap.local_points_s = snap_local_points_s_;
+            snap.local_descs = snap_local_descs_;
+            snap.local_mps = snap_local_mps_;
         }
     }
     return snap;

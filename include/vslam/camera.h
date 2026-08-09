@@ -52,6 +52,8 @@ public:
 
     /// 世界坐标 → 主目（左目）像素坐标
     Vec2 world2pixel(const Vec3& p_w, const SE3& T_cw) const;
+    /// 相机系 3D 点 → 主目像素（z ≤ 0 时返回越界像素，由调用方过滤）
+    Vec2 camera2pixel(const Vec3& p_c) const;
     /// 主目像素 → 归一化相机坐标（z = depth）
     Vec3 pixel2camera(const Vec2& pixel, double depth = 1.0) const;
 
