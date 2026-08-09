@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0 完成 + M1.1~M1.3 + 基准方案 §3.25-3.32）
+> 最后更新: 2026-08-08（M0 完成 + M1.1~M1.4 + 基准方案 §3.25-3.33）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1542,7 +1542,38 @@ L2 门限全过，500 帧×3 轮 latency_p99≈25ms、valid_ratio=1.0）。旧 `
   优先级变更（LoopClosure 优先）未引入退化；仍在门限的 ate_rmse/std、jumps_10m、
   submap_reinit 与 §3.30 一致，属 M3/M5 收敛目标。
 
-下一任务：M1.4 FrontendTracker。
+### 3.33 M1.4 FrontendTracker 拆分（2026-08-08）
+
+按 §5.1/§5.5 把前端跟踪计算从 vo.cpp 提取到独立 `FrontendTracker`
+（`frontend_tracker.{h,cpp}`，行为保持不变）：
+
+- **新增值对象**：`TrackerConfig`（VOConfig 跟踪字段快照）、`TrackingResult`
+  （pose/valid/method/matches/inliers/质量/associations/recovering）、
+  `KeyframeProposal`、`RefView`（帧首快照参考数据）、`MotionBaseline`、
+  `StereoStats`、`RigidResult`。
+- **迁移的算法**（公式/门限/顺序逐行不变）：
+  - `computeStereoDepths` → `FrontendTracker::computeStereoDepths`
+    （返回 StereoStats，VO 应用深度统计）；
+  - PnP 核心（solvePnPRansac + PoseGate 验收）→ `trackPnP`（ORB/LK 共用）；
+  - 3D-3D Kabsch → `estimateRigid3D3D`（纯几何，暴露可测）；
+  - ORB 跟踪全流程（匹配 → PnP → 3D-3D → 对极回退 → RECOVERING）→ `trackOrb`；
+  - 关键帧判定 → `proposeKeyFrame`。
+- **职责边界**（§5.5）：FrontendTracker 只输出结果，不写 Map/Atlas、不执行
+  BA/回环、不创建线程；VO 负责构造查询（快照 + 运动基线）与应用结果
+  （位姿/关联/status_/state_）。运动基线提取为 `normalMotionBaseline()`，
+  与 acceptPose 正常跟踪分支同一规则。
+- 测试 `test_frontend_tracker.cpp`（6 项）：3D-3D 已知变换恢复/点数不足、
+  trackPnP identity 恢复/连续性拒绝、单目深度边界、关键帧提议四种触发。
+
+**验收**：
+- CTest 9/9 全过（新增 test_frontend_tracker 独立 CTest）。
+- §5.6 确定性：KITTI 00 前 1000 帧轨迹逐位一致（max_translation_diff=0 m、
+  max_rotation_diff=5.5e-17 rad）、状态序列 1000 行一致。
+- 完整基准复测（default.yaml × 5 轮 + GT）：ATE RMSE mean 41.5m（§3.30 46.8m）、
+  FPS 43.3、latency p99 54.5ms、valid_ratio 0.9899——无退化且精度略好；
+  仍在门限的 ate_rmse/std、jumps_10m、submap_reinit 与 §3.30 一致，属 M3/M5 目标。
+
+下一任务：M1.5 LocalMapper。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 

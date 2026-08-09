@@ -10,6 +10,7 @@
 #include "vslam/optimizer.h"
 #include "vslam/backend_committer.h"
 #include "vslam/backend_scheduler.h"
+#include "vslam/frontend_tracker.h"
 #include "vslam/pose_gate.h"
 #include "vslam/relocalizer.h"
 #include <atomic>
@@ -278,7 +279,12 @@ private:
     bool solveAtlasConstraints();
     /// M1.1：跟踪/重定位共用的运动连续性已迁移至 PoseGate::checkMotionContinuity。
     /// 双目/RGB-D：为当前帧的每个特征点计算相机系 3D 观测 pts_c
+    /// （M1.4：转调 FrontendTracker::computeStereoDepths 后应用深度统计）
     void computeStereoDepths();
+    /// M1.4：正常跟踪的运动基线（世界系 T_wc = 上一有效位姿，门限
+    /// max_frame_translation/rotation），与 acceptPose 的正常跟踪基线同一规则；
+    /// 单目/无上一有效位姿 → 空基线（跳过连续性）。
+    [[nodiscard]] MotionBaseline normalMotionBaseline() const;
     /// 双目/RGB-D：从当前帧 pts_c 直接创建地图点（单帧绝对尺度建点）
     void createMapPointsFromStereo(const Frame::Ptr& frame);
     /// M4：组合锚定轨迹为世界系 T_cw（getPoseTrajectory 的实现；
@@ -287,12 +293,12 @@ private:
     /// 组合单条锚定记录为世界位姿（调用方必须已持 map_mutex_ 读/写锁）
     SE3 composeRecordWorld(const FramePoseRecord& rec) const;
     bool tryInitialize();
+    /// M1.4：ORB 跟踪转调 FrontendTracker::trackOrb（匹配 → PnP → 3D-3D →
+    /// 对极回退 → RECOVERING），只负责应用 TrackingResult（位姿/关联/状态）
     SE3 trackFrame();
-    /// LK 光流跟踪（feature_method=1）：基于索引对齐的 map_points 做 PnP，失败回退 ORB
+    /// LK 光流跟踪（feature_method=1）：基于索引对齐的 map_points 做 PnP，失败回退 ORB。
+    /// M1.4：PnP 核心转调 FrontendTracker::trackPnP
     SE3 trackFrameLK();
-    /// 双目/RGB-D：3D-3D 位姿估计（ref 世界系点 vs 当前帧 pts_c，绝对尺度、旋转鲁棒）。
-    /// PnP 失败或旋转-平移歧义（假平移跳变）时使用；成功返回 true 并写入 pose_cs
-    bool tryTrack3D3D(const std::vector<cv::DMatch>& matches);
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
     /// 子地图重建成功后与历史轨迹做 Umeyama 刚体对齐（双目），
@@ -373,6 +379,9 @@ private:
     FeatureMatcher feature_matcher_;
     /// M1.2：重定位候选几何验证（tryRelocalize 转调；只返回结果，不提交）
     Relocalizer relocalizer_;
+    /// M1.4：前端跟踪（ORB/LK/PnP/3D-3D/双目深度/关键帧提议；§5.5，
+    /// 只输出 TrackingResult/KeyframeProposal，不写地图/不执行 BA/回环）
+    FrontendTracker frontend_tracker_;
 
     // 轨迹记录（M4）：锚定关键帧 + 局部运动，世界位姿读时组合。
     // 回环校正/子地图对齐只更新锚点，轨迹自动跟随，无需全量插值重写。

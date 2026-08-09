@@ -19,6 +19,39 @@ namespace vslam {
 
 namespace {
 
+/// M1.4：从 VOConfig 快照跟踪相关字段到 FrontendTracker 配置
+///（构造函数调用一次；运行期 cfg_ 的跟踪字段不改变，快照一致）
+TrackerConfig buildTrackerConfig(const VOConfig& cfg) {
+    TrackerConfig tc;
+    tc.num_features = cfg.num_features;
+    tc.scale_factor = cfg.scale_factor;
+    tc.pyramid_levels = cfg.pyramid_levels;
+    tc.orb_max_bands = cfg.orb_max_bands;
+    tc.match_ratio = cfg.match_ratio;
+    tc.ransac_pixel_threshold = cfg.ransac_pixel_threshold;
+    tc.min_matches_track = cfg.min_matches_track;
+    tc.pnp_min_inliers = cfg.pnp_min_inliers;
+    tc.pnp_min_inlier_ratio = cfg.pnp_min_inlier_ratio;
+    tc.pnp_max_rmse = cfg.pnp_max_rmse;
+    tc.max_frame_translation = cfg.max_frame_translation;
+    tc.max_frame_rotation = cfg.max_frame_rotation;
+    tc.stereo_min_depth = cfg.stereo_min_depth;
+    tc.stereo_max_depth = cfg.stereo_max_depth;
+    tc.stereo_min_points = cfg.stereo_min_points;
+    tc.rigid_min_inliers = cfg.rigid_min_inliers;
+    tc.rigid_min_inlier_ratio = cfg.rigid_min_inlier_ratio;
+    tc.rigid_ransac_threshold = cfg.rigid_ransac_threshold;
+    tc.rigid_max_rmse = cfg.rigid_max_rmse;
+    tc.keyframe_translation = cfg.keyframe_translation;
+    tc.keyframe_translation_stereo = cfg.keyframe_translation_stereo;
+    tc.keyframe_max_count = cfg.keyframe_max_count;
+    tc.keyframe_rotation = cfg.keyframe_rotation;
+    tc.keyframe_min_inliers = cfg.keyframe_min_inliers;
+    tc.min_keyframe_interval = cfg.min_keyframe_interval;
+    tc.max_keyframe_interval = cfg.max_keyframe_interval;
+    return tc;
+}
+
 bool triangulateNormalizedPoint(const Vec2& p1, const Vec2& p2,
                                 const Mat33& R, const Vec3& t,
                                 Vec3& point_c1) {
@@ -228,6 +261,7 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
     : camera_(camera), cfg_(cfg), atlas_(std::make_shared<Atlas>()),
       relocalizer_(camera, cfg.num_features, cfg.scale_factor,
                    cfg.pyramid_levels, cfg.orb_max_bands),
+      frontend_tracker_(camera, buildTrackerConfig(cfg)),
       backend_scheduler_([this](BackendTask& task) { runBackendTask(task); }) {
     map_ = atlas_->createSubmap(SE3()).map;
     if (cfg_.opencv_threads > 0) {
@@ -501,54 +535,12 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
 // 双目/RGB-D 深度计算：视差（或深度）→ pts_c
 // ============================================================
 void VisualOdometry::computeStereoDepths() {
-    curr_frame_->pts_c.clear();
-    curr_frame_->pts_c.resize(curr_frame_->keypoints.size(), Vec3::Zero());
-    // 单目：无单帧深度，pts_c 全部无效（走多帧三角化）
-    if (!camera_->hasPerFrameDepth() || curr_frame_->image_right.empty()) return;
-
-    // 双目匹配用原始灰度（非 CLAHE）：CLAHE 是内容相关的非线性增强，
-    // 左右目同一 3D 点的局部直方图不同 → 灰度不一致 → 破坏光度一致性，
-    // 显著降低 LK 左右目匹配质量。
-    cv::Mat left_raw, right_raw;
-    if (curr_frame_->image.channels() == 3)
-        cv::cvtColor(curr_frame_->image, left_raw, cv::COLOR_BGR2GRAY);
-    else
-        left_raw = curr_frame_->image;
-    if (curr_frame_->image_right.channels() == 3)
-        cv::cvtColor(curr_frame_->image_right, right_raw, cv::COLOR_BGR2GRAY);
-    else
-        right_raw = curr_frame_->image_right;
-
-    std::vector<cv::Point2f> right_pts;
-    auto status = feature_matcher_.matchStereo(
-        left_raw, right_raw,
-        curr_frame_->keypoints, right_pts);
-
-    std::vector<double> disparities;
-    std::vector<double> depths;
-    disparities.reserve(status.size());
-    depths.reserve(status.size());
-    for (size_t i = 0; i < status.size() && i < curr_frame_->keypoints.size(); i++) {
-        if (!status[i]) continue;
-        double disparity = curr_frame_->keypoints[i].pt.x - right_pts[i].x;
-        const double min_disparity = camera_->fx * camera_->baseline() / cfg_.stereo_max_depth;
-        const double max_disparity = camera_->fx * camera_->baseline() / cfg_.stereo_min_depth;
-        if (disparity < min_disparity || disparity > max_disparity) continue;
-        double depth = camera_->fx * camera_->baseline() / disparity;  // z = fx*b/d
-        if (depth < cfg_.stereo_min_depth || depth > cfg_.stereo_max_depth) continue;
-        curr_frame_->pts_c[i] = camera_->pixel2camera(
-            Vec2(curr_frame_->keypoints[i].pt.x, curr_frame_->keypoints[i].pt.y), depth);
-        disparities.push_back(disparity);
-        depths.push_back(depth);
-    }
-
-    status_.stereo_points = (int)depths.size();
-    if (!depths.empty()) {
-        std::ranges::sort(disparities);
-        std::ranges::sort(depths);
-        status_.median_disparity = disparities[disparities.size() / 2];
-        status_.median_depth = depths[depths.size() / 2];
-    }
+    // M1.4：深度计算与统计迁移至 FrontendTracker（frontend_tracker.cpp），
+    // 公式与默认值保持不变；这里只应用返回的深度统计到 status_。
+    const StereoStats stats = frontend_tracker_.computeStereoDepths(curr_frame_);
+    status_.stereo_points = stats.stereo_points;
+    status_.median_disparity = stats.median_disparity;
+    status_.median_depth = stats.median_depth;
 }
 
 // ============================================================
@@ -1021,255 +1013,62 @@ bool VisualOdometry::acceptPose(
 SE3 VisualOdometry::trackFrame() {
     if (!ref_frame_ || !curr_frame_) return SE3();
 
-    // 跟踪匹配不做基础矩阵 RANSAC（省时，且避免共面场景 F 矩阵退化误剔）：
-    // 外点交给下方 solvePnPRansac 自己剔除；仅初始化/回退分支保留 F 矩阵 RANSAC
-    auto matches = feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, false);
+    // M1.4：跟踪几何计算（匹配 → PnP → 3D-3D → 对极回退 → RECOVERING）
+    // 已迁移至 FrontendTracker::trackOrb（frontend_tracker.cpp，公式不变）。
+    // 这里只负责：① 构造查询（帧首快照参考数据 + 运动基线）；② 应用结果。
+    RefView ref;
+    ref.has_ref = snap_.has_ref;
+    ref.ref_pose_cs = snap_.ref_pose_cs;
+    ref.T_ws = snap_.T_ws;
+    ref.ref_points_s = snap_.ref_points_s;
+    ref.ref_mps = snap_.ref_mps;
+    const StereoStats stereo{status_.stereo_points, status_.median_disparity,
+                             status_.median_depth};
+    const TrackingResult r = frontend_tracker_.trackOrb(
+        curr_frame_, ref_frame_, ref, normalMotionBaseline(), stereo);
 
-    // 收集 3D-2D 对应（保留 pts3d[i] 与 matches 的映射，供内点观测计数）
-    // C++23 的 views::enumerate 同时给出索引与元素
-    // M2：一帧只观察一个版本——用帧首快照的参考帧点坐标（版本绑定），
-    // 不再在跟踪中途读实时点坐标（后端写回在锁内进行，快照保证帧级一致）。
-    std::vector<cv::Point3f> pts3d;
-    std::vector<cv::Point2f> pts2d;
-    std::vector<int> match_idx;
-    if (snap_.has_ref) {
-        for (auto [k, m] : matches | std::views::enumerate) {
-            if (m.queryIdx >= (int)snap_.ref_points_s.size()) continue;
-            if (!snap_.ref_mps[m.queryIdx]) continue;
-            const Vec3& p = snap_.ref_points_s[m.queryIdx];
-            pts3d.emplace_back((float)p.x(), (float)p.y(), (float)p.z());
-            pts2d.push_back(curr_frame_->keypoints[m.trainIdx].pt);
-            match_idx.push_back((int)k);
-        }
+    // 应用结果（与旧内联逻辑逐项等价）
+    curr_frame_->pose_cs = r.pose_cs;
+    for (const auto& [train_idx, mp] : r.associations) {
+        if (train_idx >= 0 && train_idx < (int)curr_frame_->map_points.size())
+            curr_frame_->map_points[train_idx] = mp;
     }
-
-    int inliers_cnt = 0;
-
-    // PnP (3D-2D) —— solvePnPRansac 返回的 rvec/tvec 即 T_cw（世界→相机），直接存入 pose_cs
-    if (pts3d.size() >= 6) {
-        cv::Mat rvec, tvec;
-        std::vector<int> inliers;
-        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
-                                     cv::Mat(), rvec, tvec,
-                                     false, 200, cfg_.ransac_pixel_threshold, 0.99, inliers);
-        if (ok) {
-            cv::Mat R;
-            cv::Rodrigues(rvec, R);
-            const SE3 candidate_pose = Relocalizer::matToSE3(R, tvec);
-            const double rmse = PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K());
-            // M0：统一位姿验收（几何 + 连续性；正常跟踪基线 = 上一有效位姿）
-            PoseQuality quality;
-            // M3：局部位姿组合 T_ws → 世界系再验收（基线 = 世界系）
-            const bool quality_ok = acceptPose(
-                candidate_pose * snap_.T_ws.inverse(),
-                (int)inliers.size(), pts3d.size(), rmse,
-                false /* reloc_mode */, quality);
-
-            status_.inlier_ratio = quality.inlier_ratio;
-            status_.pose_rmse = quality.pose_rmse;
-            status_.translation_delta = quality.translation;
-            status_.rotation_delta = quality.rotation;
-            if (quality_ok) {
-                curr_frame_->pose_cs = candidate_pose;
-                inliers_cnt = (int)inliers.size();
-                status_.tracking_valid = true;
-                status_.pose_method = "PNP";
-                // 位姿通过全部质量检查后才关联地图点，避免被拒绝的解污染共视统计。
-                for (int idx : inliers) {
-                    if (idx < 0 || idx >= (int)match_idx.size()) continue;
-                    auto& mp = snap_.ref_mps[matches[match_idx[idx]].queryIdx];
-                    if (mp) {
-                        curr_frame_->map_points[matches[match_idx[idx]].trainIdx] = mp;
-                    }
-                }
-                updateStatus((int)matches.size(), inliers_cnt, 0.0);
-                return curr_frame_->pose_cs;
-            }
-            LOG_WARN("PnP rejected: inliers=" << inliers.size()
-                     << " ratio=" << quality.inlier_ratio << " rmse=" << rmse
-                     << " dtrans=" << quality.translation
-                     << " drot=" << quality.rotation);
-        }
-    }
-
-    // 双目/RGB-D：PnP 失败后走 3D-3D 位姿估计（绝对尺度、旋转鲁棒）。
-    // 对极几何是单目尺度估计的手段（recoverPose 的 t 归一化、旋转主导时退化），
-    // 双目有绝对尺度（当前帧 pts_c），3D-3D 天然保持尺度且对旋转鲁棒。
-    if (tryTrack3D3D(matches)) return curr_frame_->pose_cs;
-
-    // 对极几何回退（仅单目：recoverPose 的 t 归一化，双目有绝对尺度不可用）
-    // recoverPose 返回 T_rel 满足 p_c2 = T_rel * p_c1 → T_cw2 = T_rel * T_cw1
-    if (!camera_->hasPerFrameDepth() && matches.size() >= (size_t)cfg_.min_matches_track) {
-        const SE3 ref_pose_cs = snap_.ref_pose_cs;
-        std::vector<cv::Point2f> pts1, pts2;
-        FeatureMatcher::getMatchedPoints(ref_frame_, curr_frame_, matches, pts1, pts2);
-        cv::Mat E = cv::findEssentialMat(pts1, pts2, camera_->K(), cv::RANSAC, 0.999, 1.0);
-        cv::Mat R, t;
-        cv::recoverPose(E, pts1, pts2, camera_->K(), R, t);
-        SE3 T_rel = Relocalizer::matToSE3(R, t);
-        curr_frame_->pose_cs = T_rel * ref_pose_cs;
-        inliers_cnt = (int)matches.size();
-        // 对极恢复的 t 只有方向无尺度，组合后可能跳变 → 同样做跳变保护
-        SE3 Twc_new = curr_frame_->pose_cs.inverse();
-        SE3 Twc_ref = ref_pose_cs.inverse();
-        if ((Twc_new.t - Twc_ref.t).norm() > 30.0) {
-            LOG_WARN("Epipolar fallback pose jump (" << (Twc_new.t - Twc_ref.t).norm()
-                     << "m), tracking lost");
-            curr_frame_->pose_cs = ref_pose_cs;
-            state_ = State::RECOVERING;
-            updateStatus((int)matches.size(), 0, 0.0);
-            return ref_pose_cs;
-        }
+    status_.inlier_ratio = r.inlier_ratio;
+    status_.pose_rmse = r.pose_rmse;
+    status_.translation_delta = r.translation_delta;
+    status_.rotation_delta = r.rotation_delta;
+    if (r.recovering) state_ = State::RECOVERING;
+    if (r.valid) {
         status_.tracking_valid = true;
-        status_.pose_method = "EPIPOLAR";
-    } else {
-        // 匹配太少 → LOST
-        curr_frame_->pose_cs = snap_.ref_pose_cs;
-        state_ = State::RECOVERING;
-        LOG_WARN("Tracking lost! matches=" << matches.size()
-                 << " pts3d=" << pts3d.size()
-                 << " kf_ref=" << (ref_frame_ ? ref_frame_->id : -1)
-                 << " mp_ref=" << (ref_frame_ ? ref_frame_->map_points.size() : 0));
+        status_.pose_method = r.method;
     }
-
-    updateStatus((int)matches.size(), inliers_cnt, 0.0);
+    updateStatus(r.matches, r.inliers, 0.0);
     return curr_frame_->pose_cs;
 }
 
-// ============================================================
-// 双目/RGB-D 3D-3D 位姿估计
-// ref 帧世界系点 ↔ 当前帧相机系点（双目视差），RANSAC 求解 T_cw。
-// 用真实深度测量：天然保持绝对尺度、对旋转-平移歧义鲁棒
-// （对极几何的 t 归一化 + 旋转主导退化在双目下不可用）。
-// ============================================================
-bool VisualOdometry::tryTrack3D3D(const std::vector<cv::DMatch>& matches) {
-    if (!camera_->hasPerFrameDepth() || matches.size() < 20
-        || status_.stereo_points < cfg_.stereo_min_points) return false;
-
-    std::vector<cv::Point3f> pts_w;   // ref 帧世界系 3D 点（M2：快照坐标）
-    std::vector<cv::Point3f> pts_c;   // 当前帧相机系 3D 点（双目视差）
-    std::vector<int> idx3;
-    if (snap_.has_ref) {
-        for (auto [k, m] : matches | std::views::enumerate) {
-            if (m.queryIdx >= (int)snap_.ref_points_s.size()) continue;
-            if (snap_.ref_mps[m.queryIdx] && curr_frame_->pts_c[m.trainIdx].z() > 0) {
-                const Vec3& p = snap_.ref_points_s[m.queryIdx];
-                pts_w.emplace_back((float)p.x(), (float)p.y(), (float)p.z());
-                pts_c.emplace_back((float)curr_frame_->pts_c[m.trainIdx].x(),
-                                   (float)curr_frame_->pts_c[m.trainIdx].y(),
-                                   (float)curr_frame_->pts_c[m.trainIdx].z());
-                idx3.push_back((int)k);
-            }
-        }
+MotionBaseline VisualOdometry::normalMotionBaseline() const {
+    // 正常跟踪基线 = 上一有效位姿（世界系 T_wc），门限
+    // max_frame_translation/rotation（与 acceptPose 的正常跟踪分支同一规则）。
+    MotionBaseline motion;
+    if (camera_->hasPerFrameDepth() && has_last_valid_pose_) {
+        motion.baseline_twc = last_valid_pose_world_.inverse();
+        motion.max_translation = cfg_.max_frame_translation;
+        motion.max_rotation = cfg_.max_frame_rotation;
     }
-    if ((int)pts_w.size() < std::max(20, cfg_.rigid_min_inliers)) return false;
-
-    cv::Mat affine, inliers;
-    // RANSAC 3D-3D：返回 3x4 [R|t] 满足 dst = R*src + t → 即 T_cw（世界→相机）
-    bool ok = cv::estimateAffine3D(pts_w, pts_c, affine, inliers,
-                                   cfg_.rigid_ransac_threshold, 0.99);
-    if (!ok) return false;
-
-    // estimateAffine3D 只用于 RANSAC 选内点。不能把其旋转投影回 SO(3) 后仍沿用
-    // 原仿射平移：旋转、缩放和剪切被改变后，原 t 已不属于同一个变换。
-    // 在内点上重新做 Kabsch 刚体拟合，统一求解 R、t（dst = R * src + t）。
-    Vec3 mean_w = Vec3::Zero();
-    Vec3 mean_c = Vec3::Zero();
-    int rigid_inliers = 0;
-    for (size_t i = 0; i < inliers.total(); i++) {
-        if (!inliers.at<uchar>((int)i)) continue;
-        mean_w += Vec3(pts_w[i].x, pts_w[i].y, pts_w[i].z);
-        mean_c += Vec3(pts_c[i].x, pts_c[i].y, pts_c[i].z);
-        rigid_inliers++;
-    }
-    const double inlier_ratio = (double)rigid_inliers / pts_w.size();
-    if (rigid_inliers < cfg_.rigid_min_inliers
-        || inlier_ratio < cfg_.rigid_min_inlier_ratio) {
-        LOG_WARN("3D-3D rejected: inliers=" << rigid_inliers
-                 << " ratio=" << inlier_ratio);
-        return false;
-    }
-    mean_w /= rigid_inliers;
-    mean_c /= rigid_inliers;
-
-    Mat33 covariance = Mat33::Zero();
-    for (size_t i = 0; i < inliers.total(); i++) {
-        if (!inliers.at<uchar>((int)i)) continue;
-        Vec3 pw(pts_w[i].x, pts_w[i].y, pts_w[i].z);
-        Vec3 pc(pts_c[i].x, pts_c[i].y, pts_c[i].z);
-        covariance += (pc - mean_c) * (pw - mean_w).transpose();
-    }
-    Eigen::JacobiSVD<Mat33> svd(covariance, Eigen::ComputeFullU | Eigen::ComputeFullV);
-    const Vec3 singular = svd.singularValues();
-    if (singular.x() <= 1e-9 || singular.y() / singular.x() < 1e-3) {
-        LOG_WARN("3D-3D rejected: degenerate point distribution");
-        return false;
-    }
-    Mat33 U = svd.matrixU();
-    const Mat33 V = svd.matrixV();
-    Mat33 R_rigid = U * V.transpose();
-    if (R_rigid.determinant() < 0) {
-        U.col(2) *= -1;
-        R_rigid = U * V.transpose();
-    }
-    Vec3 t_rigid = mean_c - R_rigid * mean_w;
-    SE3 pose_cs(Eigen::Quaterniond(R_rigid), t_rigid);
-
-    double squared_error = 0.0;
-    for (size_t i = 0; i < inliers.total(); i++) {
-        if (!inliers.at<uchar>((int)i)) continue;
-        const Vec3 pw(pts_w[i].x, pts_w[i].y, pts_w[i].z);
-        const Vec3 pc(pts_c[i].x, pts_c[i].y, pts_c[i].z);
-        squared_error += (R_rigid * pw + t_rigid - pc).squaredNorm();
-    }
-    const double rmse = std::sqrt(squared_error / rigid_inliers);
-    // M0：统一位姿验收（3D-3D 几何门限 + 正常跟踪连续性门限）
-    PoseQuality quality;
-    const bool accepted = acceptPose(
-        pose_cs * snap_.T_ws.inverse(), rigid_inliers, pts_w.size(), rmse,
-        false /* reloc_mode */, quality,
-        cfg_.rigid_min_inliers, cfg_.rigid_min_inlier_ratio,
-        cfg_.rigid_max_rmse);
-    if (!accepted) {
-        LOG_WARN("3D-3D rejected: inliers=" << rigid_inliers
-                 << " ratio=" << quality.inlier_ratio << " rmse=" << rmse
-                 << " dtrans=" << quality.translation
-                 << " drot=" << quality.rotation);
-        return false;
-    }
-
-    curr_frame_->pose_cs = pose_cs;
-    status_.tracking_valid = true;
-    status_.pose_method = "3D3D";
-    status_.inlier_ratio = quality.inlier_ratio;
-    status_.pose_rmse = quality.pose_rmse;
-    status_.translation_delta = quality.translation;
-    status_.rotation_delta = quality.rotation;
-    // 关联内点：普通跟踪帧只保留临时 map_points 指针，不产生正式观测。
-    int inl_cnt = 0;
-    for (size_t i = 0; i < inliers.total() && i < idx3.size(); i++) {
-        if (!inliers.at<uchar>(i)) continue;
-        inl_cnt++;
-        int k = idx3[i];
-        auto& mp = snap_.ref_mps[matches[k].queryIdx];
-        if (mp) {
-            curr_frame_->map_points[matches[k].trainIdx] = mp;
-        }
-    }
-    updateStatus((int)matches.size(), inl_cnt, 0.0);
-    return true;
+    return motion;
 }
 
 // ============================================================
 // LK 光流跟踪（feature_method=1）
 // 光流后 map_points 与关键点索引对齐（继承自上一帧），直接做 PnP
+// M1.4：PnP 核心迁移至 FrontendTracker::trackPnP；这里只负责锁内收集
+// 3D-2D 对应、转调与应用结果。
 // ============================================================
 SE3 VisualOdometry::trackFrameLK() {
     if (!curr_frame_) return SE3();
 
     std::vector<cv::Point3f> pts3d;
     std::vector<cv::Point2f> pts2d;
-    std::vector<int> kp_idx;
     {
         std::shared_lock<std::shared_mutex> lock(map_mutex_);  // P1：读路径共享锁
         for (size_t i = 0; i < curr_frame_->keypoints.size(); i++) {
@@ -1277,44 +1076,26 @@ SE3 VisualOdometry::trackFrameLK() {
             if (mp) {
                 pts3d.emplace_back((float)mp->pos_s.x(), (float)mp->pos_s.y(), (float)mp->pos_s.z());
                 pts2d.push_back(curr_frame_->keypoints[i].pt);
-                kp_idx.push_back((int)i);
             }
         }
     }
 
-    int inliers_cnt = 0;
     if (pts3d.size() >= 6) {
-        cv::Mat rvec, tvec;
-        std::vector<int> inliers;
-        bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(),
-                                     cv::Mat(), rvec, tvec,
-                                     false, 200, cfg_.ransac_pixel_threshold, 0.99, inliers);
-        if (ok) {
-            cv::Mat R;
-            cv::Rodrigues(rvec, R);
-            const SE3 candidate_pose = Relocalizer::matToSE3(R, tvec);
-            const double rmse = PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K());
-            // M0：统一位姿验收（与 ORB 跟踪同一通路）
-            PoseQuality quality;
-            // M3：局部位姿组合 T_ws → 世界系再验收（基线 = 世界系）
-            const bool quality_ok = acceptPose(
-                candidate_pose * snap_.T_ws.inverse(),
-                (int)inliers.size(), pts3d.size(), rmse,
-                false /* reloc_mode */, quality);
-            if (quality_ok) {
-                curr_frame_->pose_cs = candidate_pose;
-                inliers_cnt = (int)inliers.size();
-                status_.tracking_valid = true;
-                status_.pose_method = "LK_PNP";
-                status_.inlier_ratio = quality.inlier_ratio;
-                status_.pose_rmse = quality.pose_rmse;
-                status_.translation_delta = quality.translation;
-                status_.rotation_delta = quality.rotation;
-                // 普通 LK 跟踪帧只继承临时地图点指针；正式观测仅由
-                // 关键帧插入/Map::setObservation 记录。
-                updateStatus((int)pts3d.size(), inliers_cnt, 0.0);
-                return curr_frame_->pose_cs;
-            }
+        const TrackingResult pnp = frontend_tracker_.trackPnP(
+            pts3d, pts2d, snap_.T_ws, normalMotionBaseline(),
+            cfg_.pnp_min_inliers, cfg_.pnp_min_inlier_ratio, cfg_.pnp_max_rmse);
+        if (pnp.valid) {
+            curr_frame_->pose_cs = pnp.pose_cs;
+            status_.tracking_valid = true;
+            status_.pose_method = "LK_PNP";
+            status_.inlier_ratio = pnp.inlier_ratio;
+            status_.pose_rmse = pnp.pose_rmse;
+            status_.translation_delta = pnp.translation_delta;
+            status_.rotation_delta = pnp.rotation_delta;
+            // 普通 LK 跟踪帧只继承临时地图点指针；正式观测仅由
+            // 关键帧插入/Map::setObservation 记录。
+            updateStatus((int)pts3d.size(), pnp.inliers, 0.0);
+            return curr_frame_->pose_cs;
         }
     }
 
@@ -1324,6 +1105,11 @@ SE3 VisualOdometry::trackFrameLK() {
     return trackFrame();
 }
 
+// ============================================================
+// 双目/RGB-D 3D-3D 位姿估计
+// M1.4：estimateAffine3D + Kabsch 刚体拟合已迁移至
+// FrontendTracker::estimateRigid3D3D（纯几何）；验收转调 PoseGate。
+// ============================================================
 // ============================================================
 // 重定位（LOST 状态下尝试匹配所有关键帧恢复跟踪）
 // ============================================================
@@ -2448,34 +2234,15 @@ void VisualOdometry::triangulateNewPoints(
 
 bool VisualOdometry::needNewKeyFrame() const {
     if (!ref_frame_ || !curr_frame_ || !snap_.has_ref) return false;
-    // M2：参考帧位姿取自帧首快照（版本绑定），无需再持锁读实时 KF。
-    SE3 Twc_cur = curr_frame_->pose_cs.inverse();
-    SE3 Twc_ref = snap_.ref_pose_cs.inverse();
-    double dtrans = (Twc_cur.t - Twc_ref.t).norm();
-    // 相对旋转角：q_rel = q_cur * q_ref^-1，最小表示 = 2*acos(|w|)，处理 q 与 -q 等价
-    Eigen::Quaterniond q_rel = curr_frame_->pose_cs.q * snap_.ref_pose_cs.q.inverse();
-    double drot = 2.0 * std::acos(
-        std::clamp(std::abs(q_rel.w()), 0.0, 1.0));
-    // 运动阈值 + 匹配衰减阈值：内点过少说明地图不足/视角变化大，强制补充关键帧
-    bool weak_match = status_.inliers < cfg_.keyframe_min_inliers;
-    // 冷却：weak_match 触发需与上一关键帧间隔足够帧数，防止"关键帧风暴"
-    // （一旦地图质量差，无间隔限制会每帧插关键帧 → BA/重定位越来越慢 → 卡死）
-    if (weak_match &&
-        curr_frame_->id - last_kf_frame_id_ < (unsigned long)cfg_.min_keyframe_interval)
-        weak_match = false;
-    // 平移阈值按传感器类型分派：双目/RGB-D 有绝对尺度（真实帧间位移大），
-    // 单目尺度归一化后位移小——共用阈值会导致双目每帧插 KF
-    double kf_trans = camera_->hasPerFrameDepth()
-        ? cfg_.keyframe_translation_stereo : cfg_.keyframe_translation;
-    // 规模硬顶：关键帧数超过上限后放大平移阈值，压缩后续冗余帧
-    //（KITTI 00 全程 2800+ KF → 硬顶后 2200-，-22%）
-    if (cfg_.keyframe_max_count > 0 &&
-        map_->keyFrameCount() > (unsigned long)cfg_.keyframe_max_count)
-        kf_trans *= 1.5;
-    const bool max_interval = curr_frame_->id - last_kf_frame_id_
-        >= (unsigned long)cfg_.max_keyframe_interval;
-    return dtrans > kf_trans || drot > cfg_.keyframe_rotation
-        || weak_match || max_interval;
+    // M1.4：关键帧提议迁移至 FrontendTracker::proposeKeyFrame（§5.5），
+    // 判定公式与阈值与旧 needNewKeyFrame 逐项一致。
+    KeyframeInput input;
+    input.curr_frame = curr_frame_;
+    input.ref_pose_cs = snap_.ref_pose_cs;
+    input.inliers = status_.inliers;
+    input.last_kf_frame_id = last_kf_frame_id_;
+    input.map_keyframe_count = map_->keyFrameCount();
+    return frontend_tracker_.proposeKeyFrame(input).need;
 }
 
 // ============================================================

@@ -125,7 +125,8 @@ set(VSLAM_SOURCES
     src/tracking_state_machine.cpp
     src/localizer.cpp
     src/pose_gate.cpp
-    src/relocalizer.cpp)
+    src/relocalizer.cpp
+    src/frontend_tracker.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
@@ -134,6 +135,7 @@ set(VSLAM_HEADERS
     include/vslam/localizer.h
     include/vslam/pose_gate.h
     include/vslam/relocalizer.h
+    include/vslam/frontend_tracker.h
     include/vslam/backend_scheduler.h
     include/vslam/camera.h
     include/vslam/dataset.h
@@ -269,6 +271,14 @@ if(BUILD_TESTS)
         target_compile_options(test_backend_scheduler PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_backend_scheduler COMMAND test_backend_scheduler)
+
+    # M1.4 FrontendTracker（独立 CTest）
+    add_executable(test_frontend_tracker test/test_frontend_tracker.cpp)
+    target_link_libraries(test_frontend_tracker vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_frontend_tracker PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_frontend_tracker COMMAND test_frontend_tracker)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
