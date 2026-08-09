@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-08（M0 完成 + M1.1~M1.4 + 基准方案 §3.25-3.33）
+> 最后更新: 2026-08-08（M0 + M1 全部完成 + 基准方案 §3.25-3.34）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1573,7 +1573,38 @@ L2 门限全过，500 帧×3 轮 latency_p99≈25ms、valid_ratio=1.0）。旧 `
   FPS 43.3、latency p99 54.5ms、valid_ratio 0.9899——无退化且精度略好；
   仍在门限的 ate_rmse/std、jumps_10m、submap_reinit 与 §3.30 一致，属 M3/M5 目标。
 
-下一任务：M1.5 LocalMapper。
+### 3.34 M1.5 LocalMapper 拆分（2026-08-08）
+
+按 §5.1/§5.5 把局部建图计算从 vo.cpp 提取到独立 `LocalMapper`
+（`local_mapper.{h,cpp}`，行为保持不变），M1 拆分至此全部完成：
+
+- **迁移的算法**（公式/Map API 调用/顺序逐行不变）：
+  - `createMapPointsFromStereo` → 双目单帧建点 + 正式观测绑定；
+  - `triangulateNewPoints` → 两帧三角化建点 + 全有全无观测；
+  - `selectLocalWindow` → 共视窗口 / 兜底最近 n 帧；
+  - `buildLocalBASnapshot` → min_observed 门槛 + anchor 连通分量裁剪。
+- `includeLocalBALandmark` 迁至 local_mapper.h（vo.h 移除声明，test_vo 引用不变）。
+- **职责边界**（§5.5）：LocalMapper 只通过 Map API 操作传入的 Map/Frame，
+  不持有 VO 状态、不切换子地图、不执行优化求解、不创建线程；调用方按旧
+  约定持 map_mutex_ 相应锁。insertKeyFrame 编排（快照几何检查/对齐/回环/
+  调度）仍留在 VO 作为兼容 Facade。
+- 测试 `test_local_mapper.cpp`（5 项）：观测门槛、双目单帧建点、两帧三角化、
+  共视窗口兜底、BA 快照过滤与裁剪。
+
+**验收**：
+- CTest 10/10 全过（新增 test_local_mapper 独立 CTest）。
+- §5.6 确定性：KITTI 00 前 1000 帧轨迹逐位一致（max_translation_diff=0 m、
+  max_rotation_diff=5.5e-17 rad）、状态序列 1000 行一致。
+- 完整基准复测（default.yaml × 5 轮 + GT）：ATE RMSE mean 46.0m、FPS 42.7、
+  latency p99 52.8ms、valid_ratio 0.9899——与 §3.30 同噪声带，无退化；
+  仍在门限的 ate_rmse/std、jumps_10m、submap_reinit 与 §3.30 一致，属 M3/M5 目标。
+
+M1 里程碑总结：vo.cpp 从 2600 行拆出 5 个独立模块（PoseGate/Relocalizer/
+BackendScheduler/FrontendTracker/LocalMapper），共 38 项独立 CTest；唯一行为
+变更是 M1.3 按 §5.4 的 LoopClosure 优先调度语义（用户确认）。确定性验收全程
+逐位一致，完整基准各轮均在 RNG 噪声带内无退化。
+
+下一任务：M2.1 输入队列（bounded_queue.h + sensor_packet.h）。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 

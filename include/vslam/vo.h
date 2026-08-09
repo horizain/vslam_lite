@@ -11,6 +11,7 @@
 #include "vslam/backend_committer.h"
 #include "vslam/backend_scheduler.h"
 #include "vslam/frontend_tracker.h"
+#include "vslam/local_mapper.h"
 #include "vslam/pose_gate.h"
 #include "vslam/relocalizer.h"
 #include <atomic>
@@ -130,10 +131,6 @@ struct MonocularInitializationQuality {
     const Vec3& relative_translation,
     double min_parallax_rad,
     double min_positive_depth_ratio = 0.7);
-
-/// Local BA 快照是否应保留某个地图点。
-[[nodiscard]] bool includeLocalBALandmark(int observation_count,
-                                          int min_observed);
 
 /// 后端在一帧跟踪期间校正参考 KF 时，保持该帧相对参考帧的 T_ca 不变，
 /// 把当前帧从旧局部几何重基到新参考位姿。
@@ -382,6 +379,9 @@ private:
     /// M1.4：前端跟踪（ORB/LK/PnP/3D-3D/双目深度/关键帧提议；§5.5，
     /// 只输出 TrackingResult/KeyframeProposal，不写地图/不执行 BA/回环）
     FrontendTracker frontend_tracker_;
+    /// M1.5：局部建图（关键帧/建点/正式观测/Local BA 快照/共视窗口；§5.5，
+    /// 只通过 Map API 操作，不持有 VO 状态）
+    LocalMapper local_mapper_;
 
     // 轨迹记录（M4）：锚定关键帧 + 局部运动，世界位姿读时组合。
     // 回环校正/子地图对齐只更新锚点，轨迹自动跟随，无需全量插值重写。
