@@ -17,3 +17,19 @@ Robot:
 
   # 双目时间差初值上限（秒）（§4.3）
   stereo_max_time_diff_s: 0.001
+
+  # M2.1（§6.1/§6.2）：实时调度首版参数
+  Runtime:
+    # 异步输入：传感器回调只校验并入队（跟踪 worker 消费），满丢最旧、保最新。
+    # false = M0 同步路径（processFrame 直接驱动 VO）
+    enable_async_input: false
+    # 输入队列固定容量（ring buffer）
+    input_queue_capacity: 3
+    # 跟踪硬期限（10 Hz 地面机器人；20 Hz 平台改为 40）
+    tracking_deadline_ms: 80
+    # 预测外推最长时长（超过后 pose_valid=false）
+    prediction_timeout_ms: 500
+    # 后台任务最大年龄（超出视为陈旧，由 stale gate 丢弃）
+    max_backend_task_age_ms: 500
+    # 关闭时限（join 所有线程）
+    shutdown_timeout_ms: 2000
