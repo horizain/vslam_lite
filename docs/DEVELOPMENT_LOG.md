@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-10（M0 + M1 完成 + M2 完成：输入队列/资源预算/结构化指标 §3.25-3.37）
+> 最后更新: 2026-08-10（M0 + M1 完成 + M2 完成 + M2 遗留清理：实测标定/预算收敛/soak 重构 §3.25-3.38）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1743,7 +1743,71 @@ stale/invalid 计数属 BackendCommitter（M2.3 未接入）；⑤ snapshot_byte
 里程碑：M2（§6.2 实时调度 + §6.3 资源预算 + §6.4 结构化指标）全部落地，
 §6.5 完整验收由 nightly 2 小时 soak 档执行。
 
-下一任务：M3.1 视觉前端质量门（`tracking_quality.{h,cpp}`，§7.1/§7.2）。
+### 3.38 M2 遗留清理：§6.5 实测标定、预算触发收敛、soak 轮式重构（2026-08-10）
+
+M2.3 收尾后发现的三类问题（§3.37 未验证边界中可由 M2 层解决的项 + soak
+验收工具缺陷），本轮全部处理：
+
+**① §6.5 RSS <1GiB 硬门槛 vs §6.2 首版参数互斥 → 实测标定（§0.1 硬门槛优先）**
+- 实测（KITTI 00 代表场景）：12 万点 + 1100 KF 时 RSS ≈ 1.3GB，超 1GiB 硬门槛
+  15%；RSS 构成 = 词袋 ~350MB（DBoW3 145MB 文本加载后的两个 ~170MB 匿名段）
+  + 框架 ~150MB + 地图 heap（点 ~2.5KB/个、KF ~150KB/个）。
+- 按 §0.1"产品硬门槛未达到不能进入下一发布阶段"，以硬门槛优先标定预算参数：
+  `max_active_keyframes 1200→700`、`max_active_points 120000→60000`、
+  `max_total_estimated_mb 900→500`；overhead 常量实测化
+  （`overhead_bytes_per_keyframe 16KB→128KB`、`per_point 2KB→2.5KB`），
+  使 estimated_total 与实测内存一致（12 万点 ≈ 478MB 踩 500MB 线）。
+- 标定依据为 KITTI 00 单一场景（可用场景唯一）；后续 ≥3 类实录数据统一修订。
+- 连锁影响：预算激活使 KITTI 00 1000 帧（KF 395/点 60064）触发回收 → L1
+  reference 更新（`--update-reference`，有意行为变更）；回收路径确定性验证：
+  两次运行逐位一致（平移差 0 m、旋转差 5.9e-17 rad）。
+
+**② 预算 stopped 恢复复查振荡 bug（修复）**
+- 原实现：`addFrame` 每帧按 `keyFrameCount() <= max_active_keyframes` 轻量
+  复查解除 stopped——点超限时（KF 数仍在软上限内）每帧"解除→插 KF→enforce
+  再停"振荡，BackendOverloaded 计数被瞬间解除淹没（实测 992 KF 时反复振荡）。
+- 修复：恢复复查移到 `needNewKeyFrame` 提议路径做完整只读评估（KF 插入频率，
+  避免每帧全图遍历），回到预算内才解除并允许插入。
+
+**③ reclaim 第 5 步扩展：冻结子地图删除弱陈点**
+- 非活动子地图超过 `max_inactive_submaps` 时，除卸载 KF 图像缓存外，删除
+  其弱陈点（obs < weak_point_min_observations 且超窗口未命中）；KF 描述子
+  保留作重定位骨架。M4 磁盘换出落地前控制 RSS 的最低内存手段（§6.3 第 5 步
+  注释更新）。签名增 `inactive_submaps`（id → Map）参数（默认空，旧调用不变）。
+
+**④ §6.4 frame latency 语义修正：只统计跟踪帧**
+- 重定位/LOST 恢复帧（词袋查询/PnP 候选验证）不是跟踪延迟，不计入
+  p99/deadline miss（§6.5 门限语义）。实测长程 p99 从 194ms 降到 56ms
+  （KITTI 00 整序列轮：p99 55.9ms、miss 0.67%、valid_ratio 0.992）。
+
+**⑤ run_slam --loop 循环重放时间戳偏移**
+- EOF 重建数据集后重放时间戳加轮偏移（`last_play_ts + 1.0`），满足 §4.3
+  单调检查——修复重放第二轮起全部帧被 TimestampRollback 拒绝（实测 4541 帧
+  metrics 只有第一轮）的 bug。
+
+**⑥ soak_test.py 重构为多进程轮式**
+- 原"单进程连续档（--loop 2h）"与 1GiB 硬门槛互斥：冻结子地图的点/KF 保留
+  （M4 换出前），循环重放每轮累积 ~150MB → 无法单进程 2h <1GiB。重构为：
+  快速档（默认）N 轮短程；--full 10 轮 + RSS 峰值/斜率门限；--duration-h
+  轮式跑满时长（每轮整序列 4541 帧 ≈ 238s，启动噪声占比 ~3%，轮内后 50%
+  窗口拟合斜率排除词汇表加载段；后 1/3 轮斜率均值 <5MiB/h 断言）。EOF
+  关闭路径由每轮 rc==0 覆盖。
+
+**验收**：
+- 15/15 CTest（test_resource_budget +1 项冻结子地图点回收；test_budget_runtime
+  参数断言更新）；ASan/UBSan 干净（5 个相关测试）。
+- L2 快速档 PASS：p99 mean 58.9 / worst 68.7 ms、valid_ratio 1.0。
+- KITTI 00 整序列轮（4541 帧）：p99 55.9ms、deadline miss 0.67%、valid 0.992。
+
+**未达标项（如实记录，nightly 观测）**：
+- KITTI 00 整序列 RSS 峰值 1523MB > 1GiB。根因链：LOST（每程 4-5 次）→
+  多子地图累积（旧子地图强点/KF 保留）+ 词袋 350MB。当前 M2 层手段（预算
+  参数、第 5 步弱陈点回收）只能控制活动地图；修复依赖 M3.1 质量门（降
+  LOST 次数）与 M4 磁盘换出（子地图序列化离场）与 M5 词袋内存优化。
+  2h 档 RSS 门限在此框架下如实 FAIL，作为 nightly 观测数据积累。
+
+下一任务：M3.1 视觉前端质量门（`tracking_quality.{h,cpp}`，§7.1/§7.2；
+其降 LOST 也是 RSS 达标的先决条件之一）。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 
