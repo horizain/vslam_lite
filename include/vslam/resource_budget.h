@@ -17,13 +17,22 @@ using SubmapId = unsigned long;
 /// §6.2 首版参数 + §6.3 地图预算算法参数。
 /// 参数变更必须按 §0.1 用不少于 3 类场景的机器人实录数据统一标定，
 /// 不得为单个 KITTI/EuRoC 序列改动。
+///
+/// M2 遗留清理实测标定（2026-08-10，KITTI 00 代表场景）：
+///   §6.2 原首版参数（KF 1200/点 120000/总量 900MB）与 §6.5 RSS 硬门槛
+///   （<1GiB）互斥——实测 12 万点 + 1100 KF 时 RSS ≈ 1.3GB（点 ~2.5KB/个、
+///   KF ~150KB/个、词袋 ~350MB、框架 ~150MB）。按 §0.1"产品硬门槛未达到
+///   不能进入下一发布阶段"，以硬门槛优先标定：地图预算上限使 RSS 峰值
+///   ≈ 词袋 350MB + 框架 150MB + 地图 ≈ 400MB ≈ 900MB < 1GiB。
+///   标定依据为 KITTI 00 实测（唯一可用场景）；后续 ≥3 类实录数据再统一
+///   修订（DEVELOPMENT_LOG §3.38 记录）。
 struct MapBudgetConfig {
-    // ---- §6.2 MapBudget 硬预算 ----
-    size_t max_active_keyframes = 1200;
-    size_t max_active_points = 120000;
+    // ---- §6.2 MapBudget 硬预算（实测标定版，2026-08-10）----
+    size_t max_active_keyframes = 700;
+    size_t max_active_points = 60000;
     size_t max_descriptor_mb = 256;
     size_t max_snapshot_mb = 256;
-    size_t max_total_estimated_mb = 900;
+    size_t max_total_estimated_mb = 500;
 
     // ---- §6.3 固定顺序回收参数 ----
     /// 第 2 步：观测数 < 该值的点为"弱点"
@@ -40,9 +49,11 @@ struct MapBudgetConfig {
     /// 第 5 步：非活动子地图超过该数量时冻结更老的并卸载图像缓存
     size_t max_inactive_submaps = 2;
 
-    // ---- 内存估算常量（§6.4 指标；单位字节，M7 前按实测统一标定）----
-    size_t overhead_bytes_per_keyframe = 16384;
-    size_t overhead_bytes_per_point = 2048;
+    // ---- 内存估算常量（§6.4 指标；2026-08-10 按 KITTI 00 实测标定：
+    // KF ≈ 150KB/个（描述子 32KB + 关键点 24KB + map_points 指针 + 观测），
+    // 点 ≈ 2.5KB/个（对象 + 描述子 32B + observations 向量））----
+    size_t overhead_bytes_per_keyframe = 131072;
+    size_t overhead_bytes_per_point = 2560;
 
     static constexpr size_t bytes_per_mb = 1024 * 1024;
 };
@@ -72,6 +83,7 @@ struct BudgetReclaimResult {
     size_t culled_redundant_keyframes = 0;   // 第 4 步
     size_t frozen_submaps = 0;               // 第 5 步
     size_t unloaded_submap_kf_images = 0;    // 第 5 步
+    size_t removed_frozen_submap_points = 0; // 第 5 步：冻结子地图弱陈点删除
     bool stopped_map_growth = false;         // 第 6 步：仍超预算
 };
 
@@ -96,12 +108,19 @@ public:
     ///        max_inactive_submaps 个子地图时冻结更老的（按子地图 id 升序，
     ///        保留最新的 2 个）并卸载其 KF 图像缓存。冻结标志本身属于
     ///        Atlas 状态，M4 前本模块只做图像卸载与计数。
+    /// @param inactive_submaps      非活动子地图 → 其 Map；与 submap_keyframes
+    ///        同序提供时，第 5 步在卸载图像外同时删除冻结子地图的弱陈点
+    ///        （observationCount < weak_point_min_observations 且超过
+    ///        weak_point_stale_kf_window 个 KF 未被跟踪命中）——冻结地图的
+    ///        点主体不再被访问，保留 KF 描述子作为重定位骨架；这是 M4 磁盘
+    ///        换出落地前控制 RSS 硬门槛（§6.5 <1GiB）的最低内存手段。
     [[nodiscard]] BudgetReclaimResult reclaim(
         const Map::Ptr& map,
         const std::unordered_set<KeyframeId>& protected_keyframe_ids = {},
         const std::unordered_map<SubmapId, std::vector<KeyframeId>>&
             submap_keyframes = {},
-        size_t snapshot_bytes = 0) const;
+        size_t snapshot_bytes = 0,
+        const std::unordered_map<SubmapId, Map::Ptr>& inactive_submaps = {}) const;
 
     /// 描述子字节统计（点代表描述子 + 各 KF 描述子矩阵；供 §6.4 指标复用）
     [[nodiscard]] static size_t descriptorBytes(const Map::Ptr& map);

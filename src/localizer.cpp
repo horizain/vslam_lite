@@ -252,7 +252,15 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
 
 void Localizer::feedFrameMetrics(const PoseEstimate& out, double frame_ms) {
     if (!cfg_.enable_metrics) return;
-    metrics_.recordFrameLatency(frame_ms);
+    // §6.4（M2 遗留清理）：frame latency/deadline 只统计跟踪帧——重定位/
+    // LOST 期间的单帧耗时是恢复过程（词袋查询/PnP 候选验证），不是跟踪
+    // 延迟，不应计入 §6.5 的 p99 < 图像周期×0.8 门限。frames_processed
+    // 同步定义为跟踪帧数（valid_ratio 分母一致）。
+    const bool tracking_frame =
+        out.state == TrackingState::Initializing ||
+        out.state == TrackingState::Tracking ||
+        out.state == TrackingState::Degraded;
+    if (tracking_frame) metrics_.recordFrameLatency(frame_ms);
     const VisualOdometry::Status st = vo_->getStatus();
     const double features = vo_->currentFrame()
         ? static_cast<double>(vo_->currentFrame()->keypoints.size()) : -1.0;

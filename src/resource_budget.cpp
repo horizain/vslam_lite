@@ -91,7 +91,8 @@ BudgetReclaimResult ResourceBudget::reclaim(
     const Map::Ptr& map,
     const std::unordered_set<KeyframeId>& protected_keyframe_ids,
     const std::unordered_map<SubmapId, std::vector<KeyframeId>>& submap_keyframes,
-    size_t snapshot_bytes) const {
+    size_t snapshot_bytes,
+    const std::unordered_map<SubmapId, Map::Ptr>& inactive_submaps) const {
     BudgetReclaimResult r;
     if (!map) return r;
     if (evaluate(map, snapshot_bytes).within_budget) return r;
@@ -166,7 +167,9 @@ BudgetReclaimResult ResourceBudget::reclaim(
 
     // 第 5 步：冻结超过 max_inactive_submaps 个的非活动子地图并卸载图像
     // 缓存。保留子地图 id 最大的（最新）2 个，冻结更老的；M4 前不进行
-    // 磁盘换出（§6.3：不得假装已经具备可靠的换入/换出）。
+    // 磁盘换出（§6.3：不得假装已经具备可靠的换入/换出）。冻结子地图的
+    // 弱陈点一并删除（inactive_submaps 提供 Map 时）——点主体不再被访问，
+    // KF 描述子保留作重定位骨架，控制 §6.5 RSS 硬门槛（<1GiB）。
     {
         std::vector<SubmapId> ids;
         for (const auto& [sid, kfs] : submap_keyframes) {
@@ -179,12 +182,34 @@ BudgetReclaimResult ResourceBudget::reclaim(
             for (size_t i = 0; i < r.frozen_submaps; i++) {
                 auto it = submap_keyframes.find(ids[i]);
                 if (it == submap_keyframes.end()) continue;
+                // 非活动子地图的 KF/点在子地图自己的 Map 内（Submap::map）
+                Map::Ptr submap_map;
+                auto mit = inactive_submaps.find(ids[i]);
+                if (mit != inactive_submaps.end()) submap_map = mit->second;
                 for (const auto kf_id : it->second) {
-                    const auto kf = map->getKeyFrame(kf_id);
+                    const auto kf = submap_map
+                        ? submap_map->getKeyFrame(kf_id)
+                        : map->getKeyFrame(kf_id);
                     if (kf) {
                         kf->releaseImages(false);
                         r.unloaded_submap_kf_images++;
                     }
+                }
+                if (submap_map) {
+                    const size_t kf_count = submap_map->keyFrameCount();
+                    std::vector<MapPointId> ids_to_remove;
+                    for (const auto& mp : submap_map->getAllMapPoints()) {
+                        if (mp->observationCount() >=
+                                config_.weak_point_min_observations)
+                            continue;
+                        if (submap_map->lastHitKeyframeCount(mp->id) +
+                                config_.weak_point_stale_kf_window <
+                            kf_count)
+                            ids_to_remove.push_back(mp->id);
+                    }
+                    for (const auto pid : ids_to_remove)
+                        if (submap_map->removeMapPoint(pid))
+                            r.removed_frozen_submap_points++;
                 }
             }
         }

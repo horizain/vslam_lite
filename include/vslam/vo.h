@@ -227,8 +227,9 @@ public:
         return composePoseTrajectory();
     }
 
-    /// 是否应该创建新的关键帧
-    bool needNewKeyFrame() const;
+    /// 是否应该创建新的关键帧（M2.2 遗留清理：预算 stopped 期间为 false；
+    /// 提议路径做完整只读评估，回到预算内自动恢复）
+    bool needNewKeyFrame();
 
     /// 设置特征方法（0: ORB匹配, 1: LK光流）
     void setFeatureMethod(int method) { cfg_.feature_method = method; }

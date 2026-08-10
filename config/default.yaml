@@ -74,13 +74,14 @@ Optimizer:
   enable_local_ba: true    # 局部 BA 开关（false 时仅前端跟踪，用于对比实验）
   global_ba_iterations: 0  # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
 
-# ---- 地图资源预算（M2.2/M2.3 遗留清理接线；§6.2 首版参数）----
+# ---- 地图资源预算（M2.2/M2.3 遗留清理接线；§6.2 参数已按 2026-08-10
+#      KITTI 00 实测标定以匹配 §6.5 RSS <1GiB 硬门槛，见 resource_budget.h）----
 MapBudget:
-  max_active_keyframes: 1200   # §6.3：超过后按固定顺序回收
-  max_active_points: 120000
+  max_active_keyframes: 700    # §6.3：超过后按固定顺序回收
+  max_active_points: 60000
   max_descriptor_mb: 256
   max_snapshot_mb: 256
-  max_total_estimated_mb: 900
+  max_total_estimated_mb: 500
 
 # ---- 回环检测 (Phase 2) ----
 LoopClosure:

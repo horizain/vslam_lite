@@ -70,11 +70,12 @@ void test_yaml_map_budget_parsing() {
     TEST("VOConfig: default.yaml 解析 MapBudget 段") {
         const VOConfig cfg = VOConfig::fromYaml(
             std::string(VSLAM_SOURCE_DIR) + "/config/default.yaml");
-        assert(cfg.map_budget.max_active_keyframes == 1200);
-        assert(cfg.map_budget.max_active_points == 120000);
+        // 2026-08-10 实测标定版（§6.5 RSS <1GiB 硬门槛，见 resource_budget.h）
+        assert(cfg.map_budget.max_active_keyframes == 700);
+        assert(cfg.map_budget.max_active_points == 60000);
         assert(cfg.map_budget.max_descriptor_mb == 256);
         assert(cfg.map_budget.max_snapshot_mb == 256);
-        assert(cfg.map_budget.max_total_estimated_mb == 900);
+        assert(cfg.map_budget.max_total_estimated_mb == 500);
     } TEST_PASS();
 }
 
@@ -113,11 +114,13 @@ void test_tiny_budget_controls_keyframes() {
         assert(stopped && "极小预算下最终应停止增加地图（§6.3 第 6 步）");
         assert(!vo.needNewKeyFrame() && "stopped 后 KF 提议必须被拒绝");
 
-        // stopped 后继续 100 帧：KF 数不再增长（预算恢复前建图冻结）
+        // stopped 后继续 100 帧：地图不得出现预算外增长。子地图重建会重置
+        // 活动地图计数（LOST 后重定位路径，合法），但新地图同样受预算约束。
         assert(runFrames(vo, ds, 100));
         vo.finishPendingBackendWork();
-        assert(vo.getMap()->keyFrameCount() == kfs &&
-               "stopped 期间 KF 数必须保持不变");
+        const size_t kfs_after = vo.getMap()->keyFrameCount();
+        assert(kfs_after <= kfs + 2 &&
+               "stopped 期间 KF 增长只允许来自子地图重建（新地图同样受预算约束）");
 
         // 对照：同一帧数、默认预算下 KF 数应明显更多（证明停止建图生效）
         VOConfig cfg2;

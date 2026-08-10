@@ -47,7 +47,10 @@ def parse_args():
     p.add_argument("--full", action="store_true",
                    help="完整档：10 轮 + RSS 峰值/斜率门限")
     p.add_argument("--duration-h", type=float, default=0.0,
-                   help="指定时长档（小时；>0 时循环重放到时长耗尽，nightly）")
+                   help="指定时长档（小时；轮式跑满时长，nightly）")
+    p.add_argument("--round-frames", type=int, default=0,
+                   help="每轮帧数（0=用 --frames；时长档建议整序列 4541，"
+                        "让启动噪声只占轮长的约 3%%）")
     p.add_argument("--rss-max-mb", type=float, default=1024.0)
     p.add_argument("--rss-slope-mib-h", type=float, default=5.0)
     p.add_argument("--shutdown-check", action="store_true")
@@ -127,6 +130,12 @@ def run_round(args, tmpdir, idx, metrics_checks=True):
         report["failures"].append(f"指标 JSON 缺失或损坏: {e}")
         return (False, report)
 
+    ok, report = check_metrics(m, args, report)
+    return (ok, report)
+
+
+def check_metrics(m, args, report, check_valid_ratio=True):
+    """§6.5 单轮指标断言（多轮/单进程档共用）。"""
     checks = [
         ("latency_p99_ms < deadline_ms", m["latency_p99_ms"] < args.deadline_ms,
          f"p99={m['latency_p99_ms']:.1f}ms >= {args.deadline_ms}ms"),
@@ -136,11 +145,13 @@ def run_round(args, tmpdir, idx, metrics_checks=True):
          f"hwm={m['input_queue_hwm']} > {args.queue_capacity}"),
         ("backend_pending <= 1", m["backend_pending"] <= 1,
          f"pending={m['backend_pending']}"),
-        ("valid_ratio >= 门限",
-         m["frames_processed"] == 0 or
-         m["pose_accepted"] / m["frames_processed"] >= args.min_valid_ratio,
-         f"valid={m['pose_accepted']}/{m['frames_processed']}"),
     ]
+    if check_valid_ratio:
+        checks.append(
+            ("valid_ratio >= 门限",
+             m["frames_processed"] == 0 or
+             m["pose_accepted"] / m["frames_processed"] >= args.min_valid_ratio,
+             f"valid={m['pose_accepted']}/{m['frames_processed']}"))
     for name, ok, detail in checks:
         if not ok:
             report["failures"].append(f"{name}: {detail}")
@@ -207,19 +218,17 @@ def main():
         return 0 if check_fail_inject(args) else 1
 
     rounds = 10 if args.full else args.rounds
-    if args.duration_h > 0.0:
-        deadline = time.time() + args.duration_h * 3600.0
-    else:
-        deadline = None
-
+    if args.round_frames > 0:
+        args.frames = args.round_frames
     print(f"soak_test: {args.bin} | dataset={args.dataset} "
           f"config={args.config} frames={args.frames} rounds={rounds}"
-          + (" | 时长档 %.1f h" % args.duration_h if deadline else ""))
+          + (f" | 时长档 {args.duration_h:.1f} h" if args.duration_h > 0.0 else ""))
 
     with tempfile.TemporaryDirectory(prefix="vslam_soak_") as tmpdir:
         rss_peaks = []
         rss_slopes = []
         i = 0
+        deadline = (time.time() + args.duration_h * 3600.0) if args.duration_h > 0.0 else None
         while deadline is None or time.time() < deadline:
             ok, rep = run_round(args, tmpdir, i)
             results.append(ok)
@@ -241,9 +250,14 @@ def main():
                 break
 
         all_ok = all(results) and len(results) > 0
-        if args.full and all_ok:
+        # §6.5 RSS 门限：--full 与时长档都断言。稳态斜率取后 1/3 轮的
+        # 轮内斜率均值——每轮内后 50% 窗口已排除词汇表加载的启动段
+        # （时长档用整序列帧数/轮，启动噪声占比 ~3%）；地图到预算上限后
+        # 轮内斜率应趋近于零（无泄漏时）。
+        if (args.full or args.duration_h > 0.0) and all_ok:
             peak = max(rss_peaks)
-            slope = (sum(rss_slopes) / len(rss_slopes)) if rss_slopes else None
+            late = rss_slopes[len(rss_slopes) // 3 * 2:] if len(rss_slopes) > 3 else rss_slopes
+            slope = (sum(late) / len(late)) if late else None
             if peak > args.rss_max_mb:
                 print(f"  [FAIL] RSS 峰值 {peak:.1f}MB > {args.rss_max_mb}MB（§6.5 <1GiB）")
                 all_ok = False

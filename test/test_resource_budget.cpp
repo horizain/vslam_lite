@@ -326,6 +326,55 @@ void test_reclaim_step5_freeze_submaps() {
     } TEST_PASS();
 }
 
+void test_reclaim_step5_freeze_submap_weak_points() {
+    TEST("reclaim 第5步: 冻结子地图同时删除弱陈点（M2 遗留清理，RSS 硬门槛）") {
+        vslam::MapBudgetConfig cfg;
+        cfg.max_active_keyframes = 2;   // 触发回收
+        cfg.kf_image_keep_recent = 4;   // 隔离第 3 步
+        cfg.weak_point_min_observations = 2;
+        cfg.weak_point_stale_kf_window = 1;
+        ResourceBudget budget(cfg);
+        auto map = std::make_shared<Map>();
+
+        std::vector<Frame::Ptr> kfs;
+        for (unsigned long id = 0; id < 4; id++)
+            kfs.push_back(makeKeyframe(map, id, Vec3((double)id * 3.0, 0, 0),
+                                       2, /*with_images=*/true));
+
+        // 冻结子地图 100 的独立 Map（模拟 Submap::map）
+        auto sub_map = std::make_shared<Map>();
+        const auto s_kf0 = makeKeyframe(sub_map, 0, Vec3::Zero(), 3, false);
+        // 弱陈点：1 个观测（observe 时 kf_count=1 → lastHit=1）；
+        // 此后又插入 2 个 KF（kf_count=3）→ 1+窗口1 < 3 → 陈旧可删
+        const auto weak_mp = makePoint(sub_map);
+        observe(sub_map, s_kf0, 0, weak_mp);
+        const auto s_kf1 = makeKeyframe(sub_map, 1, Vec3(1.0, 0, 0), 3, false);
+        const auto s_kf2 = makeKeyframe(sub_map, 2, Vec3(2.0, 0, 0), 3, false);
+        // 强点：2 个观测（≥ weak_point_min_observations）→ 必须保留
+        const auto strong_mp = makePoint(sub_map);
+        observe(sub_map, s_kf0, 1, strong_mp);
+        observe(sub_map, s_kf2, 1, strong_mp);
+
+        std::unordered_map<unsigned long, std::vector<KeyframeId>> submap_kfs;
+        submap_kfs[100] = {kfs[0]->id};
+        submap_kfs[200] = {kfs[1]->id};
+        submap_kfs[300] = {kfs[2]->id};
+        std::unordered_map<unsigned long, vslam::Map::Ptr> inactive_submaps;
+        inactive_submaps[100] = sub_map;
+        inactive_submaps[200] = std::make_shared<Map>();
+        inactive_submaps[300] = std::make_shared<Map>();
+
+        const auto r = budget.reclaim(map, {}, submap_kfs, 0, inactive_submaps);
+
+        assert(r.frozen_submaps == 1);
+        assert(r.unloaded_submap_kf_images == 1);
+        assert(r.removed_frozen_submap_points == 1 && "弱陈点必须被删除");
+        assert(sub_map->mapPointCount() == 1 && "强点必须保留");
+        assert(sub_map->getMapPoint(strong_mp->id) != nullptr);
+        assert(sub_map->verifyObservationConsistency());
+    } TEST_PASS();
+}
+
 void test_reclaim_step6_stop_growth() {
     TEST("reclaim 第6步: 仍超预算 → stopped_map_growth，强点不随机删除") {
         vslam::MapBudgetConfig cfg;
@@ -459,6 +508,7 @@ int main() {
     test_reclaim_step3_unload_inactive_kf_images();
     test_reclaim_step4_redundant_keyframes();
     test_reclaim_step5_freeze_submaps();
+    test_reclaim_step5_freeze_submap_weak_points();
     test_reclaim_step6_stop_growth();
     test_map_remove_keyframe();
     test_map_last_hit_side_statistics();

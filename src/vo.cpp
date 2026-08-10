@@ -345,14 +345,6 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     PERF_SCOPE("vo.frame_total");
     unsigned long frame_id = frame_count_++;
 
-    // M2.2 遗留清理（§6.3 第 6 步）：预算停止建图后的轻量恢复复查——地图
-    // 回到 KF 上限内即解除（只读原子计数，无锁、每帧 O(1)）。
-    if (map_growth_stopped_.load(std::memory_order_relaxed) &&
-        map_->keyFrameCount() <= map_budget_.config().max_active_keyframes) {
-        map_growth_stopped_ = false;
-    }
-    LOG_INFO("--- Frame " << frame_id << " ---");
-
     // 先复制 Mat 头，兼容调用方把 currentFrame()->image 直接作为下一帧输入；
     // 随后的 releaseImages 只移除旧 Frame 的引用，不会令本轮输入失效。
     const cv::Mat left_input = left;
@@ -2089,13 +2081,8 @@ void VisualOdometry::submitBackendTask(BackendTask task) {
 
 void VisualOdometry::enforceMapBudget() {
     // M2.2 遗留清理（§6.3）：预算触发点。调用方（insertKeyFrame）已持
-    // map_mutex_ 独占锁。回收前先轻量复查 stopped 是否可解除：
-    // 地图回到 KF 上限内即恢复建图（后续 KF 插入重新走完整评估）。
-    const size_t kf_limit = map_budget_.config().max_active_keyframes;
-    if (map_growth_stopped_.load(std::memory_order_relaxed) &&
-        map_->keyFrameCount() <= kf_limit) {
-        map_growth_stopped_ = false;
-    }
+    // map_mutex_ 独占锁；evaluate 只读零副作用（预算内确定性不变）。
+    // 恢复（解除 stopped）只在 needNewKeyFrame 的完整评估通过时发生。
     if (map_budget_.evaluate(map_).within_budget) return;
 
     // 保护集：回环约束两端 KF + 当前参考帧/当前帧（§6.3：不得随机删除锚点，
@@ -2108,8 +2095,10 @@ void VisualOdometry::enforceMapBudget() {
     if (ref_frame_) protected_ids.insert(ref_frame_->id);
     if (curr_frame_) protected_ids.insert(curr_frame_->id);
 
-    // 非活动子地图 → 其 KF id 列表（第 5 步冻结/卸载图像用）
+    // 非活动子地图 → 其 KF id 列表（第 5 步冻结/卸载图像用）与 Map 指针
+    // （第 5 步弱陈点回收用）
     std::unordered_map<SubmapId, std::vector<KeyframeId>> submap_keyframes;
+    std::unordered_map<SubmapId, Map::Ptr> inactive_submaps;
     const Submap* active = atlas_->activeSubmap();
     for (const auto& s : atlas_->submaps()) {
         if (active && s.id == active->id) continue;
@@ -2117,20 +2106,23 @@ void VisualOdometry::enforceMapBudget() {
         std::vector<KeyframeId> ids;
         for (const auto& kf : s.map->getAllKeyFrames()) ids.push_back(kf->id);
         submap_keyframes[s.id] = std::move(ids);
+        inactive_submaps[s.id] = s.map;
     }
 
-    const BudgetReclaimResult r =
-        map_budget_.reclaim(map_, protected_ids, submap_keyframes, 0);
+    const BudgetReclaimResult r = map_budget_.reclaim(
+        map_, protected_ids, submap_keyframes, 0, inactive_submaps);
     map_growth_stopped_ = r.stopped_map_growth;
     if (r.stopped_map_growth) {
         LOG_WARN("Map budget exhausted: map growth stopped (KF="
                  << map_->keyFrameCount() << ", pts=" << map_->mapPointCount() << ")");
     } else if (r.removed_zero_obs_points || r.removed_weak_stale_points ||
-               r.culled_redundant_keyframes || r.unloaded_kf_images) {
+               r.culled_redundant_keyframes || r.unloaded_kf_images ||
+               r.removed_frozen_submap_points) {
         LOG_INFO("Map budget reclaimed: zero-obs=" << r.removed_zero_obs_points
                  << " weak-stale=" << r.removed_weak_stale_points
                  << " unloaded-img=" << r.unloaded_kf_images
-                 << " culled-kf=" << r.culled_redundant_keyframes);
+                 << " culled-kf=" << r.culled_redundant_keyframes
+                 << " frozen-weak-pts=" << r.removed_frozen_submap_points);
     }
 }
 
@@ -2235,11 +2227,18 @@ void VisualOdometry::triangulateNewPoints(
     local_mapper_.triangulateNewPoints(map_, f1, f2, matches);
 }
 
-bool VisualOdometry::needNewKeyFrame() const {
+bool VisualOdometry::needNewKeyFrame() {
     if (!ref_frame_ || !curr_frame_ || !snap_.has_ref) return false;
-    // M2.2 遗留清理（§6.3 第 6 步）：预算耗尽停止增加地图，KF 提议直接拒绝
-    // （恢复条件：地图回到预算内——addFrame 每帧轻量复查，见 enforceMapBudget）
-    if (map_growth_stopped_.load(std::memory_order_relaxed)) return false;
+    // M2.2 遗留清理（§6.3 第 6 步）：预算耗尽停止增加地图。恢复复查只在
+    // KF 提议路径做完整只读评估（KF 插入频率，避免每帧全图遍历）——
+    // 回到预算内才解除并允许插入。注意不能只用 KF 数判恢复（点/字节超限
+    // 时 KF 数仍在软上限内，会与 enforceMapBudget 形成每帧振荡，M2 遗留
+    // 清理实测：992 KF 时 stopped 被下一帧错误解除）。
+    if (map_growth_stopped_.load(std::memory_order_relaxed)) {
+        if (!map_budget_.evaluate(map_).within_budget) return false;
+        map_growth_stopped_ = false;
+        LOG_INFO("Map budget back within limits: map growth resumed");
+    }
     // M1.4：关键帧提议迁移至 FrontendTracker::proposeKeyFrame（§5.5），
     // 判定公式与阈值与旧 needNewKeyFrame 逐项一致。
     KeyframeInput input;

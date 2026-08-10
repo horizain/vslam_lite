@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
     // ---- 解析命令行参数（与 run_vo 相同）----
     bool headless = false;
     bool use_localizer = false;  // M0.3 可选入口：用 Localizer Facade 包装同一 VO
+    bool loop = false;           // M2 遗留清理：数据集 EOF 后重建循环重放（§6.5 soak 单进程连续档）
     int max_frames = 0;  // 0 = 全程；>0 = 只处理前 N 帧（性能/回归测试用）
     int skip_frames = 0; // 跳过前 N 帧（性能分片测试用）
     std::string status_csv_path;    // M1 确定性回归：逐帧状态/计数 CSV
@@ -56,6 +57,7 @@ int main(int argc, char** argv) {
         else if (a == "--euroc") dataset_type = vslam::Dataset::Type::EUROC;
         else if (a == "--headless") headless = true;
         else if (a == "--localizer") use_localizer = true;
+        else if (a == "--loop") loop = true;
         else if (a == "--status-csv" && i + 1 < argc) status_csv_path = argv[++i];
         else if (a == "--metrics-json" && i + 1 < argc) metrics_json_path = argv[++i];
         else if (a == "--metrics-csv" && i + 1 < argc) metrics_csv_path = argv[++i];
@@ -126,6 +128,8 @@ int main(int argc, char** argv) {
         cv::Mat image, image_right;
         double timestamp;
         int frame_count = 0;
+        double round_base = 0.0;   // --loop 重放偏移：保证重放时间戳单调（§4.3）
+        double last_play_ts = 0.0;
         auto start_time = std::chrono::steady_clock::now();
         std::vector<std::pair<double, vslam::SE3>> valid_poses;  // timestamp + T_wc
 
@@ -133,16 +137,29 @@ int main(int argc, char** argv) {
         }
         start_time = std::chrono::steady_clock::now();
 
-        while (dataset.nextFrame(image, image_right, timestamp)
-               && (max_frames == 0 || frame_count < max_frames)
-               && (headless || !viewer.shouldQuit())) {
+        // M2 遗留清理（§6.5）：--loop 时 EOF 后重建数据集循环重放——单进程
+        // 连续 2h 档的 RSS 稳态斜率必须在同一进程内测量（每轮重启进程会
+        // 把词汇表加载的启动噪声算进斜率，§3.37）。
+        while (true) {
+            if (!dataset.nextFrame(image, image_right, timestamp)) {
+                if (!loop) break;
+                dataset = vslam::Dataset(input_path, dataset_type);
+                round_base = last_play_ts + 1.0;  // 时间戳偏移，保持单调递增
+                LOG_INFO("Dataset EOF: restarting replay (loop mode, ts offset "
+                         << round_base << ")");
+                continue;
+            }
+            if (max_frames != 0 && frame_count >= max_frames) break;
+            if (!headless && viewer.shouldQuit()) break;
             frame_count++;
+            const double play_ts = timestamp + round_base;
+            last_play_ts = play_ts;
             vslam::PoseEstimate est = image_right.empty()
-                ? localizer.processFrame(image, timestamp)
-                : localizer.processFrame(image, image_right, timestamp);
+                ? localizer.processFrame(image, play_ts)
+                : localizer.processFrame(image, image_right, play_ts);
             if (est.pose_valid) {
                 // 轨迹约定为相机系：T_wc = T_wb · T_bc（§2）
-                valid_poses.emplace_back(timestamp, est.T_wb * loc_cfg.T_bc);
+                valid_poses.emplace_back(play_ts, est.T_wb * loc_cfg.T_bc);
             }
             if (!headless) {
                 std::string state_str;
@@ -244,29 +261,41 @@ int main(int argc, char** argv) {
     double last_ts = 0.0;
     unsigned long prev_submap_id = 0;
     long long submap_reinit = 0;
+    double round_base = 0.0;   // --loop 重放时间戳偏移（保持单调，§4.3）
+    double last_play_ts = 0.0;
 
     LOG_INFO("Starting SLAM pipeline (loop closure "
              << (vo.loopClosureEnabled() ? "ON" : "OFF")
+             << (loop ? ", loop replay ON" : "")
              << ")... Press Ctrl+C or close window to exit.");
 
-    while (dataset.nextFrame(image, image_right, timestamp)
-           && (max_frames == 0 || frame_count < max_frames)
-           && (headless || !viewer.shouldQuit())) {
+    while (true) {
+        if (!dataset.nextFrame(image, image_right, timestamp)) {
+            if (!loop) break;
+            dataset = vslam::Dataset(input_path, dataset_type);
+            round_base = last_play_ts + 1.0;
+            LOG_INFO("Dataset EOF: restarting replay (loop mode, ts offset "
+                     << round_base << ")");
+            continue;
+        }
+        if (max_frames != 0 && frame_count >= max_frames) break;
+        if (!headless && viewer.shouldQuit()) break;
         frame_count++;
-        last_ts = timestamp;
+        last_ts = timestamp + round_base;
+        last_play_ts = last_ts;
 
-        // 运行一帧 SLAM（双目：左右目；单目：仅左目）
+        // 运行一帧 SLAM（双目：左右目；单目：仅左目；--loop 重放用偏移时间戳）
         const auto t0 = std::chrono::steady_clock::now();
         vslam::SE3 pose = image_right.empty()
-            ? vo.addFrame(image, timestamp)
-            : vo.addFrame(image, image_right, timestamp);
+            ? vo.addFrame(image, last_ts)
+            : vo.addFrame(image, image_right, last_ts);
         const double frame_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
         latencies.push_back(frame_ms);
         if (frame_ms > static_cast<double>(deadline_ms)) deadline_miss++;
 
         auto st = vo.getStatus();
-        if (st.pose_valid) valid_timestamps.push_back(timestamp);
+        if (st.pose_valid) valid_timestamps.push_back(last_ts);
 
         // LOST 状态迁移计数 + 时长
         if (st.state == vslam::VisualOdometry::State::LOST) {

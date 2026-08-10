@@ -34,12 +34,14 @@ Robot:
     # 关闭时限（join 所有线程）
     shutdown_timeout_ms: 2000
 
-  # M2.2（§6.2）：地图资源硬预算首版参数（resource_budget.h 默认值与此一致）
+  # M2.2（§6.2）：地图资源硬预算（2026-08-10 按 KITTI 00 实测标定：
+  # 原 1200/120000/900 与 §6.5 RSS <1GiB 硬门槛互斥——12 万点实测
+  # RSS≈1.3GB；标定依据与常量见 resource_budget.h，§3.38 记录）
   MapBudget:
     # 活动关键帧 / 地图点上限（§6.3 第 4/6 步触发回收与停止建图）
-    max_active_keyframes: 1200
-    max_active_points: 120000
+    max_active_keyframes: 700
+    max_active_points: 60000
     # 描述子 / 在途 Local BA 快照 / 总量估算上限（MiB）
     max_descriptor_mb: 256
     max_snapshot_mb: 256
-    max_total_estimated_mb: 900
+    max_total_estimated_mb: 500
