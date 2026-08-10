@@ -210,6 +210,9 @@ public:
     /// 获取估计轨迹中的相机位置（世界系 C_w）
     std::vector<Vec3> getTrajectory() const;
 
+    /// 获取轨迹尾部，供实时 Viewer 避免每帧组合完整历史。
+    std::vector<Vec3> getTrajectory(size_t max_points) const;
+
     /// M4：轨迹记录——普通帧不再保存全局 T_cw，只记录相对锚定关键帧的
     /// 局部运动；世界位姿读时组合 T_cw = T_ca · (anchor pose_cs · T_ws⁻¹)。
     /// 回环/子地图对齐只更新锚点（KF 局部位姿 / T_ws），轨迹自动跟随，

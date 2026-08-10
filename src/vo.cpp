@@ -2290,4 +2290,21 @@ std::vector<Vec3> VisualOdometry::getTrajectory() const {
     return trajectory;
 }
 
+std::vector<Vec3> VisualOdometry::getTrajectory(size_t max_points) const {
+    if (max_points == 0) return {};
+
+    std::vector<Vec3> trajectory;
+    // 只从尾部读取有效记录，避免实时可视化随着运行时间增长反复组合全轨迹。
+    std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
+    std::lock_guard<std::mutex> lock(traj_mutex_);
+    trajectory.reserve(std::min(max_points, pose_records_.size()));
+    for (auto it = pose_records_.rbegin();
+         it != pose_records_.rend() && trajectory.size() < max_points; ++it) {
+        if (!it->valid) continue;
+        trajectory.push_back(composeRecordWorld(*it).camera_position());
+    }
+    std::reverse(trajectory.begin(), trajectory.end());
+    return trajectory;
+}
+
 } // namespace vslam

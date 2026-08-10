@@ -338,7 +338,8 @@ int main(int argc, char** argv) {
         if (!headless) {
             viewer.setStatus(status);
             auto cf = vo.currentFrame();
-            viewer.updateFrame(cf->image, cf->keypoints, vo.getTrajectory(),
+            viewer.updateFrame(cf->image, cf->keypoints,
+                               vo.getTrajectory(vslam::Viewer::kMaxTrajectoryPoints),
                                pose, cf->image_right);
         }
 

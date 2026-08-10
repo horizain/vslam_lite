@@ -172,7 +172,8 @@ int main(int argc, char** argv) {
             viewer.setStatus(status);
             // 双目上下排列，避免超宽画面被压缩；单目显示视频流、特征点和世界系轨迹。
             auto cf = vo.currentFrame();
-            viewer.updateFrame(cf->image, cf->keypoints, vo.getTrajectory(),
+            viewer.updateFrame(cf->image, cf->keypoints,
+                               vo.getTrajectory(vslam::Viewer::kMaxTrajectoryPoints),
                                pose, cf->image_right);
         }
 

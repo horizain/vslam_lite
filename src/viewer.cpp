@@ -2,16 +2,99 @@
 
 #include <pangolin/pangolin.h>
 #include <opencv2/imgproc.hpp>
-#include <ranges>
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <thread>
 
 namespace vslam {
 
-Viewer::Viewer() {}
+namespace {
+
+std::vector<std::string> splitStatus(const std::string& status) {
+    std::vector<std::string> parts;
+    size_t begin = 0;
+    while (begin < status.size()) {
+        const size_t end = status.find(" | ", begin);
+        parts.push_back(status.substr(begin, end == std::string::npos
+                                               ? std::string::npos : end - begin));
+        if (end == std::string::npos) break;
+        begin = end + 3;
+    }
+    return parts;
+}
+
+cv::Mat makeStatusImage(const std::string& status) {
+    constexpr int width = 640;
+    constexpr int height = 240;
+    constexpr int margin = 24;
+    constexpr double font_scale = 0.72;
+    constexpr int thickness = 2;
+
+    cv::Mat bgr(height, width, CV_8UC3, cv::Scalar(24, 28, 32));
+    cv::rectangle(bgr, cv::Point(0, 0), cv::Point(width - 1, height - 1),
+                  cv::Scalar(58, 68, 76), 2);
+    cv::putText(bgr, "VSLAM / LIVE STATUS", cv::Point(margin, 34),
+                cv::FONT_HERSHEY_SIMPLEX, 0.72, cv::Scalar(180, 220, 255), 2,
+                cv::LINE_AA);
+    cv::line(bgr, cv::Point(margin, 48), cv::Point(width - margin, 48),
+             cv::Scalar(70, 82, 92), 1, cv::LINE_AA);
+
+    std::vector<std::string> lines;
+    std::string current;
+    for (const auto& part : splitStatus(status)) {
+        const std::string candidate = current.empty() ? part : current + " | " + part;
+        if (!current.empty() &&
+            cv::getTextSize(candidate, cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                            thickness, nullptr).width > width - margin * 2) {
+            lines.push_back(current);
+            current = part;
+        } else {
+            current = candidate;
+        }
+    }
+    if (!current.empty()) lines.push_back(current);
+    if (lines.empty()) lines.emplace_back("Waiting for frames...");
+
+    cv::Scalar state_color(224, 224, 224);
+    if (status.find("LOST") != std::string::npos) {
+        state_color = cv::Scalar(100, 100, 255);
+    } else if (status.find("TRACKING") != std::string::npos) {
+        state_color = cv::Scalar(100, 235, 130);
+    } else if (status.find("RECOVER") != std::string::npos ||
+               status.find("RELOC") != std::string::npos) {
+        state_color = cv::Scalar(80, 215, 255);
+    }
+
+    constexpr int line_height = 38;
+    for (size_t i = 0; i < lines.size() && i < 4; ++i) {
+        cv::putText(bgr, lines[i], cv::Point(margin, 82 + (int)i * line_height),
+                    cv::FONT_HERSHEY_SIMPLEX, font_scale, state_color, thickness,
+                    cv::LINE_AA);
+    }
+
+    cv::Mat rgb;
+    cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+    return rgb;
+}
+
+double gridStep(double range) {
+    const double target = std::max(range / 4.0, 1.0);
+    const double power = std::pow(10.0, std::floor(std::log10(target)));
+    const double normalized = target / power;
+    if (normalized < 2.0) return power;
+    if (normalized < 5.0) return 2.0 * power;
+    return 5.0 * power;
+}
+
+} // namespace
+
+Viewer::Viewer() = default;
 
 void Viewer::start() {
     if (running_) return;
+    quit_ = false;
     running_ = true;
     render_thread_ = std::thread(&Viewer::renderLoop, this);
 }
@@ -27,205 +110,280 @@ void Viewer::updateFrame(const cv::Mat& image,
                          const std::vector<Vec3>& trajectory,
                          const SE3& pose_cs,
                          const cv::Mat& image_right) {
-    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (image.empty()) return;
 
-    auto to_bgr = [](const cv::Mat& img, cv::Mat& out) {
-        if (img.channels() == 1) cv::cvtColor(img, out, cv::COLOR_GRAY2BGR);
-        else if (img.channels() == 4) cv::cvtColor(img, out, cv::COLOR_BGRA2BGR);
-        else out = img.clone();
+    auto toBgr = [](const cv::Mat& img) {
+        cv::Mat bgr;
+        if (img.channels() == 1) {
+            cv::cvtColor(img, bgr, cv::COLOR_GRAY2BGR);
+        } else if (img.channels() == 4) {
+            cv::cvtColor(img, bgr, cv::COLOR_BGRA2BGR);
+        } else {
+            bgr = img.clone();
+        }
+        return bgr;
     };
 
-    // 双目上下拼接，避免 KITTI 这类超宽图横向拼接后宽高比超过 6:1，
-    // 在 Viewer 中被严重压扁；特征点仍画在左目上。
+    cv::Mat rendered_bgr = toBgr(image);
     if (!image_right.empty()) {
-        cv::Mat left_bgr, right_bgr;
-        to_bgr(image, left_bgr);
-        to_bgr(image_right, right_bgr);
-        if (right_bgr.cols != left_bgr.cols) {
+        cv::Mat right_bgr = toBgr(image_right);
+        if (right_bgr.cols != rendered_bgr.cols) {
             cv::resize(right_bgr, right_bgr,
-                       cv::Size(left_bgr.cols,
-                                cvRound(right_bgr.rows * (double)left_bgr.cols / right_bgr.cols)));
+                       cv::Size(rendered_bgr.cols,
+                                cvRound(right_bgr.rows *
+                                        (double)rendered_bgr.cols / right_bgr.cols)));
         }
+        if (show_features_.load(std::memory_order_relaxed)) {
+            for (const auto& kp : keypoints)
+                cv::circle(rendered_bgr, kp.pt, 3, cv::Scalar(0, 235, 120), -1,
+                           cv::LINE_AA);
+        }
+        cv::putText(rendered_bgr, "LEFT", cv::Point(16, 32),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.78, cv::Scalar(0, 220, 255), 2,
+                    cv::LINE_AA);
+        cv::putText(right_bgr, "RIGHT", cv::Point(16, 32),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.78, cv::Scalar(0, 220, 255), 2,
+                    cv::LINE_AA);
+        cv::vconcat(rendered_bgr, right_bgr, rendered_bgr);
+    } else if (show_features_.load(std::memory_order_relaxed)) {
         for (const auto& kp : keypoints)
-            cv::circle(left_bgr, kp.pt, 3, cv::Scalar(0, 255, 0), -1);
-        cv::putText(left_bgr, "LEFT", cv::Point(12, 30),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 255), 2);
-        cv::putText(right_bgr, "RIGHT", cv::Point(12, 30),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 255), 2);
-        cv::vconcat(left_bgr, right_bgr, display_img_);
-    } else {
-        // 单目：视频流优先彩色（单通道灰度则转 BGR）
-        to_bgr(image, display_img_);
-        // 绿色特征点
-        for (const auto& kp : keypoints)
-            cv::circle(display_img_, kp.pt, 3, cv::Scalar(0, 255, 0), -1);
+            cv::circle(rendered_bgr, kp.pt, 3, cv::Scalar(0, 235, 120), -1,
+                       cv::LINE_AA);
     }
 
-    // 状态栏放在图像外部，不遮挡画面。按分隔符自动换行，避免为了塞进
-    // 窄画面而把字体缩得看不清。
-    if (!status_text_.empty()) {
-        const double font_scale = std::clamp(display_img_.cols / 1400.0, 0.65, 0.9);
-        const int thickness = 2;
-        const int margin = 12;
-        const int max_width = display_img_.cols - margin * 2;
+    cv::Mat rendered_rgb;
+    cv::cvtColor(rendered_bgr, rendered_rgb, cv::COLOR_BGR2RGB);
 
-        std::vector<std::string> parts;
-        size_t begin = 0;
-        while (begin < status_text_.size()) {
-            size_t end = status_text_.find(" | ", begin);
-            parts.push_back(status_text_.substr(
-                begin, end == std::string::npos ? end : end - begin));
-            if (end == std::string::npos) break;
-            begin = end + 3;
-        }
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    display_img_ = std::move(rendered_rgb);
 
-        std::vector<std::string> lines;
-        std::string line;
-        for (const auto& part : parts) {
-            std::string candidate = line.empty() ? part : line + " | " + part;
-            if (!line.empty() && cv::getTextSize(candidate, cv::FONT_HERSHEY_SIMPLEX,
-                                                  font_scale, thickness, nullptr).width > max_width) {
-                lines.push_back(line);
-                line = part;
-            } else {
-                line = std::move(candidate);
-            }
-        }
-        if (!line.empty()) lines.push_back(line);
-
-        int baseline = 0;
-        const int text_height = cv::getTextSize("Ag", cv::FONT_HERSHEY_SIMPLEX,
-                                                font_scale, thickness, &baseline).height;
-        const int line_height = text_height + baseline + 8;
-        const int status_height = margin + line_height * (int)lines.size();
-        cv::copyMakeBorder(display_img_, display_img_, 0, status_height, 0, 0,
-                           cv::BORDER_CONSTANT, cv::Scalar(24, 24, 24));
-        const int image_height = display_img_.rows - status_height;
-        for (size_t i = 0; i < lines.size(); i++) {
-            cv::putText(display_img_, lines[i],
-                        cv::Point(margin, image_height + margin + text_height + (int)i * line_height),
-                        cv::FONT_HERSHEY_SIMPLEX, font_scale,
-                        cv::Scalar(255, 255, 255), thickness, cv::LINE_AA);
-        }
-    }
-
-    trajectory_ = trajectory;
+    // Viewer 只需要有限长度的尾部轨迹。上游使用 getTrajectory(max_points)
+    // 时这里不会再复制随运行时间增长的完整历史。
+    constexpr size_t kStoredTrajectoryPoints = Viewer::kMaxTrajectoryPoints;
+    const size_t start = trajectory.size() > kStoredTrajectoryPoints
+        ? trajectory.size() - kStoredTrajectoryPoints : 0;
+    trajectory_.assign(trajectory.begin() + static_cast<std::ptrdiff_t>(start),
+                       trajectory.end());
     camera_pose_wc_ = pose_cs.inverse();
+    ++image_revision_;
+    ++trajectory_revision_;
 }
 
 void Viewer::setStatus(const std::string& text) {
     std::lock_guard<std::mutex> lock(data_mutex_);
-    status_text_ = text;
+    status_img_ = makeStatusImage(text);
+    ++status_revision_;
 }
 
 void Viewer::renderLoop() {
-    pangolin::CreateWindowAndBind("VSLAM Viewer", 1600, 900);
-    glEnable(GL_DEPTH_TEST);
+    pangolin::CreateWindowAndBind("VSLAM Dashboard", 1440, 900);
+    glDisable(GL_DEPTH_TEST);
+    glClearColor(0.035f, 0.045f, 0.055f, 1.0f);
 
-    // 视频区固定占 72%，轨迹区占 28%；不再让 LayoutHorizontal 等分后
-    // 再按宽高比压缩视频，保证单目和双目画面都有足够显示面积。
-    pangolin::View& traj_view = pangolin::Display("trajectory")
-        .SetBounds(0.0, 1.0, 0.0, 0.28, 1.0);
-    pangolin::View& img_view = pangolin::Display("image")
-        .SetBounds(0.0, 1.0, 0.28, 1.0, 640.0 / 480.0);
+    constexpr int panel_width = 220;
+    constexpr int map_width = 340;
+    constexpr int status_height = 180;
 
-    pangolin::GlTexture image_texture(640, 480, GL_RGB, false, 0, GL_RGB, GL_UNSIGNED_BYTE);
+    pangolin::CreatePanel("ui")
+        .SetBounds(0.0, 1.0, 0.0, pangolin::Attach::Pix(panel_width));
+    pangolin::View& image_view = pangolin::Display("image")
+        .SetBounds(0.0, 1.0, pangolin::Attach::Pix(panel_width),
+                   pangolin::Attach::Pix(-map_width), 1.0);
+    pangolin::View& trajectory_view = pangolin::Display("trajectory")
+        .SetBounds(pangolin::Attach::Pix(status_height), 1.0,
+                   pangolin::Attach::Pix(-map_width), 1.0, 1.0);
+    pangolin::View& status_view = pangolin::Display("status")
+        .SetBounds(0.0, pangolin::Attach::Pix(status_height),
+                   pangolin::Attach::Pix(-map_width), 1.0, 640.0 / 240.0);
+
+    pangolin::Var<bool> show_features("ui.Show features", true, true);
+    pangolin::Var<bool> show_grid("ui.Show grid", true, true);
+    pangolin::Var<bool> follow_camera("ui.Follow camera", true, true);
+    pangolin::Var<bool> show_trail("ui.Show trail", true, true);
+    pangolin::Var<bool> pause_render("ui.Pause render", false, true);
+    pangolin::Var<int> trail_points("ui.Trail points", 3000, 200, 3000);
+    pangolin::Var<double> render_fps("ui.Render FPS", 0.0,
+                                    pangolin::META_FLAG_READONLY);
+    pangolin::Var<bool> save_screenshot("ui.Save screenshot", false, false);
+
+    pangolin::GlTexture image_texture(1, 1, GL_RGB, false, 0, GL_RGB,
+                                      GL_UNSIGNED_BYTE);
+    pangolin::GlTexture status_texture(640, 240, GL_RGB, false, 0, GL_RGB,
+                                       GL_UNSIGNED_BYTE);
+
+    cv::Mat image_upload;
+    cv::Mat status_upload;
+    std::vector<Vec3> trajectory_snapshot;
+    SE3 camera_pose_snapshot;
+    uint64_t uploaded_image_revision = 0;
+    uint64_t uploaded_status_revision = 0;
+    uint64_t copied_trajectory_revision = 0;
+    int image_width = 0;
+    int image_height = 0;
+    bool has_image = false;
+    bool image_dirty = false;
+    auto fps_time = std::chrono::steady_clock::now();
+    int rendered_frames = 0;
 
     while (!pangolin::ShouldQuit() && !quit_.load()) {
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        show_features_.store(static_cast<bool>(show_features),
+                             std::memory_order_relaxed);
 
-        // ===== 左：2D 轨迹图 =====
-        traj_view.Activate();
-        {
-            glMatrixMode(GL_PROJECTION);
-            glLoadIdentity();
+        if (pangolin::Pushed(save_screenshot))
+            pangolin::SaveWindowOnRender("vslam_dashboard");
 
-            double range = 50.0;
-            // 只显示最近 kMaxTrajPts 个轨迹点（长跑后轨迹点几十万，全量绘制会卡渲染）
-            constexpr size_t kMaxTrajPts = 3000;
-            size_t traj_start = 0;
-            {
-                std::lock_guard<std::mutex> lock(data_mutex_);
-                if (trajectory_.size() > kMaxTrajPts)
-                    traj_start = trajectory_.size() - kMaxTrajPts;
-                if (!trajectory_.empty()) {
-                    // C++23 ranges：views::drop+transform 映射坐标 → ranges::max 取最大绝对值
-                    auto xs = trajectory_ | std::views::drop(traj_start)
-                                          | std::views::transform([](const Vec3& p) { return std::abs(p.x()); });
-                    auto zs = trajectory_ | std::views::drop(traj_start)
-                                          | std::views::transform([](const Vec3& p) { return std::abs(p.z()); });
-                    range = std::max({std::ranges::max(xs), std::ranges::max(zs), 5.0}) * 1.5;
-                }
+        const bool paused = static_cast<bool>(pause_render);
+        if (!paused) {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            if (uploaded_image_revision != image_revision_ && !display_img_.empty()) {
+                // Mat 的引用计数保证生产者替换下一帧时，本地上传快照仍有效。
+                image_upload = display_img_;
+                uploaded_image_revision = image_revision_;
+                image_width = image_upload.cols;
+                image_height = image_upload.rows;
+                has_image = true;
+                image_dirty = true;
             }
-            glOrtho(-range, range, -range, range, -1, 1);
-            glMatrixMode(GL_MODELVIEW);
-            glLoadIdentity();
-
-            glColor3f(0.4f, 0.4f, 0.4f);
-            glBegin(GL_LINES);
-            glVertex2f(-range, 0); glVertex2f(range, 0);
-            glVertex2f(0, -range); glVertex2f(0, range);
-            glEnd();
-
-            {
-                std::lock_guard<std::mutex> lock(data_mutex_);
-                if (trajectory_.size() >= 2) {
-                    glColor3f(0.0f, 0.9f, 1.0f);
-                    glLineWidth(2.0f);
-                    glBegin(GL_LINE_STRIP);
-                    for (size_t i = traj_start; i < trajectory_.size(); i++)
-                        glVertex2f((float)trajectory_[i].x(), (float)trajectory_[i].z());
-                    glEnd();
-
-                    auto& last = trajectory_.back();
-                    glPointSize(8.0f);
-                    glColor3f(1.0f, 0.3f, 0.3f);
-                    glBegin(GL_POINTS);
-                    glVertex2f((float)last.x(), (float)last.z());
-                    glEnd();
-
-                    // 红色箭头表示相机光轴在 x-z 平面的朝向。原地旋转时位置应固定，
-                    // 只有箭头转动，便于直接区分“姿态变化”和“平移轨迹”。
-                    Vec3 forward = camera_pose_wc_.q * Vec3(0.0, 0.0, 1.0);
-                    double forward_xz = std::hypot(forward.x(), forward.z());
-                    if (forward_xz > 1e-6) {
-                        double arrow_length = std::max(range * 0.08, 0.5);
-                        glLineWidth(3.0f);
-                        glBegin(GL_LINES);
-                        glVertex2f((float)last.x(), (float)last.z());
-                        glVertex2f((float)(last.x() + arrow_length * forward.x() / forward_xz),
-                                   (float)(last.z() + arrow_length * forward.z() / forward_xz));
-                        glEnd();
-                    }
-                }
+            if (copied_trajectory_revision != trajectory_revision_) {
+                trajectory_snapshot = trajectory_;
+                camera_pose_snapshot = camera_pose_wc_;
+                copied_trajectory_revision = trajectory_revision_;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            if (uploaded_status_revision != status_revision_ && !status_img_.empty()) {
+                status_upload = status_img_;
+                uploaded_status_revision = status_revision_;
             }
         }
 
-        // ===== 右：视频流 + 绿色特征点 =====
-        img_view.Activate();
-        {
-            std::lock_guard<std::mutex> lock(data_mutex_);
-            if (!display_img_.empty()) {
-                int w = display_img_.cols, h = display_img_.rows;
-                img_view.SetAspect((double)w / (double)h);  // 宽高比自适应图像尺寸
-                if (image_texture.width != w || image_texture.height != h)
-                    image_texture.Reinitialise(w, h, GL_RGB, false, 0, GL_RGB, GL_UNSIGNED_BYTE);
-                cv::Mat rgb;
-                cv::cvtColor(display_img_, rgb, cv::COLOR_BGR2RGB);
-                if (!rgb.isContinuous()) rgb = rgb.clone();
-                // OpenGL 默认 GL_UNPACK_ALIGNMENT=4；RGB 每像素 3 字节，当图像行宽
-                // 不是 4 的倍数时会跨行错读，表现为视频逐行倾斜。
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                image_texture.Upload(rgb.data, GL_RGB, GL_UNSIGNED_BYTE);
-                image_texture.RenderToViewportFlipY();
+        if (has_image && image_dirty && image_upload.data) {
+            image_view.SetAspect((double)image_width / (double)image_height);
+            if (image_texture.width != image_width || image_texture.height != image_height)
+                image_texture.Reinitialise(image_width, image_height, GL_RGB, false, 0,
+                                           GL_RGB, GL_UNSIGNED_BYTE);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            image_texture.Upload(image_upload.data, GL_RGB, GL_UNSIGNED_BYTE);
+            image_dirty = false;
+        }
+        if (!status_upload.empty()) {
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            status_texture.Upload(status_upload.data, GL_RGB, GL_UNSIGNED_BYTE);
+            status_upload.release();
+        }
+
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        image_view.Activate();
+        if (has_image) image_texture.RenderToViewportFlipY();
+
+        // 右上：世界系 X-Z 俯视轨迹。跟随模式把当前相机放在视图中心，
+        // 便于观察局部运动；关闭后保持世界原点，适合查看全局路线。
+        trajectory_view.Activate();
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        double center_x = 0.0;
+        double center_z = 0.0;
+        size_t trail_start = 0;
+        if (!trajectory_snapshot.empty()) {
+            trail_start = trajectory_snapshot.size() > static_cast<size_t>(trail_points)
+                ? trajectory_snapshot.size() - static_cast<size_t>(trail_points) : 0;
+            if (!static_cast<bool>(show_trail)) trail_start = trajectory_snapshot.size() - 1;
+            if (static_cast<bool>(follow_camera)) {
+                center_x = trajectory_snapshot.back().x();
+                center_z = trajectory_snapshot.back().z();
             }
+        }
+
+        double range = 5.0;
+        for (size_t i = trail_start; i < trajectory_snapshot.size(); ++i) {
+            range = std::max({range,
+                              std::abs(trajectory_snapshot[i].x() - center_x),
+                              std::abs(trajectory_snapshot[i].z() - center_z)});
+        }
+        range *= 1.25;
+        glOrtho(center_x - range, center_x + range,
+                center_z - range, center_z + range, -1.0, 1.0);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+
+        if (static_cast<bool>(show_grid)) {
+            const double step = gridStep(range);
+            glColor3f(0.14f, 0.18f, 0.21f);
+            glLineWidth(1.0f);
+            glBegin(GL_LINES);
+            for (double x = center_x - range; x <= center_x + range; x += step) {
+                glVertex2f((float)x, (float)(center_z - range));
+                glVertex2f((float)x, (float)(center_z + range));
+            }
+            for (double z = center_z - range; z <= center_z + range; z += step) {
+                glVertex2f((float)(center_x - range), (float)z);
+                glVertex2f((float)(center_x + range), (float)z);
+            }
+            glEnd();
+        }
+
+        glColor3f(0.32f, 0.38f, 0.42f);
+        glLineWidth(1.5f);
+        glBegin(GL_LINES);
+        glVertex2f((float)(center_x - range), (float)center_z);
+        glVertex2f((float)(center_x + range), (float)center_z);
+        glVertex2f((float)center_x, (float)(center_z - range));
+        glVertex2f((float)center_x, (float)(center_z + range));
+        glEnd();
+
+        if (trajectory_snapshot.size() >= 2 &&
+            trail_start < trajectory_snapshot.size() - 1 &&
+            static_cast<bool>(show_trail)) {
+            glColor3f(0.0f, 0.85f, 0.95f);
+            glLineWidth(2.5f);
+            glBegin(GL_LINE_STRIP);
+            for (size_t i = trail_start; i < trajectory_snapshot.size(); ++i)
+                glVertex2f((float)trajectory_snapshot[i].x(),
+                           (float)trajectory_snapshot[i].z());
+            glEnd();
+        }
+
+        if (!trajectory_snapshot.empty()) {
+            const Vec3& last = trajectory_snapshot.back();
+            glPointSize(9.0f);
+            glColor3f(1.0f, 0.32f, 0.25f);
+            glBegin(GL_POINTS);
+            glVertex2f((float)last.x(), (float)last.z());
+            glEnd();
+
+            const Vec3 forward = camera_pose_snapshot.q * Vec3(0.0, 0.0, 1.0);
+            const double forward_xz = std::hypot(forward.x(), forward.z());
+            if (forward_xz > 1e-6) {
+                const double arrow_length = std::max(range * 0.10, 0.5);
+                glColor3f(1.0f, 0.72f, 0.18f);
+                glLineWidth(3.0f);
+                glBegin(GL_LINES);
+                glVertex2f((float)last.x(), (float)last.z());
+                glVertex2f((float)(last.x() + arrow_length * forward.x() / forward_xz),
+                           (float)(last.z() + arrow_length * forward.z() / forward_xz));
+                glEnd();
+            }
+        }
+
+        status_view.Activate();
+        status_texture.RenderToViewportFlipY();
+
+        const auto now = std::chrono::steady_clock::now();
+        ++rendered_frames;
+        const double elapsed = std::chrono::duration<double>(now - fps_time).count();
+        if (elapsed >= 1.0) {
+            render_fps = rendered_frames / elapsed;
+            rendered_frames = 0;
+            fps_time = now;
         }
 
         pangolin::FinishFrame();
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
     }
 
-    pangolin::DestroyWindow("VSLAM Viewer");
+    pangolin::DestroyWindow("VSLAM Dashboard");
 }
 
 } // namespace vslam
