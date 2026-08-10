@@ -14,6 +14,7 @@
 #include "vslam/local_mapper.h"
 #include "vslam/pose_gate.h"
 #include "vslam/relocalizer.h"
+#include "vslam/resource_budget.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -116,6 +117,9 @@ struct VOConfig {
 
     /// 从 yaml 配置加载（缺省字段保持默认值）
     static VOConfig fromYaml(const std::string& path);
+
+    // ---- M2.2 遗留清理：地图资源预算（§6.2/§6.3）----
+    MapBudgetConfig map_budget;   // 首版参数见 §6.2 MapBudget 段（default.yaml）
 };
 
 /// 单目两帧初始化的几何质量（归一化相机坐标）。
@@ -242,6 +246,18 @@ public:
     /// M2.3：后台调度器只读统计（§6.4 backend 指标；Localizer 指标采集用）
     [[nodiscard]] BackendSchedulerStats backendStats() const {
         return backend_scheduler_.stats();
+    }
+
+    /// M2.3 遗留清理：在途 Local BA 快照字节估算（§6.4 map_snapshot_bytes；
+    /// 后台 Local BA 提交后更新；0 = 尚无快照）
+    [[nodiscard]] long long mapSnapshotBytes() const {
+        return map_snapshot_bytes_.load(std::memory_order_relaxed);
+    }
+
+    /// M2.3 遗留清理：§6.3 第 6 步——预算耗尽是否已停止增加地图
+    /// （Localizer 据此上报 Degraded + BackendOverloaded）
+    [[nodiscard]] bool mapGrowthStopped() const {
+        return map_growth_stopped_.load(std::memory_order_relaxed);
     }
 
     /// M2：前端只读快照（§14.1-6）——每帧开头捕获一次，整帧使用同一版本数据。
@@ -445,6 +461,13 @@ private:
     std::vector<Vec3> snap_local_points_s_;
     std::vector<cv::Mat> snap_local_descs_;
     std::vector<std::shared_ptr<MapPoint>> snap_local_mps_;
+
+    // ---- M2.2 遗留清理：§6.3 地图资源预算运行时接线 ----
+    ResourceBudget map_budget_;   ///< 预算引擎（默认 §6.2 参数；VOConfig.map_budget 覆写）
+    std::atomic<bool> map_growth_stopped_{false};   ///< 第 6 步：仍超预算停止建图
+    std::atomic<long long> map_snapshot_bytes_{0};  ///< 在途 Local BA 快照字节估算
+    void enforceMapBudget();      ///< KF 插入后触发；调用方必须已持 map_mutex_ 独占锁
+>>>>>>> c5eca7e (M2 遗留清理: ①backend 提交结果计数（committed/stale/invalid/not_found，§6.4 全量）；②§6.3 预算触发点运行时接线（KF 插入后评估/回收 + stopped_map_growth 停增建图 + Degraded/BackendOverloaded 联动）；③map_snapshot_bytes 接线（在途 Local BA 快照字节估算）)
 };
 
 } // namespace vslam

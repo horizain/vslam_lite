@@ -320,6 +320,16 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME test_metrics COMMAND test_metrics)
 
+    # M2.2/M2.3 遗留清理：预算触发点运行时接线（独立 CTest）
+    add_executable(test_budget_runtime test/test_budget_runtime.cpp)
+    target_link_libraries(test_budget_runtime vslam)
+    target_compile_definitions(test_budget_runtime PRIVATE
+        VSLAM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_budget_runtime PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_budget_runtime COMMAND test_budget_runtime)
+
     # M2.3 soak 快速档（§6.5：循环重放 + 队列/延迟/有效断言 + RSS 采样；
     # 完整档（RSS 门限）与 2 小时档由 nightly 用 --full/--duration-h 执行）
     find_package(Python3 COMPONENTS Interpreter QUIET)

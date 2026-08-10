@@ -27,6 +27,15 @@ struct BackendTask {
     Frame::Ptr curr_kf;               // LoopClosure：当前关键帧
 };
 
+/// §6.4 后端提交结果（M2.3 遗留清理：由 BackendCommitter 调用方上报）。
+/// 对应 CommitStatus 的四类结果——committed/stale/invalid/not_found。
+enum class TaskOutcome {
+    Committed,  ///< stale 检查通过 + 质量验收通过，已原子写回
+    Stale,      ///< 快照版本过期，整笔丢弃，实时状态不变
+    Invalid,    ///< 结果无效（valid=false 或质量指标异常），丢弃
+    NotFound    ///< 目标地图/子地图不存在
+};
+
 /// §6.4 后端调度指标（M2.3）：排队/执行/丢弃计数 + 任务等待年龄。
 /// 覆盖式单任务槽的"覆盖"对被覆盖任务计为 dropped。
 struct BackendSchedulerStats {
@@ -37,6 +46,11 @@ struct BackendSchedulerStats {
     double task_age_max_ms = 0.0; ///< 任务入队→开始执行的最大等待时长
     double task_age_total_ms = 0.0;
     long long age_samples = 0;
+    // ---- §6.4 backend committed/stale/invalid（M2.3 遗留清理：提交结果）----
+    long long committed = 0;      ///< 提交成功并原子写回数
+    long long stale = 0;          ///< 过期丢弃数（stale 检查不过）
+    long long invalid = 0;        ///< 质量验收失败丢弃数
+    long long not_found = 0;      ///< 目标地图/子地图不存在丢弃数
 
     [[nodiscard]] double taskAgeAvgMs() const {
         return age_samples > 0 ? task_age_total_ms / static_cast<double>(age_samples) : 0.0;
@@ -74,15 +88,23 @@ public:
     /// 停止前仍在槽中的任务会被排空执行（与原 backendLoop 一致）。
     void stop();
 
+    /// §6.4（M2.3 遗留清理）：上报一次任务提交结果（线程安全）。
+    void recordTaskOutcome(TaskOutcome outcome);
+
     /// worker 线程是否在运行。
     bool running() const { return running_.load(); }
 
     /// 等待槽是否被占用（容量 1，故为 0/1；诊断/指标用）。
     bool hasPending() const;
 
-    /// §6.4（M2.3）：调度统计快照（线程安全；stale/invalid 属提交器计数，
-    /// 见 BackendCommitter——M2.3 未接入，见 DEVELOPMENT_LOG §3.37）。
+    /// §6.4（M2.3）：调度统计快照（线程安全）。
+    /// committed/stale/invalid/not_found 由执行侧在提交后经
+    /// recordTaskOutcome() 上报（M2.3 遗留清理：§6.4 要求全量计数）。
     [[nodiscard]] BackendSchedulerStats stats() const;
+
+    /// §6.4（M2.3 遗留清理）：上报一次任务提交结果（stale 检查 + 质量
+    /// 验收后的最终状态；由任务执行侧在 BackendCommitter::commit 后调用，
+    /// 与 BackendTask 类型无关，线程安全）。
 
 private:
     void loop();
@@ -103,6 +125,11 @@ private:
     std::atomic<double> task_age_max_ms_{0.0};
     std::atomic<double> task_age_total_ms_{0.0};
     std::atomic<long long> age_samples_{0};
+    // ---- §6.4 提交结果（M2.3 遗留清理）----
+    std::atomic<long long> committed_{0};
+    std::atomic<long long> stale_{0};
+    std::atomic<long long> invalid_{0};
+    std::atomic<long long> not_found_{0};
 };
 
 } // namespace vslam

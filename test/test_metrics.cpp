@@ -183,6 +183,45 @@ void test_backend_stats_transfer() {
     } TEST_PASS();
 }
 
+void test_backend_commit_outcomes() {
+    TEST("collector: backend committed/stale/invalid/not_found 计数") {
+        BackendScheduler scheduler([](BackendTask&) {});
+        scheduler.recordTaskOutcome(vslam::TaskOutcome::Committed);
+        scheduler.recordTaskOutcome(vslam::TaskOutcome::Committed);
+        scheduler.recordTaskOutcome(vslam::TaskOutcome::Stale);
+        scheduler.recordTaskOutcome(vslam::TaskOutcome::Invalid);
+        scheduler.recordTaskOutcome(vslam::TaskOutcome::NotFound);
+        const auto stats = scheduler.stats();
+        assert(stats.committed == 2);
+        assert(stats.stale == 1);
+        assert(stats.invalid == 1);
+        assert(stats.not_found == 1);
+
+        MetricsCollector collector;
+        collector.recordBackend(stats);
+        const MetricsSnapshot s = collector.snapshot();
+        assert(s.backend_committed == 2);
+        assert(s.backend_stale == 1);
+        assert(s.backend_invalid == 1);
+        assert(s.backend_not_found == 1);
+        assert(collector.toJson().find("backend_committed") != std::string::npos);
+        assert(collector.toCsv().find("backend_committed") != std::string::npos);
+    } TEST_PASS();
+}
+
+void test_map_snapshot_bytes_reported() {
+    TEST("collector: map_snapshot_bytes 上报后非 -1") {
+        MetricsCollector collector;
+        const MetricsSnapshot empty = collector.snapshot();
+        assert(empty.map_snapshot_bytes == -1 && "未上报保持 -1 哨兵");
+        collector.recordMap(10, 100, 200, 1024, 2048, 4096, 8192);
+        const MetricsSnapshot s = collector.snapshot();
+        assert(s.map_keyframes == 10);
+        assert(s.map_snapshot_bytes == 4096);
+        assert(s.map_estimated_total_bytes == 8192);
+    } TEST_PASS();
+}
+
 void test_json_output() {
     TEST("collector: JSON 输出包含全部 §6.4 键") {
         MetricsCollector collector(80);
@@ -202,6 +241,8 @@ void test_json_output() {
                                 "failure_reasons", "backend_submitted", "backend_executed",
                                 "backend_dropped", "backend_pending",
                                 "backend_task_age_max_ms", "backend_task_age_avg_ms",
+                                "backend_committed", "backend_stale", "backend_invalid",
+                                "backend_not_found",
                                 "loop_committed", "map_keyframes", "map_points",
                                 "map_observations", "map_descriptor_bytes",
                                 "map_image_bytes", "map_snapshot_bytes",
@@ -285,6 +326,8 @@ int main() {
     test_pose_and_reason_counters();
     test_lost_segments_and_relocalization_latency();
     test_backend_stats_transfer();
+    test_backend_commit_outcomes();
+    test_map_snapshot_bytes_reported();
     test_json_output();
     test_csv_output();
     test_concurrent_recording();

@@ -153,6 +153,10 @@ MetricsSnapshot MetricsCollector::snapshot() const {
     s.backend_task_age_max_ms = backend_stats_.age_samples > 0
         ? backend_stats_.task_age_max_ms : -1.0;
     s.backend_task_age_avg_ms = backend_stats_.taskAgeAvgMs();
+    s.backend_committed = backend_stats_.committed;
+    s.backend_stale = backend_stats_.stale;
+    s.backend_invalid = backend_stats_.invalid;
+    s.backend_not_found = backend_stats_.not_found;
     s.loop_committed = loop_committed_;
     s.map_keyframes = map_keyframes_;
     s.map_points = map_points_;
@@ -210,6 +214,10 @@ std::string MetricsCollector::toJson() const {
     os << "  \"backend_pending\": " << s.backend_pending << ",\n";
     os << "  \"backend_task_age_max_ms\": " << s.backend_task_age_max_ms << ",\n";
     os << "  \"backend_task_age_avg_ms\": " << s.backend_task_age_avg_ms << ",\n";
+    os << "  \"backend_committed\": " << s.backend_committed << ",\n";
+    os << "  \"backend_stale\": " << s.backend_stale << ",\n";
+    os << "  \"backend_invalid\": " << s.backend_invalid << ",\n";
+    os << "  \"backend_not_found\": " << s.backend_not_found << ",\n";
     os << "  \"loop_committed\": " << s.loop_committed << ",\n";
     os << "  \"map_keyframes\": " << s.map_keyframes << ",\n";
     os << "  \"map_points\": " << s.map_points << ",\n";
@@ -235,7 +243,9 @@ std::string MetricsCollector::toCsv() const {
           "features_avg,stereo_points_avg,pnp_inliers_avg,pnp_inlier_ratio_avg,"
           "pnp_rmse_avg,pose_accepted,pose_rejected,pose_prediction_only,"
           "backend_submitted,backend_executed,backend_dropped,backend_pending,"
-          "backend_task_age_max_ms,backend_task_age_avg_ms,loop_committed,"
+          "backend_task_age_max_ms,backend_task_age_avg_ms,"
+          "backend_committed,backend_stale,backend_invalid,backend_not_found,"
+          "loop_committed,"
           "map_keyframes,map_points,map_observations,map_descriptor_bytes,"
           "map_image_bytes,map_snapshot_bytes,map_estimated_total_bytes,"
           "lost_count,lost_duration_s,relocalization_latency_p95_ms\n";
@@ -250,8 +260,10 @@ std::string MetricsCollector::toCsv() const {
        << s.pose_accepted << "," << s.pose_rejected << "," << s.pose_prediction_only
        << "," << s.backend_submitted << "," << s.backend_executed << ","
        << s.backend_dropped << "," << s.backend_pending << ","
-       << s.backend_task_age_max_ms << "," << s.backend_task_age_avg_ms << ","
-       << s.loop_committed << "," << s.map_keyframes << "," << s.map_points << ","
+        << s.backend_task_age_max_ms << "," << s.backend_task_age_avg_ms << ","
+        << s.backend_committed << "," << s.backend_stale << ","
+        << s.backend_invalid << "," << s.backend_not_found << ","
+        << s.loop_committed << "," << s.map_keyframes << "," << s.map_points << ","
        << s.map_observations << "," << s.map_descriptor_bytes << ","
        << s.map_image_bytes << "," << s.map_snapshot_bytes << ","
        << s.map_estimated_total_bytes << "," << s.lost_count << ","

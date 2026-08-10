@@ -67,7 +67,20 @@ BackendSchedulerStats BackendScheduler::stats() const {
     s.task_age_max_ms = task_age_max_ms_.load(std::memory_order_relaxed);
     s.task_age_total_ms = task_age_total_ms_.load(std::memory_order_relaxed);
     s.age_samples = age_samples_.load(std::memory_order_relaxed);
+    s.committed = committed_.load(std::memory_order_relaxed);
+    s.stale = stale_.load(std::memory_order_relaxed);
+    s.invalid = invalid_.load(std::memory_order_relaxed);
+    s.not_found = not_found_.load(std::memory_order_relaxed);
     return s;
+}
+
+void BackendScheduler::recordTaskOutcome(TaskOutcome outcome) {
+    switch (outcome) {
+        case TaskOutcome::Committed: committed_.fetch_add(1); break;
+        case TaskOutcome::Stale:     stale_.fetch_add(1);     break;
+        case TaskOutcome::Invalid:   invalid_.fetch_add(1);   break;
+        case TaskOutcome::NotFound:  not_found_.fetch_add(1); break;
+    }
 }
 
 void BackendScheduler::loop() {

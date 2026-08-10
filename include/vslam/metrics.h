@@ -46,18 +46,23 @@ struct MetricsSnapshot {
     /// 每类 FailureReason 计数（按枚举序；0 = 无失败）
     std::array<long long, 11> failure_reasons{};
 
-    // ---- backend（§6.4；stale/invalid 数据源在 BackendCommitter，M2.3 未接）----
+    // ---- backend（§6.4；stale/invalid 数据源在 BackendCommitter，M2.3 遗留清理后已接）----
     long long backend_submitted = 0;
     long long backend_executed = 0;
     long long backend_dropped = 0;
     long long backend_pending = 0;
     double backend_task_age_max_ms = -1.0;
     double backend_task_age_avg_ms = -1.0;
+    /// 提交结果计数（§6.4 backend committed/stale/invalid；queued 即 submitted）
+    long long backend_committed = 0;
+    long long backend_stale = 0;
+    long long backend_invalid = 0;
+    long long backend_not_found = 0;
 
     // ---- loop（§6.4；committed 已接，queried/candidates/verified 未接）----
     long long loop_committed = 0;
 
-    // ---- map / RSS（§6.4；snapshot_bytes 由外部上报）----
+    // ---- map / RSS（§6.4；snapshot_bytes 由 VO 在途 Local BA 快照上报）----
     long long map_keyframes = 0;
     long long map_points = 0;
     long long map_observations = 0;

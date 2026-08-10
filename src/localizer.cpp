@@ -217,7 +217,11 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
     has_last_timestamp_ = true;
 
     // M0 质量映射：pose_valid → Full，否则 Failed；Weak 细分留给 M3 质量门。
-    const FrameQuality q = st.pose_valid ? FrameQuality::Full : FrameQuality::Failed;
+    FrameQuality q = st.pose_valid ? FrameQuality::Full : FrameQuality::Failed;
+    // M2.2 遗留清理（§6.3 第 6 步）：预算耗尽停止建图期间，跟踪质量压为
+    // Weak——状态机连续 2 帧后进入 Degraded；reason 上报 BackendOverloaded。
+    const bool budget_stopped = vo_->mapGrowthStopped();
+    if (q == FrameQuality::Full && budget_stopped) q = FrameQuality::Weak;
 
     PoseEstimate out;
     out.sequence = seq;
@@ -234,6 +238,9 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
         if (sm_out.quality == FrameQuality::Weak) out.covariance *= 4.0;  // §4.2 弱质量 ×4
         out.state = sm_out.state;
         out.reason = sm_out.reason;
+        // §6.3 第 6 步（M2.2 遗留清理）：预算停止建图期间计入 BackendOverloaded
+        // （reason 覆盖：质量压弱已使状态进入 Degraded，原因码由预算决定）
+        if (budget_stopped && out.pose_valid) out.reason = FailureReason::BackendOverloaded;
         out.pose_valid = sm_out.pose_valid;
         out.prediction_only = sm_out.prediction_only;
         latest_estimate_ = out;
@@ -279,7 +286,8 @@ void Localizer::feedFinalMetrics() {
     metrics_.recordMap(static_cast<long long>(map->keyFrameCount()),
                        static_cast<long long>(map->mapPointCount()), observations,
                        static_cast<long long>(ResourceBudget::descriptorBytes(map)),
-                       static_cast<long long>(ResourceBudget::imageBytes(map)), -1,
+                       static_cast<long long>(ResourceBudget::imageBytes(map)),
+                       vo_->mapSnapshotBytes(),
                        static_cast<long long>(
                            ResourceBudget{}.evaluate(map).estimated_total_bytes));
 }
@@ -358,7 +366,8 @@ MetricsSnapshot Localizer::metricsSnapshot() const {
         metrics_.recordMap(static_cast<long long>(map->keyFrameCount()),
                            static_cast<long long>(map->mapPointCount()), observations,
                            static_cast<long long>(ResourceBudget::descriptorBytes(map)),
-                           static_cast<long long>(ResourceBudget::imageBytes(map)), -1,
+                           static_cast<long long>(ResourceBudget::imageBytes(map)),
+                           vo_->mapSnapshotBytes(),
                            static_cast<long long>(
                                ResourceBudget{}.evaluate(map).estimated_total_bytes));
     }

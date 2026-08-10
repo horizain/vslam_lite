@@ -109,6 +109,9 @@ public:
     [[nodiscard]] static size_t imageBytes(const Map::Ptr& map);
     [[nodiscard]] static size_t matBytes(const cv::Mat& mat);
 
+    /// 只读配置（VO 恢复 stopped_map_growth 时做轻量判据）
+    [[nodiscard]] const MapBudgetConfig& config() const { return config_; }
+
 private:
     /// 第 4 步：相邻 KF 对是否冗余（位姿差 + 共视重叠率）
     [[nodiscard]] bool redundantPair(const Frame::Ptr& older,

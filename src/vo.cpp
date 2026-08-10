@@ -19,6 +19,17 @@ namespace vslam {
 
 namespace {
 
+/// §6.4（M2.3 遗留清理）：BackendCommitter 结果 → 调度统计结果
+TaskOutcome toTaskOutcome(CommitStatus s) {
+    switch (s) {
+        case CommitStatus::COMMITTED: return TaskOutcome::Committed;
+        case CommitStatus::STALE:     return TaskOutcome::Stale;
+        case CommitStatus::INVALID:   return TaskOutcome::Invalid;
+        case CommitStatus::NOT_FOUND: return TaskOutcome::NotFound;
+    }
+    return TaskOutcome::Invalid;
+}
+
 /// M1.4：从 VOConfig 快照跟踪相关字段到 FrontendTracker 配置
 ///（构造函数调用一次；运行期 cfg_ 的跟踪字段不改变，快照一致）
 TrackerConfig buildTrackerConfig(const VOConfig& cfg) {
@@ -197,6 +208,14 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (r["async_backend"])  cfg.async_backend  = r["async_backend"].as<bool>();
             if (r["rng_seed"])       cfg.rng_seed       = r["rng_seed"].as<int>();
         }
+        // M2.2 遗留清理：§6.2 MapBudget 段（首版参数；缺省保持默认值）
+        if (auto b = root["MapBudget"]) {
+            if (b["max_active_keyframes"])    cfg.map_budget.max_active_keyframes = b["max_active_keyframes"].as<size_t>();
+            if (b["max_active_points"])       cfg.map_budget.max_active_points    = b["max_active_points"].as<size_t>();
+            if (b["max_descriptor_mb"])       cfg.map_budget.max_descriptor_mb    = b["max_descriptor_mb"].as<size_t>();
+            if (b["max_snapshot_mb"])         cfg.map_budget.max_snapshot_mb      = b["max_snapshot_mb"].as<size_t>();
+            if (b["max_total_estimated_mb"])  cfg.map_budget.max_total_estimated_mb = b["max_total_estimated_mb"].as<size_t>();
+        }
         if (auto v = root["VO"]) {
             if (v["method"])              cfg.feature_method       = v["method"].as<int>();
             if (v["min_parallax"])        cfg.min_parallax           = v["min_parallax"].as<double>();
@@ -271,6 +290,7 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
                    cfg.pyramid_levels, cfg.orb_max_bands),
       frontend_tracker_(camera, buildTrackerConfig(cfg)),
       local_mapper_(camera),
+      map_budget_(cfg.map_budget),  // M2.2 遗留清理：§6.3 预算引擎配置绑定
       backend_scheduler_([this](BackendTask& task) { runBackendTask(task); }) {
     map_ = atlas_->createSubmap(SE3()).map;
     if (cfg_.opencv_threads > 0) {
@@ -324,6 +344,13 @@ SE3 VisualOdometry::addFrame(const cv::Mat& left, const cv::Mat& right, double t
 SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, double timestamp) {
     PERF_SCOPE("vo.frame_total");
     unsigned long frame_id = frame_count_++;
+
+    // M2.2 遗留清理（§6.3 第 6 步）：预算停止建图后的轻量恢复复查——地图
+    // 回到 KF 上限内即解除（只读原子计数，无锁、每帧 O(1)）。
+    if (map_growth_stopped_.load(std::memory_order_relaxed) &&
+        map_->keyFrameCount() <= map_budget_.config().max_active_keyframes) {
+        map_growth_stopped_ = false;
+    }
     LOG_INFO("--- Frame " << frame_id << " ---");
 
     // 先复制 Mat 头，兼容调用方把 currentFrame()->image 直接作为下一帧输入；
@@ -1515,6 +1542,10 @@ bool VisualOdometry::insertKeyFrame() {
 
     LOG_INFO("New KF. mp=" << map_->mapPointCount());
 
+    // M2.2 遗留清理（§6.3）：KF 插入后触发预算检查——超限按固定顺序回收；
+    // 预算内 evaluate 零副作用（确定性回归不受影响）。
+    enforceMapBudget();
+
     if (cfg_.async_backend) {
         // ---- 异步路径：Local BA / 回环检测+校正 提交后台线程 ----
         if (cfg_.enable_local_ba) {
@@ -1851,6 +1882,8 @@ bool VisualOdometry::handleLoopCorrection(
         // （abcd4/abcd9 实测：loop_skip 保护端点位姿但点仍被写回）。
         const CommitStatus commit_status =
             BackendCommitter::commit(map_, loop_result, {}, 0.0, snap_map);
+        // §6.4（M2.3 遗留清理）：提交结果上报（committed/stale/invalid/not_found）
+        backend_scheduler_.recordTaskOutcome(toTaskOutcome(commit_status));
         if (commit_status != CommitStatus::COMMITTED) {
             LOG_WARN("Loop correction commit failed (status "
                      << (int)commit_status << ")");
@@ -2006,7 +2039,9 @@ void VisualOdometry::runWindowLocalBA(
     if (!result.valid) return;
     // INVALID 直接丢弃；STALE 由覆盖式队列里的更新任务自然追赶。
     // 对同一有效图重算不会改变质量验收结果，只会把 BA 成本翻倍。
-    (void)applyLocalBAResult(result, skip, snapshot_map, snapshot_submap_id);
+    const CommitStatus ba_status =
+        applyLocalBAResult(result, skip, snapshot_map, snapshot_submap_id);
+    backend_scheduler_.recordTaskOutcome(toTaskOutcome(ba_status));
 }
 
 OptimizationSnapshot VisualOdometry::buildLocalBASnapshot(
@@ -2052,6 +2087,53 @@ void VisualOdometry::submitBackendTask(BackendTask task) {
     backend_scheduler_.submit(std::move(task));
 }
 
+void VisualOdometry::enforceMapBudget() {
+    // M2.2 遗留清理（§6.3）：预算触发点。调用方（insertKeyFrame）已持
+    // map_mutex_ 独占锁。回收前先轻量复查 stopped 是否可解除：
+    // 地图回到 KF 上限内即恢复建图（后续 KF 插入重新走完整评估）。
+    const size_t kf_limit = map_budget_.config().max_active_keyframes;
+    if (map_growth_stopped_.load(std::memory_order_relaxed) &&
+        map_->keyFrameCount() <= kf_limit) {
+        map_growth_stopped_ = false;
+    }
+    if (map_budget_.evaluate(map_).within_budget) return;
+
+    // 保护集：回环约束两端 KF + 当前参考帧/当前帧（§6.3：不得随机删除锚点，
+    // 冗余剔除必须跳过回环/子地图锚点；最近窗口 KF 由 reclaim 内部按 id 保护）。
+    std::unordered_set<KeyframeId> protected_ids;
+    for (const auto& e : loop_edges_) {
+        protected_ids.insert(e.a);
+        protected_ids.insert(e.b);
+    }
+    if (ref_frame_) protected_ids.insert(ref_frame_->id);
+    if (curr_frame_) protected_ids.insert(curr_frame_->id);
+
+    // 非活动子地图 → 其 KF id 列表（第 5 步冻结/卸载图像用）
+    std::unordered_map<SubmapId, std::vector<KeyframeId>> submap_keyframes;
+    const Submap* active = atlas_->activeSubmap();
+    for (const auto& s : atlas_->submaps()) {
+        if (active && s.id == active->id) continue;
+        if (!s.map) continue;
+        std::vector<KeyframeId> ids;
+        for (const auto& kf : s.map->getAllKeyFrames()) ids.push_back(kf->id);
+        submap_keyframes[s.id] = std::move(ids);
+    }
+
+    const BudgetReclaimResult r =
+        map_budget_.reclaim(map_, protected_ids, submap_keyframes, 0);
+    map_growth_stopped_ = r.stopped_map_growth;
+    if (r.stopped_map_growth) {
+        LOG_WARN("Map budget exhausted: map growth stopped (KF="
+                 << map_->keyFrameCount() << ", pts=" << map_->mapPointCount() << ")");
+    } else if (r.removed_zero_obs_points || r.removed_weak_stale_points ||
+               r.culled_redundant_keyframes || r.unloaded_kf_images) {
+        LOG_INFO("Map budget reclaimed: zero-obs=" << r.removed_zero_obs_points
+                 << " weak-stale=" << r.removed_weak_stale_points
+                 << " unloaded-img=" << r.unloaded_kf_images
+                 << " culled-kf=" << r.culled_redundant_keyframes);
+    }
+}
+
 void VisualOdometry::runBackendTask(BackendTask& task) {
     // M1.3：调度器 worker 的任务分发（原 backendLoop 的任务执行部分）。
     // 锁序：本函数在调度器槽锁之外执行；任务内部再按需获取 map/traj 锁，
@@ -2065,6 +2147,15 @@ void VisualOdometry::runBackendTask(BackendTask& task) {
 void VisualOdometry::runBackendLocalBA(const BackendTask& task) {
     // 后台执行窗口 Local BA（统一入口 runWindowLocalBA：快照隔离 +
     // 跳过活动参考帧写回 + 正式弱观测点前置过滤）
+    // §6.4（M2.3 遗留清理）：在途快照字节估算——窗口 KF 描述子 +
+    // 其引用点描述子（深拷贝的主要字节来源，重复引用近似计一次）
+    size_t bytes = 0;
+    for (const auto& kf : task.window) {
+        bytes += ResourceBudget::matBytes(kf->descriptors);
+        for (const auto& mp : kf->map_points)
+            if (mp) bytes += ResourceBudget::matBytes(mp->descriptor);
+    }
+    map_snapshot_bytes_ = static_cast<long long>(bytes);
     runWindowLocalBA(task.window, task.anchor_kf_id,
                      task.map, task.submap_id);
 }
@@ -2146,6 +2237,9 @@ void VisualOdometry::triangulateNewPoints(
 
 bool VisualOdometry::needNewKeyFrame() const {
     if (!ref_frame_ || !curr_frame_ || !snap_.has_ref) return false;
+    // M2.2 遗留清理（§6.3 第 6 步）：预算耗尽停止增加地图，KF 提议直接拒绝
+    // （恢复条件：地图回到预算内——addFrame 每帧轻量复查，见 enforceMapBudget）
+    if (map_growth_stopped_.load(std::memory_order_relaxed)) return false;
     // M1.4：关键帧提议迁移至 FrontendTracker::proposeKeyFrame（§5.5），
     // 判定公式与阈值与旧 needNewKeyFrame 逐项一致。
     KeyframeInput input;
