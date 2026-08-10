@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
     vslam::Dataset::Type dataset_type = vslam::Dataset::Type::KITTI;
     std::string config_path = "config/default.yaml";
     std::string traj_path   = "trajectory.txt";
+    std::string robot_yaml_path = "config/robot.yaml";  // M0.3 Localizer 配置（相对路径从仓库根启动）
 
     // ---- 解析命令行参数（与 run_vo 相同）----
     bool headless = false;
@@ -45,7 +46,8 @@ int main(int argc, char** argv) {
     int max_frames = 0;  // 0 = 全程；>0 = 只处理前 N 帧（性能/回归测试用）
     int skip_frames = 0; // 跳过前 N 帧（性能分片测试用）
     std::string status_csv_path;    // M1 确定性回归：逐帧状态/计数 CSV
-    std::string metrics_json_path;  // 结构化指标 JSON（benchmark.py 消费）
+    std::string metrics_json_path;  // 结构化指标 JSON（benchmark.py / soak_test.py 消费）
+    std::string metrics_csv_path;   // M2.3（§6.4）：结构化指标 CSV
     long long deadline_ms = 100;    // 单帧延迟门限（10Hz 地面机器人默认 100ms）
     std::vector<std::string> positional;
     for (int i = 1; i < argc; i++) {
@@ -56,6 +58,8 @@ int main(int argc, char** argv) {
         else if (a == "--localizer") use_localizer = true;
         else if (a == "--status-csv" && i + 1 < argc) status_csv_path = argv[++i];
         else if (a == "--metrics-json" && i + 1 < argc) metrics_json_path = argv[++i];
+        else if (a == "--metrics-csv" && i + 1 < argc) metrics_csv_path = argv[++i];
+        else if (a == "--robot-yaml" && i + 1 < argc) robot_yaml_path = argv[++i];
         else if (a == "--deadline-ms" && i + 1 < argc) deadline_ms = std::atoll(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--skip" && i + 1 < argc) skip_frames = std::atoi(argv[++i]);
@@ -113,7 +117,7 @@ int main(int argc, char** argv) {
     if (use_localizer) {
         vslam::VOConfig loc_vo_cfg = vslam::VOConfig::fromYaml(config_path);
         loc_vo_cfg.enable_loop_closure = true;  // 与 run_slam 旧路径一致（A/B 对比）
-        vslam::LocalizerConfig loc_cfg = vslam::LocalizerConfig::fromYaml("config/robot.yaml");
+        vslam::LocalizerConfig loc_cfg = vslam::LocalizerConfig::fromYaml(robot_yaml_path);
         vslam::Localizer localizer(camera, loc_vo_cfg, loc_cfg);
 
         vslam::Viewer viewer;
@@ -161,6 +165,16 @@ int main(int argc, char** argv) {
 
         if (!headless) viewer.stop();
         localizer.stop();
+
+        // M2.3（§6.4）：结构化指标 JSON/CSV（soak_test.py / nightly 消费）
+        if (!metrics_json_path.empty()) {
+            localizer.writeMetricsJson(metrics_json_path);
+            LOG_INFO("Structured metrics -> " << metrics_json_path);
+        }
+        if (!metrics_csv_path.empty()) {
+            localizer.writeMetricsCsv(metrics_csv_path);
+            LOG_INFO("Structured metrics CSV -> " << metrics_csv_path);
+        }
 
         std::ofstream ofs(traj_path);
         if (ofs.is_open()) {

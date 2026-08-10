@@ -6,6 +6,7 @@
 #include "vslam/observation.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -24,6 +25,22 @@ struct BackendTask {
     std::vector<Frame::Ptr> window;   // LocalBA：窗口关键帧（快照在后台锁内构造）
     KeyframeId anchor_kf_id = 0;      // LocalBA：提交时的当前/锚定 KF 身份
     Frame::Ptr curr_kf;               // LoopClosure：当前关键帧
+};
+
+/// §6.4 后端调度指标（M2.3）：排队/执行/丢弃计数 + 任务等待年龄。
+/// 覆盖式单任务槽的"覆盖"对被覆盖任务计为 dropped。
+struct BackendSchedulerStats {
+    long long submitted = 0;      ///< 收到任务总数
+    long long executed = 0;       ///< 实际执行完成数
+    long long dropped = 0;        ///< 槽满/优先级被丢弃（含被 LoopClosure 覆盖）
+    long long pending = 0;        ///< 当前等待槽占用（容量 1，0/1）
+    double task_age_max_ms = 0.0; ///< 任务入队→开始执行的最大等待时长
+    double task_age_total_ms = 0.0;
+    long long age_samples = 0;
+
+    [[nodiscard]] double taskAgeAvgMs() const {
+        return age_samples > 0 ? task_age_total_ms / static_cast<double>(age_samples) : 0.0;
+    }
 };
 
 /// 后台任务调度器（M1.3，§5.4）：单后台线程 + 覆盖式单任务槽。
@@ -63,6 +80,10 @@ public:
     /// 等待槽是否被占用（容量 1，故为 0/1；诊断/指标用）。
     bool hasPending() const;
 
+    /// §6.4（M2.3）：调度统计快照（线程安全；stale/invalid 属提交器计数，
+    /// 见 BackendCommitter——M2.3 未接入，见 DEVELOPMENT_LOG §3.37）。
+    [[nodiscard]] BackendSchedulerStats stats() const;
+
 private:
     void loop();
 
@@ -70,9 +91,18 @@ private:
     mutable std::mutex mutex_;   // 保护槽/等待状态；const 访问器（hasPending）也加锁
     std::condition_variable cv_;
     std::optional<BackendTask> slot_;   // 覆盖式单任务槽（容量 1）
+    std::chrono::steady_clock::time_point slot_enqueued_at_;  // 当前槽任务入队时刻
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> running_{false};
+
+    // ---- §6.4 调度统计（M2.3）----
+    std::atomic<long long> submitted_{0};
+    std::atomic<long long> executed_{0};
+    std::atomic<long long> dropped_{0};
+    std::atomic<double> task_age_max_ms_{0.0};
+    std::atomic<double> task_age_total_ms_{0.0};
+    std::atomic<long long> age_samples_{0};
 };
 
 } // namespace vslam

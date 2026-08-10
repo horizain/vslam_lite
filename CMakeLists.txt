@@ -128,7 +128,8 @@ set(VSLAM_SOURCES
     src/relocalizer.cpp
     src/frontend_tracker.cpp
     src/local_mapper.cpp
-    src/resource_budget.cpp)
+    src/resource_budget.cpp
+    src/metrics.cpp)
 
 set(VSLAM_HEADERS
     include/vslam/common.h
@@ -140,6 +141,7 @@ set(VSLAM_HEADERS
     include/vslam/frontend_tracker.h
     include/vslam/local_mapper.h
     include/vslam/resource_budget.h
+    include/vslam/metrics.h
     include/vslam/bounded_queue.h
     include/vslam/sensor_packet.h
     include/vslam/backend_scheduler.h
@@ -309,6 +311,27 @@ if(BUILD_TESTS)
         target_compile_options(test_resource_budget PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_resource_budget COMMAND test_resource_budget)
+
+    # M2.3 结构化指标（独立 CTest）
+    add_executable(test_metrics test/test_metrics.cpp)
+    target_link_libraries(test_metrics vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_metrics PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_metrics COMMAND test_metrics)
+
+    # M2.3 soak 快速档（§6.5：循环重放 + 队列/延迟/有效断言 + RSS 采样；
+    # 完整档（RSS 门限）与 2 小时档由 nightly 用 --full/--duration-h 执行）
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME test_soak
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/soak_test.py
+                         --bin $<TARGET_FILE:run_slam>
+                         --dataset ${CMAKE_SOURCE_DIR}/datasets/sequences/00
+                         --config ${CMAKE_SOURCE_DIR}/config/default.yaml
+                         --robot-yaml ${CMAKE_SOURCE_DIR}/config/robot.yaml
+                         --frames 200 --rounds 2)
+    endif()
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

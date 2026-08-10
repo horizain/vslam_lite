@@ -1,7 +1,9 @@
 #include "vslam/localizer.h"
+#include "vslam/resource_budget.h"
 
 #include <yaml-cpp/yaml.h>
 
+#include <chrono>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -35,6 +37,11 @@ LocalizerConfig LocalizerConfig::fromYaml(const std::string& path) {
             cfg.enable_async_input = rt["enable_async_input"].as<bool>();
         if (rt["input_queue_capacity"])
             cfg.input_queue_capacity = rt["input_queue_capacity"].as<int>();
+        // M2.3（§6.2/§6.4）：跟踪硬期限与指标采集开关
+        if (rt["tracking_deadline_ms"])
+            cfg.tracking_deadline_ms = rt["tracking_deadline_ms"].as<long long>();
+        if (rt["enable_metrics"])
+            cfg.enable_metrics = rt["enable_metrics"].as<bool>();
     }
     if (robot["T_bc"]) {
         const auto& tbc = robot["T_bc"];
@@ -59,7 +66,8 @@ LocalizerConfig LocalizerConfig::fromYaml(const std::string& path) {
 Localizer::Localizer(const Camera& camera, const VOConfig& vo_cfg,
                      const LocalizerConfig& cfg)
     : camera_(camera), vo_cfg_(vo_cfg), cfg_(cfg),
-      input_queue_(static_cast<size_t>(cfg.input_queue_capacity)) {
+      input_queue_(static_cast<size_t>(cfg.input_queue_capacity)),
+      metrics_(cfg.tracking_deadline_ms) {
     if (!camera_)
         throw std::invalid_argument("Localizer: camera is null");
     if (!isFinite(cfg_.T_bc) || !isUnitQuaternion(cfg_.T_bc.q))
@@ -127,8 +135,12 @@ PoseEstimate Localizer::processFrame(const cv::Mat& left, const cv::Mat& right,
 
     FailureReason reason;
     if (!validateInput(left, right, timestamp, right_timestamp,
-                       last_timestamp_, has_last_timestamp_, reason))
-        return rejectedOutput(timestamp, reason);
+                       last_timestamp_, has_last_timestamp_, reason)) {
+        const PoseEstimate out = rejectedOutput(timestamp, reason);
+        // M2.3（§6.4）：拒绝帧也计入 pose_rejected 与对应 FailureReason
+        if (cfg_.enable_metrics) metrics_.recordPose(out);
+        return out;
+    }
     return processValidFrame(left, right, timestamp);
 }
 
@@ -189,11 +201,16 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
     const uint64_t seq = ++sequence_;
     const double dt = has_last_timestamp_ ? std::max(0.0, timestamp - last_timestamp_) : 0.0;
 
+    // M2.3（§6.4）：单帧跟踪延迟（含输入校验后的 VO 处理；异步模式为
+    // worker 内处理耗时，排队等待不计入）
+    const auto t0 = std::chrono::steady_clock::now();
     // 第一阶段直接委托 VO（§4.1：不修改算法）
     const SE3 T_cw = right.empty()
         ? vo_->addFrame(left, timestamp)
         : vo_->addFrame(left, right, timestamp);
     const VisualOdometry::Status st = vo_->getStatus();
+    const double frame_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
 
     // 只对通过验收的帧推进时间戳（§4.3：拒绝帧不污染后续比较）
     last_timestamp_ = timestamp;
@@ -222,7 +239,49 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
         latest_estimate_ = out;
     }
     out.map_generation = vo_->getMap()->topologyRevision();
+    feedFrameMetrics(out, frame_ms);
     return out;
+}
+
+void Localizer::feedFrameMetrics(const PoseEstimate& out, double frame_ms) {
+    if (!cfg_.enable_metrics) return;
+    metrics_.recordFrameLatency(frame_ms);
+    const VisualOdometry::Status st = vo_->getStatus();
+    const double features = vo_->currentFrame()
+        ? static_cast<double>(vo_->currentFrame()->keypoints.size()) : -1.0;
+    metrics_.recordTracking(features, static_cast<double>(st.stereo_points),
+                            static_cast<double>(st.inliers), st.inlier_ratio,
+                            st.pose_rmse);
+    metrics_.recordPose(out);
+    if (has_last_metric_state_) {
+        metrics_.recordStateChange(last_metric_state_, out.state, out.timestamp);
+    }
+    last_metric_state_ = out.state;
+    has_last_metric_state_ = true;
+    // 输入计数：同步 = 每帧恰好 1 收 1 处理；异步 = 提交总数含队列丢弃
+    if (cfg_.enable_async_input) {
+        metrics_.recordInput(static_cast<long long>(packet_seq_),
+                             static_cast<long long>(input_queue_.droppedCount()),
+                             static_cast<long long>(input_queue_.highWaterMark()));
+    } else {
+        metrics_.recordInput(static_cast<long long>(sequence_), 0, 0);
+    }
+}
+
+void Localizer::feedFinalMetrics() {
+    if (!cfg_.enable_metrics || !vo_) return;
+    metrics_.recordBackend(vo_->backendStats());
+    metrics_.recordLoopCommitted(static_cast<long long>(vo_->loopClosureCount()));
+    const Map::Ptr map = vo_->getMap();
+    long long observations = 0;
+    for (const auto& mp : map->getAllMapPoints())
+        observations += static_cast<long long>(mp->observationCount());
+    metrics_.recordMap(static_cast<long long>(map->keyFrameCount()),
+                       static_cast<long long>(map->mapPointCount()), observations,
+                       static_cast<long long>(ResourceBudget::descriptorBytes(map)),
+                       static_cast<long long>(ResourceBudget::imageBytes(map)), -1,
+                       static_cast<long long>(
+                           ResourceBudget{}.evaluate(map).estimated_total_bytes));
 }
 
 PoseEstimate Localizer::rejectedOutput(double timestamp, FailureReason reason) const {
@@ -255,6 +314,12 @@ void Localizer::stop() {
         std::lock_guard<std::mutex> lock(result_mutex_);
         state_machine_.stop();
     }
+    // M2.3（§6.4）：收尾 backend/loop/map 最终统计（含 LOST 段收口）
+    if (cfg_.enable_metrics && has_last_metric_state_) {
+        metrics_.recordStateChange(last_metric_state_, TrackingState::Stopped,
+                                   last_timestamp_);
+    }
+    feedFinalMetrics();
 }
 
 TrackingState Localizer::state() const {
@@ -277,6 +342,39 @@ size_t Localizer::mapPointCount() const {
 
 size_t Localizer::keyFrameCount() const {
     return vo_ ? vo_->getMap()->keyFrameCount() : 0;
+}
+
+MetricsSnapshot Localizer::metricsSnapshot() const {
+    // M2.3（§6.4）：backend/loop/map 统计在快照时现算（collector 只存值；
+    // metrics_ 为 mutable：const 快照可刷新）。snapshot_bytes 由调用方
+    // 经 collector 上报（M2.3 未接，保持 -1）。
+    if (cfg_.enable_metrics && vo_) {
+        metrics_.recordBackend(vo_->backendStats());
+        metrics_.recordLoopCommitted(static_cast<long long>(vo_->loopClosureCount()));
+        const Map::Ptr map = vo_->getMap();
+        long long observations = 0;
+        for (const auto& mp : map->getAllMapPoints())
+            observations += static_cast<long long>(mp->observationCount());
+        metrics_.recordMap(static_cast<long long>(map->keyFrameCount()),
+                           static_cast<long long>(map->mapPointCount()), observations,
+                           static_cast<long long>(ResourceBudget::descriptorBytes(map)),
+                           static_cast<long long>(ResourceBudget::imageBytes(map)), -1,
+                           static_cast<long long>(
+                               ResourceBudget{}.evaluate(map).estimated_total_bytes));
+    }
+    return metrics_.snapshot();
+}
+
+void Localizer::writeMetricsJson(const std::string& path) const {
+    if (!cfg_.enable_metrics) return;
+    (void)metricsSnapshot();  // 刷新 backend/loop/map 后输出
+    metrics_.writeJson(path);
+}
+
+void Localizer::writeMetricsCsv(const std::string& path) const {
+    if (!cfg_.enable_metrics) return;
+    (void)metricsSnapshot();
+    metrics_.writeCsv(path);
 }
 
 } // namespace vslam

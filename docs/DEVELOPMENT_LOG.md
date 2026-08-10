@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-10（M0 + M1 完成 + M2.1 输入队列 + M2.2 资源预算 §3.25-3.36）
+> 最后更新: 2026-08-10（M0 + M1 完成 + M2 完成：输入队列/资源预算/结构化指标 §3.25-3.37）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -1684,6 +1684,66 @@ snapshot_bytes 上报接线未接，留待 M2.3 指标任务；② 第 5 步的"
 点 2 KB）为保守估计，M7 前按实测统一标定。
 
 下一任务：M2.3 结构化指标（`metrics.{h,cpp}` + `soak_test.py`，§6.4）。
+
+### 3.37 M2.3 结构化指标 + soak 验收（2026-08-10）
+
+按 §6.4/§6.5 落地端到端结构化指标与 soak 脚本，替代正则解析日志：
+
+- **`metrics.{h,cpp}`**：线程安全 `MetricsCollector` + 不可变 `MetricsSnapshot`
+  （§6.4 全清单，未接数据源保留 -1 哨兵）：
+  - frame latency p50/p95/p99/max + deadline miss/ratio；
+  - input received/processed/dropped、queue high-water mark；
+  - tracking 均值（features/stereo/inliers/ratio/RMSE）；
+  - pose accepted/rejected/prediction-only + 每类 FailureReason 计数
+    （类别互斥：prediction_only 不计入 accepted）；
+  - backend submitted/executed/dropped/pending + 任务年龄；
+  - loop committed；map KF/点/Observation/描述子/图像/总量字节；
+  - LOST 次数/时长与 relocalization latency（Relocalizing→Tracking 恢复，
+    p95）；JSON/CSV 序列化与落盘。
+- **BackendScheduler 调度统计**（§6.4 数据源）：submitted/executed/dropped/
+  pending + 入队→执行任务年龄；覆盖式单任务槽的"被覆盖任务"计为 dropped。
+- **vo.h 只读接口** `backendStats()`（范围扩大说明：Localizer 需要经 VO
+  读取调度统计——§12 M2.3 允许列表外的单行 getter，无行为影响）。
+- **Localizer 集成**：同步/异步路径统一喂数据（单帧 latency 计时、VO
+  Status 质量、PoseEstimate、状态机转换、输入计数）；stop 收尾 LOST 段并
+  刷新 backend/loop/map 统计；`metricsSnapshot()` / `writeMetricsJson/Csv`；
+  `LocalizerConfig.enable_metrics / tracking_deadline_ms`（robot.yaml
+  Runtime 段已含 tracking_deadline_ms=80）。
+- **run_slam --localizer**：新增 `--metrics-json/--metrics-csv` 输出与
+  `--robot-yaml` 参数（修复：robot.yaml 硬编码相对路径导致从非仓库根目录
+  启动即 `YAML::BadFile` 崩溃，soak CTest 从 build/ 触发）。
+- **`soak_test.py`**（§6.5）：循环重放同一序列 N 轮（--full=10 轮），
+  零依赖 RSS 采样（/proc VmRSS，0.5 s 间隔），逐轮断言：进程退出码 0
+  （无崩溃/死锁）、latency p99 < 80 ms、deadline miss < 1%、
+  input_queue_hwm <= 3、backend_pending <= 1、valid_ratio >= 0.99；
+  关闭三路径：SIGINT < 2 s 退出、输入 EOF（数据读完自然退出）、构造失败
+  （非法输入快速退出；Localizer 层真实构造失败由 test_localizer_contract
+  覆盖）；--full 档断言 RSS 峰值 < 1 GiB、稳态斜率 < 5 MiB/h（后 50%
+  窗口线性拟合）；--duration-h 2.0 为 §6.5 2 小时档（nightly）。
+  CTest 注册 test_soak 快速档（200 帧 × 2 轮）。
+
+**验收**：
+- CTest 14/14 全过（新增 test_metrics 11 项 + test_soak）。
+- ASan/UBSan（test_metrics/test_backend_scheduler/test_localizer_contract/
+  test_bounded_queue）零报错。
+- 冒烟（KITTI 00，deterministic.yaml 120 帧 --localizer）：JSON 全字段
+  有效——p99 142.8 ms（deterministic 单线程配置固有偏慢，非实时档）、
+  backend 0（async_backend=false 同步路径）、map 78 KF/17349 点/
+  33960 Observation/2.87 MB 描述子/3.73 MB 图像。
+- soak 快速档（default.yaml 300 帧 × 2 轮）：PASS——p99 40.8/45.1 ms
+  （<80 ms）、hwm=0、pending=0、RSS 峰值 797 MB（<1 GiB）。
+
+**未验证边界**：① RSS 稳态斜率 10~12 MiB/h 是 8 秒窗口的启动噪声（词汇表
+加载），§6.5 斜率门限须由 2 小时档（--duration-h 2.0）验证；② grid
+occupancy / PnP condition number 数据源在 M3.1/M3.2（质量门/协方差）；
+③ loop queried/candidates/verified 数据源在 M5（回环确认）；④ backend
+stale/invalid 计数属 BackendCommitter（M2.3 未接入）；⑤ snapshot_bytes
+上报接线仍为 -1（M2.2 遗留，随预算触发点一起接入）。
+
+里程碑：M2（§6.2 实时调度 + §6.3 资源预算 + §6.4 结构化指标）全部落地，
+§6.5 完整验收由 nightly 2 小时 soak 档执行。
+
+下一任务：M3.1 视觉前端质量门（`tracking_quality.{h,cpp}`，§7.1/§7.2）。
 
 ### 3.30 当前版本完整基准评估（KITTI 00 全程 × 5 轮 + GT + RSS，2026-08-08）
 

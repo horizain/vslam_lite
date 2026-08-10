@@ -2,6 +2,7 @@
 
 #include "vslam/bounded_queue.h"
 #include "vslam/localization_types.h"
+#include "vslam/metrics.h"
 #include "vslam/sensor_packet.h"
 #include "vslam/tracking_state_machine.h"
 #include "vslam/vo.h"
@@ -27,6 +28,10 @@ struct LocalizerConfig {
     bool enable_async_input = false;   ///< 传感器回调只校验并入队（跟踪 worker 消费）；
                                        ///< false = 保持 M0 同步路径（processFrame）
     int input_queue_capacity = 3;      ///< 输入队列固定容量（§6.2 首版参数）
+
+    // ---- M2.3 结构化指标（§6.4）----
+    bool enable_metrics = true;        ///< 内部 MetricsCollector 采集开关
+    long long tracking_deadline_ms = 80;  ///< 单帧跟踪硬期限（§6.2：10 Hz 平台 80 ms）
 
     /// 从 robot.yaml 的 Robot 段加载（缺省字段保持默认值；T_bc 不做静默归一化，
     /// 非单位四元数由 Localizer 构造时按 §4.3 拒绝）
@@ -96,6 +101,13 @@ public:
     [[nodiscard]] size_t mapPointCount() const;
     [[nodiscard]] size_t keyFrameCount() const;
 
+    // ---- M2.3 结构化指标（§6.4）----
+    /// §6.4：指标快照（线程安全；含实时 map 字节/规模统计与 backend 计数）
+    [[nodiscard]] MetricsSnapshot metricsSnapshot() const;
+    /// §6.4：输出指标 JSON/CSV（soak_test.py / nightly 消费；禁止正则解析日志）
+    void writeMetricsJson(const std::string& path) const;
+    void writeMetricsCsv(const std::string& path) const;
+
 private:
     bool validateInput(const cv::Mat& left, const cv::Mat& right,
                        double timestamp, double right_timestamp,
@@ -106,6 +118,10 @@ private:
     PoseEstimate rejectedOutput(double timestamp, FailureReason reason) const;
     PoseEstimate stoppedOutput() const;
     void trackingLoop();  // 异步模式跟踪 worker 主循环
+    /// M2.3：喂入每帧指标（latency/tracking/pose/state change/input 计数）
+    void feedFrameMetrics(const PoseEstimate& out, double frame_ms);
+    /// M2.3：喂入后端/回环/地图最终统计（stop 与快照时调用）
+    void feedFinalMetrics();
 
     Camera camera_;
     VOConfig vo_cfg_;
@@ -129,6 +145,12 @@ private:
     double last_timestamp_ = 0.0;  // 处理侧时间戳（同步=调用方线程；异步=worker）
     bool has_last_timestamp_ = false;
     bool stopped_ = false;
+
+    // M2.3（§6.4）：结构化指标采集（enable_metrics=false 时为空实现；
+    // mutable：const metricsSnapshot() 可刷新 backend/map 统计）
+    mutable MetricsCollector metrics_;
+    TrackingState last_metric_state_ = TrackingState::Initializing;
+    bool has_last_metric_state_ = false;
 };
 
 } // namespace vslam

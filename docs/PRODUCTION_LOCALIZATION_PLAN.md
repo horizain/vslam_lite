@@ -1,7 +1,8 @@
 # 从教学 SLAM 到机器人长期定位组件：实施规格
 
-> 状态：M0 完成；M1 全部完成（均确定性验收通过）；M2.1 输入队列完成，
-> M2.2 资源预算 完成；下一步 M2.3 结构化指标
+> 状态：M0 完成；M1 全部完成（均确定性验收通过）；M2 全部完成（输入队列 +
+> 资源预算 + 结构化指标/soak，§6.5 完整验收由 nightly 2 小时档执行）；
+> 下一步 M3.1 视觉前端质量门
 > 基线：`7a22edd`，2026-08-07
 > 适用范围：把当前单目/双目 VO + Local BA + DBoW3 回环 + Atlas 原型，演进为
 > 可供机器人连续运行 8～24 小时的核心定位组件。
@@ -791,7 +792,7 @@ M0
 |---|---|---|
 | M0 API/状态机 | 完成 | M0.1/M0.2/M0.3 全部落地（契约 19 + 状态机 24 + Facade 16 项测试，6/6 CTest 全过） |
 | M1 模块拆分 | 完成 | M1.1~M1.5 全部落地（PoseGate 11 + Relocalizer 9 + BackendScheduler 7 + FrontendTracker 6 + LocalMapper 5 项测试，10/10 CTest 全过，1000 帧确定性验收通过：轨迹逐位一致、旋转差 5.5e-17 rad）；M1.6 基准门已落地（`--metrics-json` + benchmark.py v2 多轮 mean/std/worst + `.githooks/pre-commit`）；下一步 M2 |
-| M2 实时/资源/指标 | 进行中 | M2.1 输入队列已落地（`bounded_queue.h` 固定容量 ring buffer + 丢最旧保最新 + `sensor_packet.h` + Localizer 异步模式：submitFrame 只校验入队、跟踪 worker 消费、hwm/dropped 指标，11 项队列测试）；M2.2 资源预算已落地（`resource_budget.{h,cpp}` §6.3 六步固定顺序回收：0 观测点/弱点陈旧/图像卸载/冗余 KF 剔除/子地图冻结/stopped_map_growth，`Map::removeKeyFrame` + `recordTrackingHit` 旁路统计，robot.yaml `MapBudget` 段，14 项预算测试，KITTI 00 1000 帧确定性逐位一致）；下一步 M2.3 指标（`metrics.{h,cpp}` + `soak_test.py`） |
+| M2 实时/资源/指标 | 完成 | M2.1 输入队列（bounded_queue 固定容量 + 丢最旧保最新 + Localizer 异步 worker + hwm/dropped，11 项测试）；M2.2 资源预算（§6.3 六步固定顺序回收 + Map::removeKeyFrame/最近命中旁路统计 + robot.yaml MapBudget 段，14 项测试，KITTI 00 1000 帧确定性逐位一致）；M2.3 结构化指标（`metrics.{h,cpp}` §6.4 全字段 JSON/CSV + BackendScheduler 调度统计 + Localizer 采集接线 + `soak_test.py` §6.5 循环重放/RSS 采样/三关闭路径，11 项指标测试 + CTest test_soak）。§6.5 完整验收（2 小时 RSS 斜率档）由 nightly 执行；下一步 M3.1 质量门 |
 | M3 前端鲁棒/协方差 | 未开始 | 现有质量 gate 为基础 |
 | M4 地图持久化/纯定位 | 未开始 | 当前无版本化 MapStore |
 | M5 多会话/Atlas 融合 | 未开始 | 当前 Atlas 只连坐标，不融合点 |

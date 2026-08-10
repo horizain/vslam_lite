@@ -239,6 +239,11 @@ public:
     /// (Phase 2) 已闭合的回环次数（状态栏/评估用）
     unsigned long loopClosureCount() const { return loop_closure_count_; }
 
+    /// M2.3：后台调度器只读统计（§6.4 backend 指标；Localizer 指标采集用）
+    [[nodiscard]] BackendSchedulerStats backendStats() const {
+        return backend_scheduler_.stats();
+    }
+
     /// M2：前端只读快照（§14.1-6）——每帧开头捕获一次，整帧使用同一版本数据。
     /// 跟踪不再在途中读实时地图点坐标（避免跨版本/部分提交观测）。
     struct TrackingSnapshot {
