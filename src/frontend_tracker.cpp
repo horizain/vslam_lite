@@ -118,6 +118,32 @@ TrackingResult FrontendTracker::refinePnP(
     TrackingResult r;
     if (pts3d.size() < 6) return r;
 
+    // 输入排序：消除双实例交替驱动下局部地图点/关联的容器遍历顺序差异
+    // （M0 §4.4 等价性验收：raw2/raw3/est 三实例在 09d2a35 方案 B 引入后
+    // 出现 float 精度级（2^-25）分歧——solvePnP 的 LM 累加对输入顺序敏感，
+    // 相同点集不同顺序收敛到不同浮点解；按 3D 坐标字典序稳定排序后输入
+    // 逐位一致，精修输出恢复确定性）。
+    {
+        std::vector<size_t> order(pts3d.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = i;
+        std::ranges::stable_sort(order, [&](size_t a, size_t b) {
+            const auto& pa = pts3d[a];
+            const auto& pb = pts3d[b];
+            if (pa.x != pb.x) return pa.x < pb.x;
+            if (pa.y != pb.y) return pa.y < pb.y;
+            return pa.z < pb.z;
+        });
+        std::vector<cv::Point3f> sorted_3d(pts3d.size());
+        std::vector<cv::Point2f> sorted_2d(pts2d.size());
+        for (size_t i = 0; i < order.size(); i++) {
+            sorted_3d[i] = pts3d[order[i]];
+            sorted_2d[i] = pts2d[order[i]];
+        }
+        // 求解用排序后输入；验收（内点数/RMSE）对顺序不敏感，直接用求解结果
+        const_cast<std::vector<cv::Point3f>&>(pts3d) = sorted_3d;
+        const_cast<std::vector<cv::Point2f>&>(pts2d) = sorted_2d;
+    }
+
     // 确定性精修：不重跑 RANSAC（避免消耗全局 RNG，破坏双实例交替驱动的
     // 确定性等价），而是用首轮位姿作初值做纯迭代优化。solvePnP 的
     // rvec/tvec 语义与 trackPnP 一致：p_c = R·p_s + t，即 T_cs。

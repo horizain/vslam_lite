@@ -468,7 +468,6 @@ private:
     std::atomic<bool> map_growth_stopped_{false};   ///< 第 6 步：仍超预算停止建图
     std::atomic<long long> map_snapshot_bytes_{0};  ///< 在途 Local BA 快照字节估算
     void enforceMapBudget();      ///< KF 插入后触发；调用方必须已持 map_mutex_ 独占锁
->>>>>>> c5eca7e (M2 遗留清理: ①backend 提交结果计数（committed/stale/invalid/not_found，§6.4 全量）；②§6.3 预算触发点运行时接线（KF 插入后评估/回收 + stopped_map_growth 停增建图 + Degraded/BackendOverloaded 联动）；③map_snapshot_bytes 接线（在途 Local BA 快照字节估算）)
 };
 
 } // namespace vslam
