@@ -291,8 +291,8 @@ void Viewer::renderLoop() {
     pangolin::View& image_view = pangolin::Display("image")
         .SetBounds(0.0, 1.0, pangolin::Attach::Pix(panel_width),
                    pangolin::Attach::Pix(-map_width), 1.0);
-    // 右上：可交互 3D 地图视图（鼠标左键旋转 / 右键拖动 / 滚轮缩放，
-    // 'r' 复位视角；开启 Follow camera 时每帧跟踪当前相机）。
+    // 右上：默认 2D X-Z 轨迹视图；打开 Show 3D map 后切换为可交互 3D 视图
+    //（鼠标左键旋转 / 右键拖动 / 滚轮缩放，'r' 复位视角）。
     pangolin::OpenGlRenderState map_cam(
         pangolin::ProjectionMatrix(640, 640, 480, 480, 320, 320, 0.1, 2000.0),
         pangolin::ModelViewLookAt(4.0, -6.0, -6.0, 0.0, 0.0, 0.0,
@@ -307,6 +307,7 @@ void Viewer::renderLoop() {
                    pangolin::Attach::Pix(-map_width), 1.0, 640.0 / 240.0);
 
     pangolin::Var<bool> show_features("ui.Show features", true, true);
+    pangolin::Var<bool> show_3d_map("ui.Show 3D map", false, true);
     pangolin::Var<bool> show_map_points("ui.Show map points", true, true);
     pangolin::Var<bool> show_camera("ui.Show camera", true, true);
     pangolin::Var<bool> show_grid("ui.Show grid", true, true);
@@ -398,8 +399,7 @@ void Viewer::renderLoop() {
         image_view.Activate();
         if (has_image) image_texture.RenderToViewportFlipY();
 
-        // 右上：可交互 3D 地图视图。Follow camera 开启时每帧把视角对准
-        // 当前相机位置；关闭后保持上一次用户拖拽的视角，展示全局地图。
+        // 2D/3D 地图视图共用同一块显示区域；默认保持轻量的 X-Z 俯视图。
         size_t trail_start = 0;
         if (!trajectory_snapshot.empty()) {
             trail_start = trajectory_snapshot.size() > static_cast<size_t>(trail_points)
@@ -407,98 +407,183 @@ void Viewer::renderLoop() {
             if (!static_cast<bool>(show_trail)) trail_start = trajectory_snapshot.size() - 1;
         }
 
-        double center_x = 0.0, center_y = 0.0, center_z = 0.0;
-        // 跟随模式只在用户空闲（最近 ~1s 无鼠标/键盘交互）时重新对准视角，
-        // 否则用户拖动旋转/缩放会立即被下一帧的重设覆盖。
-        const bool follow_idle = static_cast<bool>(follow_camera) &&
-            (std::chrono::steady_clock::now() - map_input.last_input)
-                > std::chrono::milliseconds(800);
-        if (follow_idle && !trajectory_snapshot.empty()) {
-            const Vec3& p = trajectory_snapshot.back();
-            center_x = p.x(); center_y = p.y(); center_z = p.z();
-            const double eye_dist = 3.0;
-            map_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(
-                center_x + eye_dist, center_y - eye_dist * 0.7,
-                center_z - eye_dist, center_x, center_y, center_z,
-                pangolin::AxisY));
-        }
+        if (!static_cast<bool>(show_3d_map)) {
+            // 默认 2D 模式：世界系 X-Z 俯视轨迹，保留原有箭头/网格交互语义。
+            trajectory_view.Activate();
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            double center_x = 0.0;
+            double center_z = 0.0;
+            if (static_cast<bool>(follow_camera) && !trajectory_snapshot.empty()) {
+                center_x = trajectory_snapshot.back().x();
+                center_z = trajectory_snapshot.back().z();
+            }
 
-        trajectory_view.Activate(map_cam);
-        glClear(GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST);
+            double range = 5.0;
+            for (size_t i = trail_start; i < trajectory_snapshot.size(); ++i) {
+                range = std::max({range,
+                                  std::abs(trajectory_snapshot[i].x() - center_x),
+                                  std::abs(trajectory_snapshot[i].z() - center_z)});
+            }
+            range *= 1.25;
+            glOrtho(center_x - range, center_x + range,
+                    center_z - range, center_z + range, -1.0, 1.0);
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
 
-        // 全局视图：网格中心 = 轨迹+点云包围盒中心，范围覆盖全部数据。
-        double grid_cx = center_x, grid_cz = center_z;
-        double grid_range = 5.0;
-        if (!static_cast<bool>(follow_camera)) {
-            double min_x = 0.0, max_x = 0.0, min_z = 0.0, max_z = 0.0;
-            bool have_extent = false;
-            for (const auto& p : map_points_snapshot) {
-                if (!have_extent) {
-                    min_x = max_x = p.x();
-                    min_z = max_z = p.z();
-                    have_extent = true;
-                } else {
-                    min_x = std::min(min_x, p.x()); max_x = std::max(max_x, p.x());
-                    min_z = std::min(min_z, p.z()); max_z = std::max(max_z, p.z());
+            if (static_cast<bool>(show_grid)) {
+                const double step = gridStep(range);
+                glColor3f(0.14f, 0.18f, 0.21f);
+                glLineWidth(1.0f);
+                glBegin(GL_LINES);
+                for (double x = center_x - range; x <= center_x + range; x += step) {
+                    glVertex2f((float)x, (float)(center_z - range));
+                    glVertex2f((float)x, (float)(center_z + range));
+                }
+                for (double z = center_z - range; z <= center_z + range; z += step) {
+                    glVertex2f((float)(center_x - range), (float)z);
+                    glVertex2f((float)(center_x + range), (float)z);
+                }
+                glEnd();
+            }
+
+            glColor3f(0.32f, 0.38f, 0.42f);
+            glLineWidth(1.5f);
+            glBegin(GL_LINES);
+            glVertex2f((float)(center_x - range), (float)center_z);
+            glVertex2f((float)(center_x + range), (float)center_z);
+            glVertex2f((float)center_x, (float)(center_z - range));
+            glVertex2f((float)center_x, (float)(center_z + range));
+            glEnd();
+
+            if (trajectory_snapshot.size() >= 2 &&
+                trail_start < trajectory_snapshot.size() - 1 &&
+                static_cast<bool>(show_trail)) {
+                glColor3f(0.0f, 0.85f, 0.95f);
+                glLineWidth(2.5f);
+                glBegin(GL_LINE_STRIP);
+                for (size_t i = trail_start; i < trajectory_snapshot.size(); ++i)
+                    glVertex2f((float)trajectory_snapshot[i].x(),
+                               (float)trajectory_snapshot[i].z());
+                glEnd();
+            }
+
+            if (static_cast<bool>(show_camera) && !trajectory_snapshot.empty()) {
+                const Vec3& last = trajectory_snapshot.back();
+                glPointSize(9.0f);
+                glColor3f(1.0f, 0.32f, 0.25f);
+                glBegin(GL_POINTS);
+                glVertex2f((float)last.x(), (float)last.z());
+                glEnd();
+
+                const Vec3 forward = camera_pose_snapshot.q * Vec3(0.0, 0.0, 1.0);
+                const double forward_xz = std::hypot(forward.x(), forward.z());
+                if (forward_xz > 1e-6) {
+                    const double arrow_length = std::max(range * 0.10, 0.5);
+                    glColor3f(1.0f, 0.72f, 0.18f);
+                    glLineWidth(3.0f);
+                    glBegin(GL_LINES);
+                    glVertex2f((float)last.x(), (float)last.z());
+                    glVertex2f((float)(last.x() + arrow_length * forward.x() / forward_xz),
+                               (float)(last.z() + arrow_length * forward.z() / forward_xz));
+                    glEnd();
                 }
             }
-            for (const auto& p : trajectory_snapshot) {
-                if (!have_extent) {
-                    min_x = max_x = p.x();
-                    min_z = max_z = p.z();
-                    have_extent = true;
-                } else {
-                    min_x = std::min(min_x, p.x()); max_x = std::max(max_x, p.x());
-                    min_z = std::min(min_z, p.z()); max_z = std::max(max_z, p.z());
+        } else {
+            // 3D 模式：Follow camera 开启时只在用户空闲约 0.8s 后重新对准，
+            // 避免每帧重设视角覆盖用户拖拽/平移/缩放。
+            double center_x = 0.0, center_y = 0.0, center_z = 0.0;
+            const bool follow_idle = static_cast<bool>(follow_camera) &&
+                (std::chrono::steady_clock::now() - map_input.last_input)
+                    > std::chrono::milliseconds(800);
+            if (follow_idle && !trajectory_snapshot.empty()) {
+                const Vec3& p = trajectory_snapshot.back();
+                center_x = p.x(); center_y = p.y(); center_z = p.z();
+                const double eye_dist = 3.0;
+                map_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(
+                    center_x + eye_dist, center_y - eye_dist * 0.7,
+                    center_z - eye_dist, center_x, center_y, center_z,
+                    pangolin::AxisY));
+            }
+
+            trajectory_view.Activate(map_cam);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_DEPTH_TEST);
+
+            // 全局视图：网格中心 = 轨迹+点云包围盒中心，范围覆盖全部数据。
+            double grid_cx = center_x, grid_cz = center_z;
+            double grid_range = 5.0;
+            if (!static_cast<bool>(follow_camera)) {
+                double min_x = 0.0, max_x = 0.0, min_z = 0.0, max_z = 0.0;
+                bool have_extent = false;
+                for (const auto& p : map_points_snapshot) {
+                    if (!have_extent) {
+                        min_x = max_x = p.x();
+                        min_z = max_z = p.z();
+                        have_extent = true;
+                    } else {
+                        min_x = std::min(min_x, p.x()); max_x = std::max(max_x, p.x());
+                        min_z = std::min(min_z, p.z()); max_z = std::max(max_z, p.z());
+                    }
+                }
+                for (const auto& p : trajectory_snapshot) {
+                    if (!have_extent) {
+                        min_x = max_x = p.x();
+                        min_z = max_z = p.z();
+                        have_extent = true;
+                    } else {
+                        min_x = std::min(min_x, p.x()); max_x = std::max(max_x, p.x());
+                        min_z = std::min(min_z, p.z()); max_z = std::max(max_z, p.z());
+                    }
+                }
+                if (have_extent) {
+                    grid_cx = 0.5 * (min_x + max_x);
+                    grid_cz = 0.5 * (min_z + max_z);
+                    grid_range = std::max({5.0, 0.5 * (max_x - min_x),
+                                           0.5 * (max_z - min_z)});
                 }
             }
-            if (have_extent) {
-                grid_cx = 0.5 * (min_x + max_x);
-                grid_cz = 0.5 * (min_z + max_z);
-                grid_range = std::max({5.0, 0.5 * (max_x - min_x), 0.5 * (max_z - min_z)});
+            grid_range *= 1.15;
+
+            if (static_cast<bool>(show_grid))
+                drawGrid3D(grid_cx, 0.0, grid_cz, grid_range, gridStep(grid_range));
+
+            // 地图点云（世界系 p_w = T_ws · p_s）
+            if (static_cast<bool>(show_map_points) && !map_points_snapshot.empty()) {
+                glPointSize(2.0f);
+                glColor3f(0.25f, 0.85f, 0.35f);
+                glBegin(GL_POINTS);
+                for (const auto& pt : map_points_snapshot)
+                    glVertex3f((float)pt.x(), (float)pt.y(), (float)pt.z());
+                glEnd();
             }
+
+            // 轨迹（3D 折线）
+            if (trajectory_snapshot.size() >= 2 &&
+                trail_start < trajectory_snapshot.size() - 1 &&
+                static_cast<bool>(show_trail)) {
+                glColor3f(0.0f, 0.85f, 0.95f);
+                glLineWidth(2.5f);
+                glBegin(GL_LINE_STRIP);
+                for (size_t i = trail_start; i < trajectory_snapshot.size(); ++i)
+                    glVertex3f((float)trajectory_snapshot[i].x(),
+                               (float)trajectory_snapshot[i].y(),
+                               (float)trajectory_snapshot[i].z());
+                glEnd();
+            }
+
+            if (static_cast<bool>(show_camera) && !trajectory_snapshot.empty()) {
+                const Vec3& last = trajectory_snapshot.back();
+                glPointSize(9.0f);
+                glColor3f(1.0f, 0.32f, 0.25f);
+                glBegin(GL_POINTS);
+                glVertex3f((float)last.x(), (float)last.y(), (float)last.z());
+                glEnd();
+                drawCameraFrustum(camera_pose_snapshot, 0.5);
+            }
+
+            glDisable(GL_DEPTH_TEST);
         }
-        grid_range *= 1.15;
-
-        if (static_cast<bool>(show_grid))
-            drawGrid3D(grid_cx, 0.0, grid_cz, grid_range, gridStep(grid_range));
-
-        // 地图点云（世界系 p_w = T_ws · p_s）
-        if (static_cast<bool>(show_map_points) && !map_points_snapshot.empty()) {
-            glPointSize(2.0f);
-            glColor3f(0.25f, 0.85f, 0.35f);
-            glBegin(GL_POINTS);
-            for (const auto& pt : map_points_snapshot)
-                glVertex3f((float)pt.x(), (float)pt.y(), (float)pt.z());
-            glEnd();
-        }
-
-        // 轨迹（3D 折线）
-        if (trajectory_snapshot.size() >= 2 &&
-            trail_start < trajectory_snapshot.size() - 1 &&
-            static_cast<bool>(show_trail)) {
-            glColor3f(0.0f, 0.85f, 0.95f);
-            glLineWidth(2.5f);
-            glBegin(GL_LINE_STRIP);
-            for (size_t i = trail_start; i < trajectory_snapshot.size(); ++i)
-                glVertex3f((float)trajectory_snapshot[i].x(),
-                           (float)trajectory_snapshot[i].y(),
-                           (float)trajectory_snapshot[i].z());
-            glEnd();
-        }
-
-        if (static_cast<bool>(show_camera) && !trajectory_snapshot.empty()) {
-            const Vec3& last = trajectory_snapshot.back();
-            glPointSize(9.0f);
-            glColor3f(1.0f, 0.32f, 0.25f);
-            glBegin(GL_POINTS);
-            glVertex3f((float)last.x(), (float)last.y(), (float)last.z());
-            glEnd();
-            drawCameraFrustum(camera_pose_snapshot, 0.5);
-        }
-
-        glDisable(GL_DEPTH_TEST);
 
         status_view.Activate();
         status_texture.RenderToViewportFlipY();

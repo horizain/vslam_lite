@@ -2012,9 +2012,10 @@ Local BA 锚点重基和跨子图渐进校正几何回归。
 
 ### 3.42 可交互 3D 地图点云可视化（2026-08-11）
 
-把右上角原来固定正交的 X-Z 俯视轨迹窗改为 **Pangolin Handler3D 可交互 3D 地图视图**：
-鼠标左键旋转、右键平移、滚轮缩放（`r` 复位）；叠加世界系地图点云、3D 轨迹折线、当前
-相机视锥与 XZ 参考网格。纯可视化增强，不影响 SLAM 数据路径与数值。
+右上角保留原来的 **2D X-Z 俯视轨迹视图**作为默认模式；面板的 `Show 3D map`
+默认关闭，打开后切换为 **Pangolin Handler3D 可交互 3D 地图视图**：鼠标左键旋转、
+右键平移、滚轮缩放（`r` 复位），并叠加世界系地图点云、3D 轨迹折线、当前相机视锥
+与 XZ 参考网格。纯可视化增强，不影响 SLAM 数据路径与数值。
 
 **实现**：
 
@@ -2034,7 +2035,8 @@ Local BA 锚点重基和跨子图渐进校正几何回归。
 - **完整轨迹保留**：`kMaxTrajectoryPoints` 3000→20000（覆盖 KITTI 00 全程 4541
   帧），`Trail points` 滑杆默认/上限同步为 20000——修复长序列后半段时前半段轨迹
   从可视化中消失的问题。存储 20000×Vec3≈0.5MB，有界。
-- 面板新增 `Show map points` / `Show camera` 开关；`Show grid`、`Follow camera`、
+- 面板新增默认关闭的 `Show 3D map` 以及 `Show map points` / `Show camera` 开关；
+  `Show grid`、`Follow camera`、
   `Show trail`、`Pause render`、截图等保留。右侧地图列宽 340→460px。
 - `scripts/plot_traj.py` 字体优先级调整为 Noto Sans CJK 优先（DroidSansFallbackFull
   仅含 CJK 字形、缺 ASCII，会渲染方块标签；系统安装 `fonts-noto-cjk` 后中文/英文
