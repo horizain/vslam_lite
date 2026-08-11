@@ -165,9 +165,19 @@ void test_track_pnp_continuity_rejects() {
         far.baseline_twc = SE3(Eigen::Quaterniond::Identity(), Vec3(100.0, 0.0, 0.0));
         far.max_translation = 3.0;
         far.max_rotation = 0.35;
+        cv::setRNGSeed(0x5A17);
+        const TrackingResult primary_only = tracker.trackPnP(
+            pts3d, pts2d, SE3(), far, 15, 0.3, 2.5);
+        const uint64_t rng_after_primary = cv::theRNG().state;
+        assert(!primary_only.valid);
+
+        far.predicted_pose_cs = SE3();  // 覆盖预测初值二次 RANSAC 分支
+        cv::setRNGSeed(0x5A17);
         const TrackingResult r = tracker.trackPnP(pts3d, pts2d, SE3(), far,
                                                   15, 0.3, 2.5);
         assert(!r.valid && "100m 外基线必须被连续性拒绝");
+        assert(cv::theRNG().state == rng_after_primary &&
+               "容错重试不得扰动后续帧 RANSAC 随机序列");
     } TEST_PASS();
 }
 
@@ -419,6 +429,59 @@ void test_refine_pnp_deterministic() {
     } TEST_PASS();
 }
 
+void test_refine_pnp_does_not_modify_inputs() {
+    TEST("refinePnP: const 输入排序不应修改调用方数据") {
+        const vslam::Camera cam = makeMonocular();
+        FrontendTracker tracker(cam);
+        std::vector<cv::Point3f> pts3d;
+        std::vector<cv::Point2f> pts2d;
+        for (int i = 0; i < 30; i++) {
+            const Vec3 p(-1.2 + 0.08 * i, -0.7 + 0.04 * (i % 9),
+                        4.0 + 0.15 * (i % 7));
+            const Vec2 px = cam->camera2pixel(p);
+            pts3d.emplace_back((float)p.x(), (float)p.y(), (float)p.z());
+            pts2d.emplace_back((float)px.x(), (float)px.y());
+        }
+        // 打乱输入顺序，覆盖精修内部的确定性排序路径。
+        std::vector<cv::Point3f> input_3d;
+        std::vector<cv::Point2f> input_2d;
+        for (int i = 29; i >= 0; i--) {
+            input_3d.push_back(pts3d[(size_t)i]);
+            input_2d.push_back(pts2d[(size_t)i]);
+        }
+        const auto before_3d = input_3d;
+        const auto before_2d = input_2d;
+        const TrackingResult result = tracker.refinePnP(
+            input_3d, input_2d, SE3(), SE3(), MotionBaseline(), 6, 0.5, 2.5);
+        assert(result.valid);
+        assert(input_3d == before_3d && "精修不得通过 const_cast 改写 3D 输入");
+        assert(input_2d == before_2d && "精修不得通过 const_cast 改写 2D 输入");
+    } TEST_PASS();
+}
+
+void test_refine_pnp_scores_all_correspondences() {
+    TEST("refinePnP: 非首点大误差必须计入 RMSE") {
+        const vslam::Camera cam = makeMonocular();
+        FrontendTracker tracker(cam);
+        std::vector<cv::Point3f> pts3d;
+        std::vector<cv::Point2f> pts2d;
+        for (int i = 0; i < 60; i++) {
+            const Vec3 p(-1.5 + 0.05 * i, -0.8 + 0.03 * (i % 11),
+                        4.0 + 0.1 * (i % 13));
+            const Vec2 px = cam->camera2pixel(p);
+            pts3d.emplace_back((float)p.x(), (float)p.y(), (float)p.z());
+            pts2d.emplace_back((float)px.x(), (float)px.y());
+        }
+        // 3D 字典序中最后一个点是非首点；只污染它，旧的全 0 索引 RMSE
+        // 会重复计算首点而错误放行该精修结果。
+        pts2d.back().x += 100.0f;
+        const TrackingResult result = tracker.refinePnP(
+            pts3d, pts2d, SE3(), SE3(), MotionBaseline(), 6, 0.5, 2.5);
+        assert(!result.valid && "所有对应都必须参与 RMSE 验收");
+        assert(result.pose_rmse > 2.5);
+    } TEST_PASS();
+}
+
 }  // namespace
 
 int main() {
@@ -436,6 +499,8 @@ int main() {
     test_match_guided_recall();
     test_track_local_map();
     test_refine_pnp_deterministic();
+    test_refine_pnp_does_not_modify_inputs();
+    test_refine_pnp_scores_all_correspondences();
 
     std::cout << "全部通过" << std::endl;
     return 0;

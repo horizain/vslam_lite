@@ -20,6 +20,7 @@ using Mat33 = Eigen::Matrix3d;
 using Mat44 = Eigen::Matrix4d;
 using Vec6 = Eigen::Matrix<double, 6, 1>;
 using Mat6 = Eigen::Matrix<double, 6, 6>;
+using SubmapId = unsigned long;
 
 // ---------- 位姿表示（最小 SE3） ----------
 struct SE3 {

@@ -7,15 +7,35 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace vslam {
 
 /// 回环检测模块（Phase 2）
 ///
-/// 数据流：词袋检测(DBoW3) → 候选过滤（时间窗 + 分数）→ PnP 几何验证 → SE3 回环约束。
+/// 数据流：词袋检测(DBoW3) → 候选过滤（时间窗 + 分数）→ 历史地点聚类/时序
+/// 假设跟踪 → PnP 几何验证 → SE3 回环约束。
 /// 只负责"检测 + 验证"，位姿/地图校正由 VisualOdometry::handleLoopCorrection 完成。
 class LoopClosure {
 public:
+    /// 回环候选的身份边界。
+    ///
+    /// Frame::pose_cs 只在所属子地图局部坐标系内有意义；调用方必须使用
+    /// submap_id 将候选交给对应的 Atlas 子地图，而不能默认从当前 Map 查找。
+    struct LoopCandidate {
+        Frame::Ptr frame;
+        SubmapId submap_id = 0;
+        double score = 0.0;
+        // 同一历史地点时间邻域内的候选成员；frame 是当前几何验证代表。
+        // 保留成员而不在这里展开地图查询，供后续 region verifier 使用。
+        std::vector<Frame::Ptr> cluster_members;
+        int temporal_support = 0;
+        bool mature = false;
+    };
+
+    using SubmapPoses = std::unordered_map<SubmapId, SE3>;
+
     LoopClosure();
     ~LoopClosure();  // Impl 在 .cpp 中定义，析构函数须在此处定义
 
@@ -29,20 +49,43 @@ public:
                    const Camera& camera,
                    int top_candidates = 20,
                    double pos_prior_dist_m = 25.0,
-                   int pos_prior_gap = 100);
+                   int pos_prior_gap = 100,
+                   double max_reprojection_rmse = 2.5,
+                   double min_positive_depth_ratio = 0.95,
+                   int min_grid_cells = 12);
 
     /// 从文件加载预训练词袋词典（.txt / .dbow3），并初始化数据库
     bool loadVocabulary(const std::string& vocab_path);
 
-    /// 将关键帧加入数据库（词袋向量入库 + 缓存，供回查）
-    void addKeyFrame(Frame::Ptr kf);
+    /// 将关键帧加入数据库（词袋向量入库 + 缓存，供回查）。
+    /// @param submap_id 关键帧所属子地图，不能用当前活动子地图替代。
+    /// @param T_ws 加入时的子地图→世界位姿快照；仅作没有最新 Atlas 快照时
+    ///             的回退值，位置先验优先使用 detectLoop 传入的最新位姿。
+    void addKeyFrame(Frame::Ptr kf, SubmapId submap_id, const SE3& T_ws);
+
+    /// 地图预算剔除关键帧后同步回环索引生命周期。DBoW3 不支持单条删除，
+    /// 因此实现会批量清理缓存并只用仍存活的 BoW 重建数据库，避免失效条目
+    /// 占据 Top-N 候选和强引用绕过地图内存硬预算。
+    void removeKeyFrames(const std::vector<KeyframeId>& keyframe_ids);
+
+    /// 当前由回环模块持有并可参与检索的关键帧数（资源指标/回归测试）。
+    [[nodiscard]] size_t indexedKeyFrameCount() const;
 
     /// 检测回环：返回候选关键帧列表（按优先级排序，可空）。
-    /// 候选来源：① DBoW3 Top-N 词袋候选（分数过滤 + 时间窗）按分数降序；
+    /// 候选来源：① DBoW3 Top-N 词袋候选（分数过滤 + 时间窗）按地点聚类；
     ///            ② 位置先验候选（世界系距离近 + 间隔足够），词袋候选验证
     ///               失败时兜底——轨迹自交区域词袋分低但几何验证仍可成功。
-    /// 调用方依次做 PnP 几何验证，第一个通过的即回环。
-    std::vector<Frame::Ptr> detectLoop(Frame::Ptr kf);
+    /// 调用方依次对每个地点代表做 PnP 几何验证，第一个通过的即回环；
+    /// 每个 LoopCandidate.cluster_members 保留该地点的历史邻域成员，供
+    /// 后续 region verifier 扩展使用。BoW 召回量受 top_candidates 配置，
+    /// 与位置先验合并去重后每次最多返回 12 个历史地点。
+    /// @param query_submap_id 当前查询帧所属子地图。
+    /// @param query_T_ws 当前子地图→世界位姿。
+    /// @param latest_submap_poses Atlas 中各子地图最新的子地图→世界位姿；
+    ///        位置先验使用该表重算双方世界光心，禁止把 pose_cs 局部光心当世界坐标。
+    std::vector<LoopCandidate> detectLoop(
+        Frame::Ptr kf, SubmapId query_submap_id, const SE3& query_T_ws,
+        const SubmapPoses& latest_submap_poses);
 
     /// 几何一致性验证：ORB 匹配 → 3D-2D PnP → 内点判定。
     /// 成功时输出 T_loop_curr，满足 T_wc_curr = T_wc_loop * T_loop_curr，
@@ -62,9 +105,12 @@ private:
     int    min_loop_inliers_     = 30;    // 几何验证最小内点数
     double pnp_inlier_ratio_     = 0.7;   // 几何验证最小内点比例
     double ransac_pixel_threshold_ = 3.0; // PnP RANSAC 重投影阈值(px)
-    int    top_candidates_       = 20;    // 词袋查询 Top-N（召回扩宽）
+    int    top_candidates_       = 20;    // 词袋召回池（聚类后几何验证仍有硬上限）
     double position_prior_dist_m_ = 25.0; // 位置先验距离阈值(m)
     int    position_prior_gap_   = 100;   // 位置先验最小关键帧间隔
+    double max_reprojection_rmse_ = 2.5;
+    double min_positive_depth_ratio_ = 0.95;
+    int min_grid_cells_ = 12;
     Camera camera_;
     FeatureMatcher matcher_;
     // 只保护本模块状态；不持有地图锁，也不从锁内回调 Map。

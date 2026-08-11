@@ -76,37 +76,78 @@ TrackingResult FrontendTracker::trackPnP(
     const SE3& T_ws, const MotionBaseline& motion,
     int min_inliers, double min_ratio, double max_rmse) const {
     TrackingResult r;
-    if (pts3d.size() < 6) return r;
+    if (pts3d.size() < 6 || pts3d.size() != pts2d.size()) return r;
+
+    auto solve = [&](bool use_guess, const std::optional<SE3>& guess,
+                     cv::Mat& rvec, cv::Mat& tvec,
+                     std::vector<int>& inliers) {
+        if (use_guess && guess) {
+            const Mat33 R_guess = guess->q.toRotationMatrix();
+            cv::Mat R_cv(3, 3, CV_64F);
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 3; ++col)
+                    R_cv.at<double>(row, col) = R_guess(row, col);
+            cv::Rodrigues(R_cv, rvec);
+            tvec = (cv::Mat_<double>(3, 1) <<
+                guess->t.x(), guess->t.y(), guess->t.z());
+        }
+        return cv::solvePnPRansac(
+            pts3d, pts2d, camera_->K(), cv::Mat(), rvec, tvec,
+            use_guess, 200, cfg_.ransac_pixel_threshold, 0.99, inliers);
+    };
+
+    auto assess = [&](const cv::Mat& rvec, const cv::Mat& tvec,
+                      const std::vector<int>& inliers) {
+        TrackingResult candidate;
+        cv::Mat R;
+        cv::Rodrigues(rvec, R);
+        const SE3 pose_cs = Relocalizer::matToSE3(R, tvec);
+        const double rmse = PoseGate::pnpReprojectionRmse(
+            pts3d, pts2d, rvec, tvec, inliers, camera_->K());
+        PoseQuality quality;
+        const bool accepted = PoseGate::acceptPoseCandidate(
+            pose_cs * T_ws.inverse(), (int)inliers.size(), pts3d.size(), rmse,
+            min_inliers, min_ratio, max_rmse,
+            motion.baseline_twc, motion.max_translation, motion.max_rotation,
+            quality);
+        candidate.inlier_ratio = quality.inlier_ratio;
+        candidate.pose_rmse = quality.pose_rmse;
+        candidate.translation_delta = quality.translation;
+        candidate.rotation_delta = quality.rotation;
+        candidate.inliers = (int)inliers.size();
+        if (accepted) {
+            candidate.pose_cs = pose_cs;
+            candidate.pnp_inlier_indices = inliers;
+            candidate.valid = true;
+        }
+        return candidate;
+    };
 
     cv::Mat rvec, tvec;
     std::vector<int> inliers;
-    bool ok = cv::solvePnPRansac(pts3d, pts2d, camera_->K(), cv::Mat(), rvec, tvec,
-                                 false, 200, cfg_.ransac_pixel_threshold, 0.99, inliers);
-    if (!ok) return r;
+    if (solve(false, std::nullopt, rvec, tvec, inliers))
+        r = assess(rvec, tvec, inliers);
+    if (r.valid || !motion.predicted_pose_cs) return r;
 
-    cv::Mat R;
-    cv::Rodrigues(rvec, R);
-    const SE3 candidate_pose = Relocalizer::matToSE3(R, tvec);
-    const double rmse = PoseGate::pnpReprojectionRmse(pts3d, pts2d, rvec, tvec, inliers, camera_->K());
-
-    // M0：统一位姿验收（几何 + 连续性；正常跟踪基线由调用方传入）
-    PoseQuality quality;
-    const bool accepted = PoseGate::acceptPoseCandidate(
-        candidate_pose * T_ws.inverse(), (int)inliers.size(), pts3d.size(), rmse,
-        min_inliers, min_ratio, max_rmse,
-        motion.baseline_twc, motion.max_translation, motion.max_rotation, quality);
-
-    // 无论通过与否都携带质量信息（原 trackFrame 先写 status_ 再判断）
-    r.inlier_ratio = quality.inlier_ratio;
-    r.pose_rmse = quality.pose_rmse;
-    r.translation_delta = quality.translation;
-    r.rotation_delta = quality.rotation;
-    r.inliers = (int)inliers.size();   // 原始内点数（供拒绝日志/验收）
-    if (accepted) {
-        r.pose_cs = candidate_pose;
-        r.pnp_inlier_indices = inliers;
-        r.valid = true;
-    }
+    // RANSAC 在稀疏/近退化窗口中偶尔会返回“内点数看似足够、RMSE 却上千
+    // 像素”的数值坏解。不要降低任何几何门；以匀速预测为初值独立重试
+    // 同一组 3D-2D 和同一 RANSAC 门。只有重试结果也通过原内点/比例/RMSE/
+    // 连续性验收才接受，避免一次随机坏解把前端推入 20 帧 LOST 链。
+    cv::Mat retry_rvec, retry_tvec;
+    std::vector<int> retry_inliers;
+    // OpenCV RANSAC 使用线程局部全局 RNG。重试是数值容错分支，不应因为
+    // “是否触发过”改变后续帧的随机序列，否则相同输入会产生级联轨迹分叉。
+    const uint64_t rng_state_before_retry = cv::theRNG().state;
+    const bool retry_ok = solve(true, motion.predicted_pose_cs,
+                                retry_rvec, retry_tvec, retry_inliers);
+    cv::theRNG().state = rng_state_before_retry;
+    if (!retry_ok) return r;
+    TrackingResult retry = assess(retry_rvec, retry_tvec, retry_inliers);
+    if (retry.valid) return retry;
+    // 两次都拒绝时保留更有诊断意义的一组质量数据。
+    if (retry.inliers > r.inliers ||
+        (retry.inliers == r.inliers && retry.pose_rmse < r.pose_rmse))
+        return retry;
     return r;
 }
 
@@ -116,13 +157,15 @@ TrackingResult FrontendTracker::refinePnP(
     const MotionBaseline& motion,
     int min_inliers, double min_ratio, double max_rmse) const {
     TrackingResult r;
-    if (pts3d.size() < 6) return r;
+    if (pts3d.size() < 6 || pts3d.size() != pts2d.size()) return r;
 
     // 输入排序：消除双实例交替驱动下局部地图点/关联的容器遍历顺序差异
     // （M0 §4.4 等价性验收：raw2/raw3/est 三实例在 09d2a35 方案 B 引入后
     // 出现 float 精度级（2^-25）分歧——solvePnP 的 LM 累加对输入顺序敏感，
     // 相同点集不同顺序收敛到不同浮点解；按 3D 坐标字典序稳定排序后输入
     // 逐位一致，精修输出恢复确定性）。
+    std::vector<cv::Point3f> sorted_3d;
+    std::vector<cv::Point2f> sorted_2d;
     {
         std::vector<size_t> order(pts3d.size());
         for (size_t i = 0; i < order.size(); i++) order[i] = i;
@@ -133,15 +176,12 @@ TrackingResult FrontendTracker::refinePnP(
             if (pa.y != pb.y) return pa.y < pb.y;
             return pa.z < pb.z;
         });
-        std::vector<cv::Point3f> sorted_3d(pts3d.size());
-        std::vector<cv::Point2f> sorted_2d(pts2d.size());
+        sorted_3d.resize(pts3d.size());
+        sorted_2d.resize(pts2d.size());
         for (size_t i = 0; i < order.size(); i++) {
             sorted_3d[i] = pts3d[order[i]];
             sorted_2d[i] = pts2d[order[i]];
         }
-        // 求解用排序后输入；验收（内点数/RMSE）对顺序不敏感，直接用求解结果
-        const_cast<std::vector<cv::Point3f>&>(pts3d) = sorted_3d;
-        const_cast<std::vector<cv::Point2f>&>(pts2d) = sorted_2d;
     }
 
     // 确定性精修：不重跑 RANSAC（避免消耗全局 RNG，破坏双实例交替驱动的
@@ -158,20 +198,23 @@ TrackingResult FrontendTracker::refinePnP(
                  initial_pose_cs.t.y(), initial_pose_cs.t.z());
 
     cv::Mat rvec = rvec_init.clone(), tvec = tvec_init.clone();
-    const bool ok = cv::solvePnP(pts3d, pts2d, camera_->K(), cv::Mat(),
+    const bool ok = cv::solvePnP(sorted_3d, sorted_2d, camera_->K(), cv::Mat(),
                                  rvec, tvec, true, cv::SOLVEPNP_ITERATIVE);
     if (!ok) return r;
 
     cv::Mat R;
     cv::Rodrigues(rvec, R);
     const SE3 candidate_pose = Relocalizer::matToSE3(R, tvec);
+    std::vector<int> all_indices(sorted_3d.size());
+    for (size_t i = 0; i < all_indices.size(); i++)
+        all_indices[i] = static_cast<int>(i);
     const double rmse = PoseGate::pnpReprojectionRmse(
-        pts3d, pts2d, rvec, tvec, std::vector<int>(pts3d.size()), camera_->K());
+        sorted_3d, sorted_2d, rvec, tvec, all_indices, camera_->K());
 
     // 与 trackPnP 相同的统一验收（几何 + 连续性）
     PoseQuality quality;
     const bool accepted = PoseGate::acceptPoseCandidate(
-        candidate_pose * T_ws.inverse(), (int)pts3d.size(), pts3d.size(), rmse,
+        candidate_pose * T_ws.inverse(), (int)sorted_3d.size(), sorted_3d.size(), rmse,
         min_inliers, min_ratio, max_rmse,
         motion.baseline_twc, motion.max_translation, motion.max_rotation, quality);
 
@@ -179,7 +222,7 @@ TrackingResult FrontendTracker::refinePnP(
     r.pose_rmse = quality.pose_rmse;
     r.translation_delta = quality.translation;
     r.rotation_delta = quality.rotation;
-    r.inliers = (int)pts3d.size();   // 确定性精修不筛外点，内点集由调用方提供
+    r.inliers = (int)sorted_3d.size();   // 确定性精修不筛外点，内点集由调用方提供
     if (accepted) {
         r.pose_cs = candidate_pose;
         r.valid = true;

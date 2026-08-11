@@ -43,6 +43,12 @@ def load_metrics_json(path):
         return json.load(f)
 
 
+def validate_run_metrics(metrics):
+    """拒绝未实际处理输入的基准轮次，避免空工作被统计成零延迟成功。"""
+    if metrics.get("frames_processed", 0) <= 0:
+        raise RuntimeError("run_slam 未处理任何帧")
+
+
 def run_ate(est_tum, gt_tum, alignment):
     """evaluate_ate.py --json，直接解析 JSON 摘要。返回 dict。"""
     proc = subprocess.run(
@@ -73,26 +79,26 @@ def run_once(cfg, args, out_path, run_dir):
         raise RuntimeError(f"run_slam 失败(returncode={proc.returncode})，见 {log_path}")
 
     m = load_metrics_json(metrics_path)
+    validate_run_metrics(m)
 
     # GT 精度（可选）
     gt = cfg.get("gt") or args.gt
     if gt:
-        try:
-            ate = run_ate(out_path, gt, cfg.get("alignment", "se3"))
-            m.update({
-                "coverage_pct": ate["coverage_pct"],
-                "ate_rmse": ate["ate_rmse"], "ate_mean": ate["ate_mean"],
-                "ate_std": ate["ate_std"], "ate_max": ate["ate_max"],
-                "rpe_trans_rmse": ate["rpe_trans_rmse"],
-                "rpe_trans_mean": ate["rpe_trans_mean"], "rpe_trans_max": ate["rpe_trans_max"],
-                "rpe_rot_rmse": ate["rpe_rot_rmse"],
-                "rpe_rot_mean": ate["rpe_rot_mean"], "rpe_rot_max": ate["rpe_rot_max"],
-                "len_ratio": ate["len_ratio"],
-                "jumps_3m": ate["jumps_3m"], "jumps_5m": ate["jumps_5m"],
-                "jumps_10m": ate["jumps_10m"],
-            })
-        except RuntimeError as e:
-            print(f"[bench] 警告: {e}（跳过 ATE 门限）", file=sys.stderr)
+        # 配置了 GT 就是强门：评估脚本、GT 路径或轨迹解析失败必须让整轮失败，
+        # 不能告警后删除 ATE 字段继续把提交判绿。
+        ate = run_ate(out_path, gt, cfg.get("alignment", "se3"))
+        m.update({
+            "coverage_pct": ate["coverage_pct"],
+            "ate_rmse": ate["ate_rmse"], "ate_mean": ate["ate_mean"],
+            "ate_std": ate["ate_std"], "ate_max": ate["ate_max"],
+            "rpe_trans_rmse": ate["rpe_trans_rmse"],
+            "rpe_trans_mean": ate["rpe_trans_mean"], "rpe_trans_max": ate["rpe_trans_max"],
+            "rpe_rot_rmse": ate["rpe_rot_rmse"],
+            "rpe_rot_mean": ate["rpe_rot_mean"], "rpe_rot_max": ate["rpe_rot_max"],
+            "len_ratio": ate["len_ratio"],
+            "jumps_3m": ate["jumps_3m"], "jumps_5m": ate["jumps_5m"],
+            "jumps_10m": ate["jumps_10m"],
+        })
 
     # RSS 峰值（Linux /usr/bin/time -v，可选）
     if cfg.get("measure_rss", False):
@@ -109,34 +115,47 @@ def run_once(cfg, args, out_path, run_dir):
 
 
 def aggregate(rounds):
-    """多轮 → {metric: {mean, std, worst}}；worst 取"更差方向"原始值。"""
+    """多轮 → {metric: {mean, std, min, max, worst}}。
+
+    ``min``/``max`` 都保留，门限检查按门限方向选择对应的极值；
+    ``worst`` 作为旧报告字段保留（等同于 ``max``，避免破坏消费者）。
+    """
     out = {}
     for k in rounds[0]:
         vals = np.asarray([r[k] for r in rounds], dtype=float)
         out[k] = {"mean": float(vals.mean()), "std": float(vals.std()),
+                  "min": float(vals.min()), "max": float(vals.max()),
                   "worst": float(vals.max())}
     return out
 
 
 def check_gates(agg, gates, ate_available):
-    """按门限断言。min=越高越好（worst 取 min），max=越低越好（worst 取 max）。"""
+    """按门限断言：min 门使用各轮最小值，max 门使用各轮最大值。"""
+    gt_metrics = {
+        "coverage_pct", "ate_rmse", "ate_mean", "ate_std", "ate_max",
+        "rpe_trans_rmse", "rpe_trans_mean", "rpe_trans_max",
+        "rpe_rot_rmse", "rpe_rot_mean", "rpe_rot_max", "len_ratio",
+        "jumps_3m", "jumps_5m", "jumps_10m",
+    }
     results = {}
     for name, spec in gates.items():
         if not spec:
             continue
-        if name.startswith("ate_") and not ate_available:
+        if name in gt_metrics and not ate_available:
             results[name] = {"status": "skip", "reason": "无 GT"}
             continue
         if name not in agg:
-            results[name] = {"status": "skip", "reason": "无此指标"}
+            results[name] = {"status": "fail", "reason": "门限指标缺失"}
             continue
         worst = agg[name]["worst"]
         ok, bound, op = True, None, None
         if "max" in spec:
             bound, op = spec["max"], "max"
+            worst = agg[name]["max"]
             ok = worst <= bound
         if "min" in spec:
             bound, op = spec["min"], "min"
+            worst = agg[name]["min"]
             ok = worst >= bound
         results[name] = {
             "status": "pass" if ok else "fail",
@@ -153,7 +172,8 @@ def print_table(agg, gates, gate_results):
         tag = {"pass": "PASS", "fail": "FAIL", "skip": "-"}.get(r.get("status"), " ")
         bound = r.get("bound")
         bound_str = f"{r.get('op', '')} {bound:.3g}" if bound is not None else ""
-        print(f"{k:<22}{v['mean']:>12.4f}{v['std']:>12.4f}{v['worst']:>12.4f}"
+        display_worst = r.get("worst", v["worst"])
+        print(f"{k:<22}{v['mean']:>12.4f}{v['std']:>12.4f}{display_worst:>12.4f}"
               f"  {tag:>5} {bound_str}")
 
 

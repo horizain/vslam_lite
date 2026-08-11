@@ -58,7 +58,24 @@ CommitStatus BackendCommitter::commit(
     // 2. 质量验收
     if (!passesQuality(result, max_pose_correction)) return CommitStatus::INVALID;
 
-    // 3. 对象存活检查 + 一次临界区应用全部更新
+    // 3. 对象存活预检。拓扑追加不使窗口结果失效，但预算线程可能在 BA
+    // 计算期间剔除快照对象；这时不得静默跳过一部分 pose/point 后仍发布
+    // COMMITTED，否则同一优化结果会形成“位姿新、点旧”的部分事务。
+    for (const auto& u : result.poses) {
+        if (skip_pose.count(u.id)) continue;
+        if (!map->getKeyFrame(u.id)) {
+            LOG_WARN("Committer dropped result with missing keyframe " << u.id);
+            return CommitStatus::STALE;
+        }
+    }
+    for (const auto& p : result.points) {
+        if (!map->getMapPoint(p.id)) {
+            LOG_WARN("Committer dropped result with missing map point " << p.id);
+            return CommitStatus::STALE;
+        }
+    }
+
+    // 4. 一次临界区应用全部更新
     for (const auto& u : result.poses) {
         if (skip_pose.count(u.id)) continue;  // 跳过活动参考帧写回（M0）
         auto real = map->getKeyFrame(u.id);
@@ -68,7 +85,7 @@ CommitStatus BackendCommitter::commit(
         auto real = map->getMapPoint(p.id);
         if (real) real->pos_s = p.pos_s;
     }
-    // 4. 唯一提交者发布几何新版本
+    // 5. 唯一提交者发布几何新版本
     map->bumpGeometry();
     return CommitStatus::COMMITTED;
 }

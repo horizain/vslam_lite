@@ -19,12 +19,16 @@ bool includeLocalBALandmark(int observation_count, int min_observed) {
 LocalMapper::LocalMapper(const Camera& camera) : camera_(camera) {}
 
 void LocalMapper::createMapPointsFromStereo(const Map::Ptr& map,
-                                            const Frame::Ptr& frame) const {
+                                            const Frame::Ptr& frame,
+                                            size_t max_map_points) const {
     if (!camera_->hasPerFrameDepth()) return;
 
     int cnt = 0;
     const bool registered = map->getKeyFrame(frame->id) == frame;
     for (size_t i = 0; i < frame->keypoints.size(); i++) {
+        // 建点预算是逐点检查的绝对上限。关键帧仍可插入，但达到上限后
+        // 本轮及后续轮次只保留跟踪/观测，不再批量越过 MapPoint 配额。
+        if (map->mapPointCount() >= max_map_points) break;
         if (i >= frame->pts_c.size()) continue;
         if (frame->pts_c[i].z() > 0 && frame->map_points[i] == nullptr) {
             // M3：p_s = T_sc * p_c（pose_cs 的逆把相机系点转到子地图局部系）
@@ -52,12 +56,15 @@ void LocalMapper::createMapPointsFromStereo(const Map::Ptr& map,
 
 void LocalMapper::triangulateNewPoints(
     const Map::Ptr& map, const Frame::Ptr& f1, const Frame::Ptr& f2,
-    const std::vector<cv::DMatch>& matches) const {
+    const std::vector<cv::DMatch>& matches, size_t max_map_points) const {
     cv::Mat K = camera_->K();
     int cnt = 0;
     const bool f1_registered = map->getKeyFrame(f1->id) == f1;
     const bool f2_registered = map->getKeyFrame(f2->id) == f2;
     for (auto& m : matches) {
+        // 不使用“先收集、后批量插入”的方式，避免剩余配额小于匹配数时
+        // 一次性越过上限；每次成功插入后重新读取原子计数。
+        if (map->mapPointCount() >= max_map_points) break;
         if (m.queryIdx < 0 || m.trainIdx < 0 ||
             m.queryIdx >= static_cast<int>(f1->map_points.size()) ||
             m.trainIdx >= static_cast<int>(f2->map_points.size()) ||

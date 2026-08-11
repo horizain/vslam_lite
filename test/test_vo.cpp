@@ -219,6 +219,7 @@ void test_mobile_config() {
         assert(cfg.opencv_threads == 4);
         assert(cfg.local_window_size == 6);
         assert(cfg.local_ba_iterations == 3);
+        assert(std::abs(cfg.local_ba_max_correction - 1.0) < 1e-12);
         assert(cfg.enable_loop_closure);
         assert(std::abs(cfg.min_parallax - 0.025) < 1e-12);
         assert(cfg.min_init_inliers == 18);
@@ -641,6 +642,59 @@ void test_local_ba_filter_helper() {
         const auto new_T_ca = rebased * new_ref.inverse();
         assert((old_T_ca.matrix() - new_T_ca.matrix()).norm() < 1e-12);
         assert((rebased.matrix() - frame.matrix()).norm() > 1.0);
+    } TEST_PASS();
+
+    TEST("Local BA 改写锚点时反向重基 T_ca 并保持历史世界位姿") {
+        const vslam::SE3 T_ca_old(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.08, vslam::Vec3::UnitX())),
+            vslam::Vec3(0.7, -0.1, 0.2));
+        const vslam::SE3 old_anchor(
+            Eigen::Quaterniond(Eigen::AngleAxisd(-0.12, vslam::Vec3::UnitY())),
+            vslam::Vec3(8.0, 1.0, -3.0));
+        const vslam::SE3 new_anchor(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.16, vslam::Vec3::UnitZ())),
+            vslam::Vec3(8.6, 0.7, -2.8));
+        const auto T_ca_new = vslam::rebaseTrajectoryAnchor(
+            T_ca_old, old_anchor, new_anchor);
+        assert((T_ca_new * new_anchor).matrix().isApprox(
+            (T_ca_old * old_anchor).matrix(), 1e-12));
+        assert((T_ca_new.matrix() - T_ca_old.matrix()).norm() > 0.1);
+    } TEST_PASS();
+
+    TEST("跨子地图锚校正从连续边界平滑过渡到完整闭环校正") {
+        const vslam::SE3 T_ca(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.04, vslam::Vec3::UnitX())),
+            vslam::Vec3(0.3, 0.1, -0.2));
+        const vslam::SE3 anchor(
+            Eigen::Quaterniond(Eigen::AngleAxisd(-0.1, vslam::Vec3::UnitY())),
+            vslam::Vec3(4.0, -2.0, 1.0));
+        const vslam::SE3 old_T_ws(Eigen::Quaterniond::Identity(),
+                                  vslam::Vec3(20.0, 0.0, 5.0));
+        const vslam::SE3 new_T_ws(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.2, vslam::Vec3::UnitZ())),
+            vslam::Vec3(27.0, -1.0, 4.0));
+        const auto at_start = vslam::rebaseTrajectoryForSubmapAnchor(
+            T_ca, anchor, old_T_ws, new_T_ws, 0.0);
+        const auto at_end = vslam::rebaseTrajectoryForSubmapAnchor(
+            T_ca, anchor, old_T_ws, new_T_ws, 1.0);
+        assert((at_start * anchor * new_T_ws.inverse()).matrix().isApprox(
+            (T_ca * anchor * old_T_ws.inverse()).matrix(), 1e-12));
+        assert((at_end.matrix() - T_ca.matrix()).norm() < 1e-12);
+        assert(vslam::submapTrajectoryCorrectionAlpha(80, 100, 100, 200) == 0.0);
+        assert(vslam::submapTrajectoryCorrectionAlpha(100, 100, 100, 200) == 0.0);
+        assert(std::abs(vslam::submapTrajectoryCorrectionAlpha(
+            150, 100, 100, 200) - 0.5) < 1e-12);
+        assert(vslam::submapTrajectoryCorrectionAlpha(220, 100, 100, 200) == 1.0);
+        const auto fallback_world = vslam::composeAnchoredWorldPose(
+            T_ca, anchor, old_T_ws);
+        assert(fallback_world.matrix().isApprox(
+            (T_ca * anchor * old_T_ws.inverse()).matrix(), 1e-12));
+        assert(fallback_world.t.norm() > 1.0);  // 锚被剔除时不得退化为 SE3()
+
+        const auto remapped = vslam::rebaseTrajectoryAnchor(
+            T_ca, anchor, new_T_ws);
+        assert((remapped * new_T_ws).matrix().isApprox(
+            (T_ca * anchor).matrix(), 1e-12));
     } TEST_PASS();
 }
 
@@ -1276,6 +1330,22 @@ void test_map_batch_cull() {
         assert(map->mapPointCount() == 1);
         assert(map->sharedObservationCount(0, 1) == 1);
         assert(map->verifyObservationConsistency());
+
+        // 滚动地图会一次删除数万点；显式批量 API 必须只发布一次拓扑
+        // revision，并保持正式观测/slot 一致。
+        auto p13 = std::make_shared<vslam::MapPoint>(13);
+        auto p14 = std::make_shared<vslam::MapPoint>(14);
+        map->insertMapPoint(p13);
+        map->insertMapPoint(p14);
+        assert(map->setObservation(kfs[0], 3, p13));
+        assert(map->setObservation(kfs[1], 3, p13));
+        assert(map->setObservation(kfs[1], 5, p14));
+        assert(map->setObservation(kfs[2], 5, p14));
+        const auto before_bulk_remove = map->topologyRevision();
+        assert(map->removeMapPoints({10, 13, 14}) == 3);
+        assert(map->topologyRevision() == before_bulk_remove + 1);
+        assert(map->mapPointCount() == 0);
+        assert(map->verifyObservationConsistency());
     } TEST_PASS();
 }
 
@@ -1421,6 +1491,26 @@ void test_backend_committer() {
         assert(BackendCommitter::isStale(r, map));
         r.base_geometry_revision = map->geometryRevision();
         assert(!BackendCommitter::isStale(r, map));
+    } TEST_PASS();
+
+    TEST("BackendCommitter：快照对象被预算剔除时整笔 STALE，不得部分提交") {
+        auto map = std::make_shared<vslam::Map>();
+        auto kf = std::make_shared<vslam::Frame>(7, 0.7);
+        auto mp = std::make_shared<vslam::MapPoint>(9);
+        map->insertKeyFrame(kf);
+        map->insertMapPoint(mp);
+        vslam::OptimizationResult r;
+        r.base_geometry_revision = map->geometryRevision();
+        r.valid = true;
+        r.metrics.max_correction = 0.2;
+        r.poses.push_back({7, vslam::SE3(
+            Eigen::Quaterniond::Identity(), vslam::Vec3(1, 0, 0))});
+        r.points.push_back({9, vslam::Vec3(2, 3, 4)});
+        assert(map->removeMapPoints({9}) == 1);
+        const auto geo_before = map->geometryRevision();
+        assert(BackendCommitter::commit(map, r) == CommitStatus::STALE);
+        assert(map->geometryRevision() == geo_before);
+        assert(kf->pose_cs.t.norm() < 1e-12);
     } TEST_PASS();
 
     TEST("BackendCommitter：无效结果/超大校正被拒绝 INVALID") {
@@ -1889,6 +1979,30 @@ void test_pose_graph() {
             assert((Twc.t - vslam::Vec3(i, 0, 0)).norm() < 1e-12);
         }
     } TEST_PASS();
+
+    TEST("位姿图显式固定已发布历史节点，只校正活动尾节点") {
+        vslam::OptimizationSnapshot snap;
+        for (unsigned long i = 0; i < 3; ++i) {
+            const double x = i == 2 ? 30.0 : 10.0 * static_cast<double>(i);
+            const vslam::SE3 Twc(Eigen::Quaterniond::Identity(),
+                                  vslam::Vec3(x, 0, 0));
+            snap.keyframes.push_back({i, Twc.inverse()});
+        }
+        snap.fixed_kf_ids = {0, 1};
+        snap.constraints.push_back({
+            0, 1, vslam::SE3(Eigen::Quaterniond::Identity(),
+                             vslam::Vec3(10, 0, 0)), 1.0, false});
+        snap.constraints.push_back({
+            1, 2, vslam::SE3(Eigen::Quaterniond::Identity(),
+                             vslam::Vec3(10, 0, 0)), 10.0, true});
+        const auto result = vslam::Optimizer::solvePoseGraph(snap);
+        assert(result.valid);
+        for (const auto& update : result.poses) {
+            const double x = update.pose_cs.inverse().t.x();
+            if (update.id == 1) assert(std::abs(x - 10.0) < 1e-10);
+            if (update.id == 2) assert(std::abs(x - 20.0) < 0.1);
+        }
+    } TEST_PASS();
 #else
     TEST("位姿图优化：回环约束校正累积漂移") {
         vslam::OptimizationSnapshot snap;
@@ -2012,26 +2126,27 @@ void test_loop_closure() {
                     kf->map_points[j] = mp;
                 }
             }
-            lc.addKeyFrame(kf);
+            lc.addKeyFrame(kf, 0, vslam::SE3());
             last_kf = kf;
             if (kf_id == 20) mid_kf = kf;  // 中段帧（负例用）
             kf_id++;
         }
 
         // 回环检测：最后一帧（回到原点）应命中早期帧（id 差 > 30，时间窗过滤通过）
-        auto cands = lc.detectLoop(last_kf);
+        auto cands = lc.detectLoop(last_kf, 0, vslam::SE3(),
+                                   {{0, vslam::SE3()}});
         std::cout << " (cands=" << cands.size()
-                  << " top=kf#" << (cands.empty() ? 0 : cands.front()->id)
+                  << " top=kf#" << (cands.empty() ? 0 : cands.front().frame->id)
                   << " last=kf#" << last_kf->id << ")";
         assert(!cands.empty());
-        assert(cands.front()->id < last_kf->id);
+        assert(cands.front().frame->id < last_kf->id);
 
         // 几何验证：PnP 直接输出 loop→curr 的位姿图 SE3 测量。
         // 它应与无漂移合成真值一致，不依赖 last_kf 中保存的 VO 漂移位姿。
         last_kf->pose_cs.t += vslam::Vec3(3.0, -2.0, 1.0);
         vslam::SE3 T_loop_curr;
-        assert(lc.verifyLoop(last_kf, cands.front(), T_loop_curr));
-        const vslam::SE3 expected = cands.front()->pose_cs * poses.back();
+        assert(lc.verifyLoop(last_kf, cands.front().frame, T_loop_curr));
+        const vslam::SE3 expected = cands.front().frame->pose_cs * poses.back();
         // isApprox 是相对精度（|a-b|² ≤ prec²·min(|a|²,|b|²)），期望平移为零时
         // 分母恒为 0，任何非零误差都会失败，故用绝对范数判据。
         assert((T_loop_curr.t - expected.t).norm() < 0.1);
@@ -2040,7 +2155,8 @@ void test_loop_closure() {
 
         // 负例：中段帧（id 20，所有高分候选都在时间窗内）应返回空候选
         assert(mid_kf != nullptr);
-        auto none = lc.detectLoop(mid_kf);
+        auto none = lc.detectLoop(mid_kf, 0, vslam::SE3(),
+                                  {{0, vslam::SE3()}});
         assert(none.empty());
     } TEST_PASS();
 #else
@@ -2089,12 +2205,15 @@ void test_loop_closure_concurrency_and_position_cache() {
         auto cached_position = std::make_shared<vslam::Frame>(200, 200.0);
         cached_position->pose_cs = vslam::SE3();
         cached_position->descriptors = frames.front()->descriptors.clone();
-        lc.addKeyFrame(cached_position);
+        lc.addKeyFrame(cached_position, 10, vslam::SE3());
         cached_position->pose_cs.t = vslam::Vec3(-1000, 0, 0);
-        auto position_candidates = lc.detectLoop(query);
+        auto position_candidates = lc.detectLoop(query, 10, vslam::SE3(),
+                                                 {{10, vslam::SE3()}});
         assert(std::ranges::any_of(position_candidates,
                                    [](const auto& candidate) {
-                                       return candidate && candidate->id == 200;
+                                       return candidate.frame &&
+                                              candidate.frame->id == 200 &&
+                                              candidate.submap_id == 10;
                                    }));
 
         // 并发回归只验证状态安全；关闭位置先验和候选日志，避免测试输出
@@ -2105,13 +2224,14 @@ void test_loop_closure_concurrency_and_position_cache() {
         for (int worker = 0; worker < 4; ++worker) {
             workers.emplace_back([&, worker] {
                 for (int i = worker; i < kFrameCount; i += 4)
-                    lc.addKeyFrame(frames[i]);
+                    lc.addKeyFrame(frames[i], 10, vslam::SE3());
             });
         }
         for (int worker = 0; worker < 4; ++worker) {
             workers.emplace_back([&] {
                 for (int i = 0; i < 10; ++i)
-                    (void)lc.detectLoop(query);
+                    (void)lc.detectLoop(query, 10, vslam::SE3(),
+                                        {{10, vslam::SE3()}});
             });
         }
         for (auto& worker : workers) worker.join();
@@ -2122,6 +2242,348 @@ void test_loop_closure_concurrency_and_position_cache() {
         std::cout << "SKIPPED (built without DBoW3)";
     } TEST_PASS();
 #endif
+}
+
+void test_loop_closure_cross_submap_metadata() {
+#ifdef HAS_DBOW3
+    TEST("LoopClosure 跨子地图候选身份与世界位置先验") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500;
+        cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        const std::string vocab = VSLAM_SOURCE_DIR "/config/ORBvoc.dbow3";
+        assert(std::filesystem::exists(vocab));
+
+        vslam::LoopClosure lc;
+        // 关闭 BoW 分数候选，仅验证位置先验；跨子图不应使用全局 id 时间窗。
+        lc.setParams(1.1, 30, 8, 0.1, 3.0, cam, 20, 2.0, 30);
+        assert(lc.loadVocabulary(vocab));
+
+        cv::Mat descriptors(48, 32, CV_8U);
+        for (int r = 0; r < descriptors.rows; ++r)
+            for (int c = 0; c < descriptors.cols; ++c)
+                descriptors.at<unsigned char>(r, c) =
+                    static_cast<unsigned char>((r * 17 + c * 31) & 255);
+
+        // 两个候选的局部坐标都接近子地图原点，但最新 Atlas 锚点相反：
+        // A 的局部光心为 +10，最新 T_ws=-10 后位于世界原点；
+        // B 的局部光心为 0，最新 T_ws=+100 后远离查询帧。
+        auto candidate_a = std::make_shared<vslam::Frame>(10, 10.0);
+        candidate_a->pose_cs = vslam::SE3(
+            Eigen::Quaterniond::Identity(), vslam::Vec3(0, 0, 0));
+        candidate_a->pose_cs.t = vslam::Vec3(-10, 0, 0);
+        candidate_a->descriptors = descriptors.clone();
+        auto candidate_b = std::make_shared<vslam::Frame>(11, 11.0);
+        candidate_b->pose_cs = vslam::SE3();
+        candidate_b->descriptors = descriptors.clone();
+        lc.addKeyFrame(candidate_a, 101, vslam::SE3());
+        lc.addKeyFrame(candidate_b, 202, vslam::SE3());
+
+        auto query = std::make_shared<vslam::Frame>(12, 12.0);
+        query->pose_cs = vslam::SE3();
+        query->descriptors = descriptors.clone();
+        const vslam::LoopClosure::SubmapPoses latest = {
+            {101, vslam::SE3(Eigen::Quaterniond::Identity(),
+                             vslam::Vec3(-10, 0, 0))},
+            {202, vslam::SE3(Eigen::Quaterniond::Identity(),
+                             vslam::Vec3(100, 0, 0))},
+            {303, vslam::SE3()}};
+        auto candidates = lc.detectLoop(query, 303, vslam::SE3(), latest);
+        assert(!candidates.empty());
+        assert(candidates.front().frame == candidate_a);
+        assert(candidates.front().submap_id == 101);
+    } TEST_PASS();
+#else
+    TEST("LoopClosure 跨子地图候选身份与世界位置先验") {
+        std::cout << "SKIPPED (built without DBoW3)";
+    } TEST_PASS();
+#endif
+}
+
+void test_loop_closure_keeps_all_place_clusters() {
+#ifdef HAS_DBOW3
+    TEST("LoopClosure 回归：不把词袋候选硬截为 Top-3") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500;
+        cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        const std::string vocab = VSLAM_SOURCE_DIR "/config/ORBvoc.dbow3";
+        assert(std::filesystem::exists(vocab));
+
+        vslam::LoopClosure lc;
+        lc.setParams(0.0, 1, 8, 0.1, 3.0, cam, 20, 0.0, 1);
+        assert(lc.loadVocabulary(vocab));
+
+        cv::Mat descriptors(48, 32, CV_8U);
+        for (int r = 0; r < descriptors.rows; ++r)
+            for (int c = 0; c < descriptors.cols; ++c)
+                descriptors.at<unsigned char>(r, c) =
+                    static_cast<unsigned char>((r * 17 + c * 31) & 255);
+
+        // 5 个相距较远的历史地点都与查询帧有相同词袋外观。
+        // 旧实现只返回分数最高的 3 个，导致排名靠后的真实地点没有机会
+        // 进入 PnP；相距较远也确保不会被聚合成同一历史时间邻域。
+        for (unsigned long id : {10UL, 100UL, 200UL, 300UL, 400UL}) {
+            auto frame = std::make_shared<vslam::Frame>(id, static_cast<double>(id));
+            frame->pose_cs = vslam::SE3();
+            frame->descriptors = descriptors.clone();
+            lc.addKeyFrame(frame, 7, vslam::SE3());
+        }
+        auto query = std::make_shared<vslam::Frame>(1000, 1000.0);
+        query->pose_cs = vslam::SE3();
+        query->descriptors = descriptors.clone();
+        auto candidates = lc.detectLoop(query, 7, vslam::SE3(), {{7, vslam::SE3()}});
+        assert(candidates.size() >= 5);
+        assert(std::ranges::all_of(candidates, [](const auto& candidate) {
+            return candidate.frame && !candidate.cluster_members.empty() &&
+                   candidate.cluster_members.front() &&
+                   candidate.temporal_support == 1 && !candidate.mature;
+        }));
+
+        // 连续查询才成熟；中间出现多个无效/缺测查询后，支持度必须重置。
+        auto query_next = std::make_shared<vslam::Frame>(1001, 1001.0);
+        query_next->pose_cs = vslam::SE3();
+        query_next->descriptors = descriptors.clone();
+        auto mature = lc.detectLoop(query_next, 7, vslam::SE3(),
+                                    {{7, vslam::SE3()}});
+        assert(std::ranges::any_of(mature, [](const auto& candidate) {
+            return candidate.mature && candidate.temporal_support >= 2;
+        }));
+        auto missing = std::make_shared<vslam::Frame>(1002, 1002.0);
+        for (int i = 0; i < 3; ++i) {
+            missing->id = static_cast<unsigned long>(1002 + i);
+            missing->descriptors.release();
+            (void)lc.detectLoop(missing, 7, vslam::SE3(),
+                                 {{7, vslam::SE3()}});
+        }
+        auto after_gap = std::make_shared<vslam::Frame>(1006, 1006.0);
+        after_gap->pose_cs = vslam::SE3();
+        after_gap->descriptors = descriptors.clone();
+        auto reset = lc.detectLoop(after_gap, 7, vslam::SE3(),
+                                   {{7, vslam::SE3()}});
+        assert(std::ranges::all_of(reset, [](const auto& candidate) {
+            return !candidate.mature && candidate.temporal_support == 1;
+        }));
+    } TEST_PASS();
+#else
+    TEST("LoopClosure 回归：不把词袋候选硬截为 Top-3") {
+        std::cout << "SKIPPED (built without DBoW3)";
+    } TEST_PASS();
+#endif
+}
+
+void test_loop_closure_removes_culled_keyframes() {
+#ifdef HAS_DBOW3
+    TEST("LoopClosure 回归：预算剔除同步释放缓存并重建 DBoW 索引") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500;
+        cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        const std::string vocab = VSLAM_SOURCE_DIR "/config/ORBvoc.dbow3";
+
+        vslam::LoopClosure lc;
+        lc.setParams(0.0, 1, 8, 0.1, 3.0, cam, 20, 0.0, 1);
+        assert(lc.loadVocabulary(vocab));
+
+        cv::Mat descriptors(48, 32, CV_8U);
+        for (int r = 0; r < descriptors.rows; ++r)
+            for (int c = 0; c < descriptors.cols; ++c)
+                descriptors.at<unsigned char>(r, c) =
+                    static_cast<unsigned char>((r * 17 + c * 31) & 255);
+
+        auto removed_a = std::make_shared<vslam::Frame>(10, 10.0);
+        auto removed_b = std::make_shared<vslam::Frame>(100, 100.0);
+        auto survivor = std::make_shared<vslam::Frame>(200, 200.0);
+        for (const auto& frame : {removed_a, removed_b, survivor}) {
+            frame->pose_cs = vslam::SE3();
+            frame->descriptors = descriptors.clone();
+            lc.addKeyFrame(frame, 7, vslam::SE3());
+        }
+        assert(lc.indexedKeyFrameCount() == 3);
+
+        auto query = std::make_shared<vslam::Frame>(1000, 1000.0);
+        query->pose_cs = vslam::SE3();
+        query->descriptors = descriptors.clone();
+        {
+            auto before = lc.detectLoop(query, 7, vslam::SE3(),
+                                        {{7, vslam::SE3()}});
+            assert(!before.empty());  // 同时建立 place_hypothesis 强引用
+        }
+        std::weak_ptr<vslam::Frame> removed_weak = removed_a;
+        lc.removeKeyFrames({removed_a->id, removed_b->id});
+        removed_a.reset();
+        removed_b.reset();
+        assert(removed_weak.expired() && "被剔除 KF 不得被缓存/地点假设强持有");
+        assert(lc.indexedKeyFrameCount() == 1);
+
+        auto after = lc.detectLoop(query, 7, vslam::SE3(),
+                                   {{7, vslam::SE3()}});
+        assert(!after.empty());
+        assert(std::ranges::all_of(after, [&](const auto& candidate) {
+            return candidate.frame && candidate.frame->id == survivor->id;
+        }));
+
+        // 重复通知必须幂等，不能误删存活条目。
+        lc.removeKeyFrames({10, 100});
+        assert(lc.indexedKeyFrameCount() == 1);
+    } TEST_PASS();
+#else
+    TEST("LoopClosure 回归：预算剔除同步释放缓存并重建 DBoW 索引") {
+        std::cout << "SKIPPED (built without DBoW3)";
+    } TEST_PASS();
+#endif
+}
+
+void test_loop_closure_reserves_multiple_position_priors() {
+#ifdef HAS_DBOW3
+    TEST("LoopClosure 回归：BoW 满槽时保留 4 个独立位置先验簇") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500;
+        cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        const std::string vocab = VSLAM_SOURCE_DIR "/config/ORBvoc.dbow3";
+
+        vslam::LoopClosure lc;
+        lc.setParams(0.95, 30, 8, 0.1, 3.0, cam, 20, 10.0, 30);
+        assert(lc.loadVocabulary(vocab));
+        cv::Mat query_descriptors(48, 32, CV_8U);
+        for (int r = 0; r < query_descriptors.rows; ++r)
+            for (int c = 0; c < query_descriptors.cols; ++c)
+                query_descriptors.at<unsigned char>(r, c) =
+                    static_cast<unsigned char>((r * 17 + c * 31) & 255);
+
+        // 12 个高分 BoW 历史地点占满总槽，但世界位置超出 prior 门。
+        for (unsigned long id = 1000; id < 2200; id += 100) {
+            auto frame = std::make_shared<vslam::Frame>(id, id * 0.1);
+            frame->pose_cs = vslam::SE3(
+                Eigen::Quaterniond::Identity(), vslam::Vec3(-100, 0, 0));
+            frame->descriptors = query_descriptors.clone();
+            lc.addKeyFrame(frame, 7, vslam::SE3());
+        }
+        // BoW kf#10 与下方 prior 35/60 通过 25/25 的链式间隔属同一地点；
+        // 即使 BoW cluster_members 只有 10，也必须跨模态去重。
+        auto overlapping_bow = std::make_shared<vslam::Frame>(10, 1.0);
+        overlapping_bow->pose_cs = vslam::SE3(
+            Eigen::Quaterniond::Identity(), vslam::Vec3(-100, 0, 0));
+        overlapping_bow->descriptors = query_descriptors.clone();
+        lc.addKeyFrame(overlapping_bow, 7, vslam::SE3());
+        // 4 个低 BoW 分、但位置近且历史时间簇互异的地点。
+        // 35/60 与 BoW#10 是同一跨模态链式簇，应整簇跳过；
+        // 100/200/300/400 四个独立簇应恰好保留 4 个 prior。
+        const std::vector<std::pair<unsigned long, double>> prior_specs{
+            {35, 1.0}, {60, 2.0}, {100, 4.0}, {200, 5.0}, {300, 6.0}, {400, 7.0}};
+        for (size_t i = 0; i < prior_specs.size(); ++i) {
+            const auto [id, distance] = prior_specs[i];
+            auto frame = std::make_shared<vslam::Frame>(id, id * 0.1);
+            frame->pose_cs = vslam::SE3(
+                Eigen::Quaterniond::Identity(),
+                vslam::Vec3(-distance, 0, 0));
+            frame->descriptors = cv::Mat(
+                48, 32, CV_8U, cv::Scalar::all(static_cast<int>(31 + i * 47)));
+            lc.addKeyFrame(frame, 7, vslam::SE3());
+        }
+
+        auto query = std::make_shared<vslam::Frame>(10000, 1000.0);
+        query->pose_cs = vslam::SE3();
+        query->descriptors = query_descriptors.clone();
+        const auto candidates = lc.detectLoop(
+            query, 7, vslam::SE3(), {{7, vslam::SE3()}});
+        assert(candidates.size() == 12);
+        for (const auto id : {100UL, 200UL, 300UL, 400UL}) {
+            assert(std::ranges::any_of(candidates, [&](const auto& candidate) {
+                return candidate.frame && candidate.frame->id == id &&
+                       candidate.score == 0.0;
+            }) && "每个独立位置先验簇都必须占有槽位");
+        }
+        assert(std::ranges::none_of(candidates, [](const auto& candidate) {
+            return candidate.score == 0.0 && candidate.frame &&
+                   (candidate.frame->id == 35 || candidate.frame->id == 60);
+        }) && "与 BoW 链式连通的 prior 簇不得重复占槽");
+    } TEST_PASS();
+#else
+    TEST("LoopClosure 回归：BoW 满槽时保留 4 个独立位置先验簇") {
+        std::cout << "SKIPPED (built without DBoW3)";
+    } TEST_PASS();
+#endif
+}
+
+void test_cross_submap_loop_constraint_direction() {
+    TEST("Atlas 跨子地图回环约束方向（非单位旋转/平移）") {
+        const auto qx = Eigen::Quaterniond(
+            Eigen::AngleAxisd(0.31, vslam::Vec3::UnitX()));
+        const auto qy = Eigen::Quaterniond(
+            Eigen::AngleAxisd(-0.27, vslam::Vec3::UnitY()));
+        const auto qz = Eigen::Quaterniond(
+            Eigen::AngleAxisd(0.43, vslam::Vec3::UnitZ()));
+        const vslam::SE3 current_pose_cs(qx, vslam::Vec3(1.2, -0.4, 0.7));
+        const vslam::SE3 loop_pose_cs(qy, vslam::Vec3(-2.1, 0.8, 1.3));
+        const vslam::SE3 P(qz, vslam::Vec3(3.4, -1.7, 0.2));
+        const vslam::SE3 Z = loop_pose_cs * P.inverse();
+
+        const auto constraint = vslam::makeCrossSubmapLoopConstraint(
+            7, 3, current_pose_cs, loop_pose_cs, Z);
+        const vslam::SE3 expected = current_pose_cs.inverse() * P;
+        assert(constraint.a == 7 && constraint.b == 3);
+        assert(constraint.type == vslam::AtlasConstraintType::LoopClosure);
+        assert((constraint.T_rel.t - expected.t).norm() < 1e-10);
+        assert(constraint.T_rel.q.toRotationMatrix().isApprox(
+            expected.q.toRotationMatrix(), 1e-10));
+
+        const vslam::SE3 T_ws_current(qy, vslam::Vec3(12.0, -4.0, 2.0));
+        const vslam::SE3 T_ws_loop = T_ws_current * constraint.T_rel;
+        const vslam::SE3 world_from_current =
+            current_pose_cs * T_ws_current.inverse();
+        const vslam::SE3 world_from_loop = P * T_ws_loop.inverse();
+        assert((world_from_current.t - world_from_loop.t).norm() < 1e-10);
+        assert(world_from_current.q.toRotationMatrix().isApprox(
+            world_from_loop.q.toRotationMatrix(), 1e-10));
+    } TEST_PASS();
+}
+
+void test_frontend_world_pose_rebase_after_atlas_correction() {
+    TEST("Atlas 锚点校正后前端世界基线保持同一局部位姿") {
+        const vslam::SE3 T_ws_old(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.37, vslam::Vec3::UnitY())),
+            vslam::Vec3(18.0, -3.0, 42.0));
+        const vslam::SE3 T_ws_new(
+            Eigen::Quaterniond(Eigen::AngleAxisd(-0.51, vslam::Vec3::UnitZ())),
+            vslam::Vec3(-7.0, 5.0, 11.0));
+        const vslam::SE3 T_cs(
+            Eigen::Quaterniond(Eigen::AngleAxisd(0.23, vslam::Vec3::UnitX())),
+            vslam::Vec3(2.0, -1.0, 6.0));
+        const vslam::SE3 old_world = T_cs * T_ws_old.inverse();
+        const vslam::SE3 expected = T_cs * T_ws_new.inverse();
+        const vslam::SE3 rebased = vslam::rebaseWorldPoseForSubmapAnchor(
+            old_world, T_ws_old, T_ws_new);
+        assert((rebased.t - expected.t).norm() < 1e-10);
+        assert(rebased.q.toRotationMatrix().isApprox(
+            expected.q.toRotationMatrix(), 1e-10));
+    } TEST_PASS();
+}
+
+void test_atlas_rejects_solution_that_reopens_old_loop() {
+    TEST("Atlas 回环验收：新边不得把旧闭环重新拉开") {
+        vslam::Atlas atlas;
+        const auto a_id = atlas.createSubmap(vslam::SE3(), true).id;
+        const auto b_id = atlas.createSubmap(vslam::SE3(), true).id;
+        vslam::AtlasConstraint loop;
+        loop.a = a_id;
+        loop.b = b_id;
+        loop.T_rel = vslam::SE3();
+        loop.weight = 10.0;
+        loop.type = vslam::AtlasConstraintType::LoopClosure;
+        atlas.addConstraint(loop);
+        assert(atlas.loopConstraintsConsistent(5.0, 10.0 * M_PI / 180.0));
+
+        atlas.getSubmap(b_id)->T_ws = vslam::SE3(
+            Eigen::Quaterniond(Eigen::AngleAxisd(
+                20.0 * M_PI / 180.0, vslam::Vec3::UnitY())),
+            vslam::Vec3(6.0, 0.0, 0.0));
+        double trans = 0.0, rot = 0.0;
+        assert(!atlas.loopConstraintsConsistent(
+            5.0, 10.0 * M_PI / 180.0, &trans, &rot));
+        assert(trans > 5.0 || rot > 10.0 * M_PI / 180.0);
+    } TEST_PASS();
 }
 
 // ============================================================
@@ -2167,6 +2629,13 @@ int main() {
     std::cout << "\n[Loop Closure (Phase 2)]\n";
     test_loop_closure();
     test_loop_closure_concurrency_and_position_cache();
+    test_loop_closure_cross_submap_metadata();
+    test_loop_closure_keeps_all_place_clusters();
+    test_loop_closure_removes_culled_keyframes();
+    test_loop_closure_reserves_multiple_position_priors();
+    test_cross_submap_loop_constraint_direction();
+    test_frontend_world_pose_rebase_after_atlas_correction();
+    test_atlas_rejects_solution_that_reopens_old_loop();
 
     std::cout << "\n[Feature Extraction]\n";
     test_feature_extraction();

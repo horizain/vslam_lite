@@ -71,6 +71,7 @@ VO:
 Optimizer:
   local_window_size: 10    # 局部 BA 窗口大小
   local_ba_iterations: 10  # 局部 BA 迭代次数
+  local_ba_max_correction: 1.0 # 局部 BA 仅做亚米级精修；大范围校正由位姿图负责
   enable_local_ba: true    # 局部 BA 开关（false 时仅前端跟踪，用于对比实验）
   global_ba_iterations: 0  # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
 
@@ -89,13 +90,20 @@ LoopClosure:
   vocab_path: "config/ORBvoc.dbow3"  # 词袋词典（scripts/fetch_vocab.sh 获取）
   min_score: 0.1              # 词袋候选最低分（0.3 召回过低；0.1 + PnP 验证兜底）
   temporal_window: 30         # 跳过最近 N 个关键帧（时间过滤，刚走过的路不算回环）
-  detection_interval: 10      # 每 N 个关键帧检测一次回环
-  pnp_inlier_ratio: 0.85      # 几何验证最小内点比例（提高，过滤弱验证）
+  detection_interval: 5       # 覆盖短重访区间；移动端可按计算预算使用 10
+  pnp_inlier_ratio: 0.70      # 通用 RANSAC 内点比门；同时保留 50 内点/3px 双门
   min_loop_inliers: 50        # 几何验证最小内点数（提高，过滤弱验证）
+  pnp_max_rmse: 2.5           # 内点重投影 RMSE 硬门
+  pnp_min_positive_depth_ratio: 0.95
+  pnp_min_grid_cells: 12      # 8x6 图像网格最少覆盖数
   loop_cooldown_kfs: 20       # 回环校正冷却（关键帧数）：挡同区域重复命中
-  top_candidates: 20          # 词袋查询候选数（Top-N，提高召回）
+  top_candidates: 20          # 全库召回 Top-N；聚类+位置先验最多验证 12 个地点
   position_prior_dist: 40.0   # 位置先验距离阈值(m)：轨迹自交区域词袋分低时补召回
   position_prior_gap: 100     # 位置先验最小关键帧间隔（防刚走过的路误报）
+  region_max_keyframes: 12    # 单帧 PnP 失败后，历史区域的 KF 硬上限
+  region_max_points: 800      # 区域唯一 3D 点硬上限；几何门不随区域放宽
+  region_max_covisible: 4
+  region_max_temporal: 7
 
 # ---- 可视化 ----
 Viewer:

@@ -33,20 +33,29 @@ done
 cd "$ROOT"
 TMP="$(mktemp -d /tmp/vslam_gate.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
+BUILD_DIR="$TMP/build"
 FAILED=0
 
+# ---- L0: Python 门限逻辑单测 ----
+echo "===== [gate] L0 Python 门限/soak 单测 ====="
+if ! python3 scripts/test_benchmark.py; then
+    echo "[gate] Python 门限/soak 单测失败" >&2
+    exit 1
+fi
+
 # ---- L0: 构建 + 单元测试 ----
-echo "===== [gate] L0 构建 ====="
-cmake --build build -j
+echo "===== [gate] L0 全新配置 + 构建 ====="
+cmake -S . -B "$BUILD_DIR" -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build "$BUILD_DIR" -j
 echo "===== [gate] L0 单元测试 (ctest) ====="
-if ! ctest --test-dir build --output-on-failure; then
+if ! ctest --test-dir "$BUILD_DIR" --output-on-failure --no-tests=error; then
     echo "[gate] L0 单元测试失败" >&2
     exit 1
 fi
 
 # ---- L1: 确定性回归 ----
 echo "===== [gate] L1 确定性回归 (KITTI 00 前 1000 帧, deterministic.yaml) ====="
-if ! ./build/bin/run_slam datasets/sequences/00 config/deterministic.yaml \
+if ! "$BUILD_DIR/bin/run_slam" datasets/kitti/sequences/00 config/deterministic.yaml \
         "$TMP/traj.txt" --headless --frames 1000 --status-csv "$TMP/status.csv" \
         >/dev/null 2>&1; then
     echo "[gate] L1 确定性运行失败" >&2
@@ -70,14 +79,15 @@ fi
 # ---- L2: 统计基准 + 门限断言 ----
 if [ "$FULL" = "1" ]; then
     echo "===== [gate] L2 统计基准（完整档） ====="
-    if ! python3 scripts/benchmark.py config/benchmark.yaml "$TMP/bench"; then
+    if ! python3 scripts/benchmark.py config/benchmark.yaml "$TMP/bench" \
+            --bin "$BUILD_DIR/bin/run_slam"; then
         echo "[gate] L2 统计基准未通过门限" >&2
         FAILED=1
     fi
 else
     echo "===== [gate] L2 统计基准（快速档: window=500, runs=3） ====="
     if ! python3 scripts/benchmark.py config/benchmark.yaml "$TMP/bench" \
-            --window 500 --runs 3; then
+            --window 500 --runs 3 --bin "$BUILD_DIR/bin/run_slam"; then
         echo "[gate] L2 统计基准未通过门限" >&2
         FAILED=1
     fi

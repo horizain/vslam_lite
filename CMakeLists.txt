@@ -122,6 +122,7 @@ set(VSLAM_SOURCES
     src/optimizer.cpp
     src/viewer.cpp
     src/loop_closure.cpp
+    src/loop_region.cpp
     src/tracking_state_machine.cpp
     src/localizer.cpp
     src/pose_gate.cpp
@@ -156,7 +157,8 @@ set(VSLAM_HEADERS
     include/vslam/vo.h
     include/vslam/optimizer.h
     include/vslam/viewer.h
-    include/vslam/loop_closure.h)
+    include/vslam/loop_closure.h
+    include/vslam/loop_region.h)
 
 add_library(vslam STATIC ${VSLAM_SOURCES} ${VSLAM_HEADERS})
 target_include_directories(vslam
@@ -229,6 +231,14 @@ if(BUILD_TESTS)
         target_compile_options(test_vo PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_vo COMMAND test_vo)
+
+    # 通用历史地点区域验证：有限快照 + mutual ORB + PnP 几何门。
+    add_executable(test_loop_region test/test_loop_region.cpp)
+    target_link_libraries(test_loop_region vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_loop_region PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_loop_region COMMAND test_loop_region)
 
     # M0.1 定位契约类型（独立 CTest，不与 test_vo 混排）
     add_executable(test_localization_types test/test_localization_types.cpp)
@@ -334,10 +344,12 @@ if(BUILD_TESTS)
     # 完整档（RSS 门限）与 2 小时档由 nightly 用 --full/--duration-h 执行）
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME test_benchmark_gate_logic
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_benchmark.py)
         add_test(NAME test_soak
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/soak_test.py
                          --bin $<TARGET_FILE:run_slam>
-                         --dataset ${CMAKE_SOURCE_DIR}/datasets/sequences/00
+                         --dataset ${CMAKE_SOURCE_DIR}/datasets/kitti/sequences/00
                          --config ${CMAKE_SOURCE_DIR}/config/default.yaml
                          --robot-yaml ${CMAKE_SOURCE_DIR}/config/robot.yaml
                          --frames 200 --rounds 2)
@@ -347,6 +359,12 @@ if(BUILD_TESTS)
     if(Python3_Interpreter_FOUND)
         add_test(NAME test_trajectory_alignment
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_trajectory_alignment.py)
+        # 离线回环召回评估自测；显式加入 scripts 目录，确保同目录
+        # evaluate_loop_recall.py 可被 Python 导入。
+        add_test(NAME test_loop_recall
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_loop_recall.py)
+        set_tests_properties(test_loop_recall PROPERTIES
+                             ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/scripts")
     endif()
 endif()
 

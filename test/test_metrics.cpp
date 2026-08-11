@@ -20,11 +20,14 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>
 
 #define TEST(name) \
     std::cout << "  TEST: " << name << " ... ";
@@ -297,17 +300,45 @@ void test_write_json_and_csv_files() {
     TEST("collector: writeJson/writeCsv 落盘") {
         MetricsCollector collector;
         collector.recordFrameLatency(3.0);
-        collector.writeJson("/tmp/opencode/metrics_test.json");
-        collector.writeCsv("/tmp/opencode/metrics_test.csv");
-        std::ifstream ifs("/tmp/opencode/metrics_test.json");
+
+        // 使用系统临时目录和 mkstemp 取得唯一基名，测试不能依赖某个开发机
+        // 的固定目录（旧测试写死 /tmp/opencode，干净环境会假绿/直接失败）。
+        const auto tmp_dir = std::filesystem::temp_directory_path();
+        std::string pattern = (tmp_dir / "vslam_metrics_XXXXXX").string();
+        std::vector<char> native(pattern.begin(), pattern.end());
+        native.push_back('\0');
+        const int fd = mkstemp(native.data());
+        assert(fd >= 0);
+        close(fd);
+        const std::filesystem::path base(native.data());
+        std::filesystem::remove(base);
+        const auto json_path = std::filesystem::path(base.string() + ".json");
+        const auto csv_path = std::filesystem::path(base.string() + ".csv");
+
+        collector.writeJson(json_path.string());
+        collector.writeCsv(csv_path.string());
+        std::ifstream ifs(json_path);
         assert(ifs.is_open());
         std::string content((std::istreambuf_iterator<char>(ifs)),
                             std::istreambuf_iterator<char>());
         assert(content.find("\"latency_p50_ms\"") != std::string::npos);
         ifs.close();
-        std::ifstream ifs2("/tmp/opencode/metrics_test.csv");
+        std::ifstream ifs2(csv_path);
         assert(ifs2.is_open());
         ifs2.close();
+
+        // 文件不能作为父目录；写入失败时不得伪造输出文件。
+        const auto invalid_json = base / "child.json";
+        const auto invalid_csv = base / "child.csv";
+        { std::ofstream blocker(base); assert(blocker.is_open()); }
+        collector.writeJson(invalid_json.string());
+        collector.writeCsv(invalid_csv.string());
+        assert(!std::filesystem::exists(invalid_json));
+        assert(!std::filesystem::exists(invalid_csv));
+
+        std::filesystem::remove(base);
+        std::filesystem::remove(json_path);
+        std::filesystem::remove(csv_path);
     } TEST_PASS();
 }
 

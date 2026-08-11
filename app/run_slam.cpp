@@ -96,6 +96,11 @@ int main(int argc, char** argv) {
         dataset_type == vslam::Dataset::Type::CAMERA
             ? vslam::Dataset(std::stoi(input_path))
             : vslam::Dataset(input_path, dataset_type));
+    if (dataset_type != vslam::Dataset::Type::CAMERA &&
+        dataset.totalFrames() == 0) {
+        std::cerr << "Dataset contains no readable frames: " << input_path << "\n";
+        return 2;
+    }
 
     // ---- 加载相机参数（与 run_vo 相同的优先级）----
     vslam::Camera camera;
@@ -260,6 +265,7 @@ int main(int argc, char** argv) {
     double lost_start = 0.0;
     double last_ts = 0.0;
     unsigned long prev_submap_id = 0;
+    bool have_prev_submap = false;
     long long submap_reinit = 0;
     double round_base = 0.0;   // --loop 重放时间戳偏移（保持单调，§4.3）
     double last_play_ts = 0.0;
@@ -306,8 +312,11 @@ int main(int argc, char** argv) {
             lost_duration += timestamp - lost_start;
         }
         // 子地图重建计数（submap_id 递增）
-        if (st.submap_id > prev_submap_id) {
-            if (prev_submap_id != 0) submap_reinit++;
+        if (!have_prev_submap) {
+            prev_submap_id = st.submap_id;
+            have_prev_submap = true;
+        } else if (st.submap_id != prev_submap_id) {
+            submap_reinit++;
             prev_submap_id = st.submap_id;
         }
 

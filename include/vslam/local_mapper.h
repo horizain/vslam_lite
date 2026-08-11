@@ -9,7 +9,9 @@
 
 #include <opencv2/features2d.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace vslam {
@@ -31,13 +33,17 @@ public:
     /// 已注册 KF 通过 Map 维护双向正式观测；未注册帧先写 slot。
     /// 调用方须持 map_mutex_ 独占锁（旧 createMapPointsFromStereo）。
     void createMapPointsFromStereo(const Map::Ptr& map,
-                                   const Frame::Ptr& frame) const;
+                                   const Frame::Ptr& frame,
+                                   size_t max_map_points =
+                                       std::numeric_limits<size_t>::max()) const;
 
     /// 两帧三角化建点（单目/初始化）：MapPoint::create + 正式观测绑定。
     /// 调用方须持 map_mutex_ 独占锁（旧 triangulateNewPoints）。
     void triangulateNewPoints(const Map::Ptr& map,
                               const Frame::Ptr& f1, const Frame::Ptr& f2,
-                              const std::vector<cv::DMatch>& matches) const;
+                              const std::vector<cv::DMatch>& matches,
+                              size_t max_map_points =
+                                  std::numeric_limits<size_t>::max()) const;
 
     /// 共视图滑动窗口选择（Local BA 窗口）：当前帧 + 共视最多的 KF，
     /// 共视不足退化为最近 n 帧，最终按 id 升序。调用方锁约定同旧

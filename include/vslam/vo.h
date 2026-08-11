@@ -7,6 +7,7 @@
 #include "vslam/atlas.h"
 #include "vslam/feature.h"
 #include "vslam/loop_closure.h"
+#include "vslam/loop_region.h"
 #include "vslam/optimizer.h"
 #include "vslam/backend_committer.h"
 #include "vslam/backend_scheduler.h"
@@ -31,8 +32,10 @@ namespace vslam {
 /// 最终验证必须在事务独占 map 锁内重新执行，revision 仅用于记录候选发现时的
 /// 版本，不能把锁外计算结果直接写回新的几何版本。
 struct LoopCorrectionContext {
-    Map::Ptr map;
-    unsigned long submap_id = 0;
+    Map::Ptr map;                 // 当前活动子地图
+    Map::Ptr loop_map;            // 候选所属子地图（同图时等于 map）
+    SubmapId submap_id = 0;
+    SubmapId loop_submap_id = 0;
     uint64_t topology_revision = 0;
     uint64_t geometry_revision = 0;
     KeyframeId curr_kf_id = 0;
@@ -77,6 +80,7 @@ struct VOConfig {
     int    max_keyframe_interval  = 15;     // 最长关键帧间隔（防尺度低估导致参考帧过旧）
     int    local_window_size      = 10;     // 局部 BA 滑动窗口
     int    local_ba_iterations    = 10;     // 局部 BA 迭代次数
+    double local_ba_max_correction = 1.0;   // 局部 BA 单次最大位姿校正(m)
     bool   enable_local_ba        = true;   // 局部 BA 开关（诊断/教学对比用）
     int    feature_method         = 0;      // 0: ORB匹配, 1: LK光流
     double stereo_min_depth       = 0.5;    // 双目/RGB-D 有效深度下限(m)
@@ -100,13 +104,14 @@ struct VOConfig {
     std::string vocab_path       = "";      // 词袋词典路径（config/ORBvoc.dbow3）
     double min_score             = 0.3;     // 词袋候选最低分
     int    temporal_window       = 30;      // 跳过最近 N 个关键帧（时间过滤）
-    int    detection_interval    = 10;      // 每 N 个关键帧检测一次回环
+    int    detection_interval    = 5;       // 每 N 个关键帧检测一次，覆盖短重访窗口
     double pnp_inlier_ratio      = 0.7;     // 几何验证最小内点比例
-    int    min_loop_inliers      = 30;      // 几何验证最小内点数
+    int    min_loop_inliers      = 50;      // 与各 YAML 生产档一致
     int    loop_cooldown_kfs     = 20;      // 回环校正冷却（关键帧数）：防止同区域连续校正（D 曾改 12，实测同区域 43 KF 内连续回环叠加拉扯变形，回退）
-    int    loop_top_candidates   = 20;      // 词袋查询候选数（Top-N，提高召回）
+    int    loop_top_candidates   = 20;      // 词袋召回池；聚类后与位置先验合计硬限 12 地点
     double loop_position_prior_dist = 40.0; // 位置先验距离阈值(m)：轨迹自交区域补召回（A3 放宽）
     int    loop_position_prior_gap   = 100; // 位置先验最小关键帧间隔
+    LoopRegionConfig loop_region;            // 单 KF PnP 失败后的有限历史区域验证
     int    global_ba_iterations  = 20;      // 回环后全局 BA 迭代次数
 
     // ---- 异步后端（P2-1）----
@@ -150,6 +155,38 @@ struct MonocularInitializationQuality {
     const SE3& frame_pose_cs,
     const SE3& old_ref_pose_cs,
     const SE3& new_ref_pose_cs);
+
+/// Local BA 改写锚点时重基持久轨迹的相对位姿，使已发布的世界位姿不变：
+/// T_ca_new * anchor_new == T_ca_old * anchor_old。
+[[nodiscard]] SE3 rebaseTrajectoryAnchor(
+    const SE3& T_ca_old,
+    const SE3& old_anchor_pose_cs,
+    const SE3& new_anchor_pose_cs);
+
+/// Atlas 刚体锚从 old_T_ws 校正到 new_T_ws 时，按 alpha∈[0,1] 将校正
+/// 分布到子地图内部轨迹。alpha=0 保持滚动边界世界位姿，alpha=1 接受
+/// 完整新锚校正，避免整张子图平移后在连接处产生单帧跳变。
+[[nodiscard]] SE3 rebaseTrajectoryForSubmapAnchor(
+    const SE3& T_ca_old,
+    const SE3& anchor_pose_cs,
+    const SE3& old_T_ws,
+    const SE3& new_T_ws,
+    double alpha);
+
+/// 连续激活段内的渐进校正比例；旧激活段始终为 0，避免重激活同一子图
+/// 时把多段不连续访问误当作一条时间轴。
+[[nodiscard]] double submapTrajectoryCorrectionAlpha(
+    unsigned long frame_id,
+    unsigned long segment_start_frame_id,
+    unsigned long first_frame_id,
+    unsigned long endpoint_frame_id);
+
+/// 用记录内的相对位姿和锚点快照组合世界位姿。live KF 被预算剔除时，
+/// 调用方传入 FramePoseRecord::anchor_pose_cs 仍可得到原轨迹而非单位位姿。
+[[nodiscard]] SE3 composeAnchoredWorldPose(
+    const SE3& T_ca,
+    const SE3& anchor_pose_cs,
+    const SE3& T_ws);
 
 /// 视觉里程计前端
 class VisualOdometry {
@@ -222,6 +259,7 @@ public:
         unsigned long submap_id = 0;    // 所属子地图（T_ws 查找）
         unsigned long anchor_kf_id = 0; // 锚定关键帧（关键帧自身 = 自己）
         SE3 T_ca;                       // 相对锚定关键帧的局部运动（T_ca：anchor→camera）
+        SE3 anchor_pose_cs;             // 最近事务同步的锚点位姿；KF 被预算剔除后的兜底
         bool valid = false;
     };
 
@@ -230,8 +268,8 @@ public:
         return composePoseTrajectory();
     }
 
-    /// 是否应该创建新的关键帧（M2.2 遗留清理：预算 stopped 期间为 false；
-    /// 提议路径做完整只读评估，回到预算内自动恢复）
+    /// 是否应该创建新的关键帧（点预算耗尽仍允许 KF 提议；只有 KF/描述子/
+    /// 快照/总量预算真正阻塞时才返回 false）。
     bool needNewKeyFrame();
 
     /// 设置特征方法（0: ORB匹配, 1: LK光流）
@@ -258,8 +296,8 @@ public:
         return map_snapshot_bytes_.load(std::memory_order_relaxed);
     }
 
-    /// M2.3 遗留清理：§6.3 第 6 步——预算耗尽是否已停止增加地图
-    /// （Localizer 据此上报 Degraded + BackendOverloaded）
+    /// M2.3 遗留清理：§6.3 第 6 步——预算耗尽或点配额已满是否停止增加点
+    /// （Localizer 据此上报 Degraded；不等价于停止关键帧）
     [[nodiscard]] bool mapGrowthStopped() const {
         return map_growth_stopped_.load(std::memory_order_relaxed);
     }
@@ -327,6 +365,10 @@ private:
     /// M4：组合锚定轨迹为世界系 T_cw（getPoseTrajectory 的实现；
     /// 无并发时（评估）也可直接使用）
     std::vector<SE3> composePoseTrajectory() const;
+    /// 前端安全点同步 Atlas 对活动子地图的锚点校正。后台只允许改 Atlas；
+    /// snap_/last_valid_pose_world_ 由前端线程在 map_mutex_ 下重基，避免异步
+    /// 回环把旧局部位姿和新世界锚混用。调用方须持 map_mutex_ 读/写锁。
+    void syncFrontendAnchor(SubmapId submap_id, const SE3& T_ws);
     /// 组合单条锚定记录为世界位姿（调用方必须已持 map_mutex_ 读/写锁）
     SE3 composeRecordWorld(const FramePoseRecord& rec) const;
     bool tryInitialize();
@@ -338,6 +380,9 @@ private:
     SE3 trackFrameLK();
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
+    /// KF/描述子/总量预算阻塞但前端确实请求 KF 时，主动滚动到新子地图。
+    /// 当前帧直接成为新图首个 KF，保持世界位姿连续；调用方不应处于 LOST。
+    bool rolloverBudgetSubmap();
     /// 子地图重建成功后与历史轨迹做 Umeyama 刚体对齐（双目），
     /// 消除丢失期位移未知导致的锚点残留偏差。延迟到子地图有 ≥3 个
     /// 关键帧时在 insertKeyFrame 中触发（重建瞬间 KF 数不足无法拟合）
@@ -437,6 +482,13 @@ private:
     std::atomic<unsigned long> loop_closure_count_{0};  // 已闭合回环次数（前后端共享）
     std::atomic<unsigned long> last_loop_kf_count_{0};  // 上次回环校正时的 KF 数（冷却基准）
 
+    // 最近一次 Local BA 成功发布的几何版本。帧尾若发现本帧快照恰好被
+    // 该提交跨越，则按 live reference 记录相对位姿，避免在途帧跟随局部
+    // 精修发生跳变；位姿图/Atlas 校正不设置此标记，仍允许全局轨迹闭合。
+    Map::Ptr last_local_ba_commit_map_;
+    SubmapId last_local_ba_commit_submap_id_ = 0;
+    uint64_t last_local_ba_commit_geometry_revision_ = 0;
+
     // ---- 异步后端同步原语 ----
     // P1：map_mutex_ 为读写锁。前端读点/位姿持共享锁（trackFrame/needNewKeyFrame 等），
     // 后端 BA 写回与前端 KF 插入持独占锁——读路径并发、写路径独占，缩短前端等待。
@@ -449,6 +501,9 @@ private:
 
     unsigned long frame_count_ = 0;
     unsigned long last_kf_frame_id_ = 0;  // 上一个关键帧的帧号（关键帧冷却用）
+    unsigned long active_trajectory_segment_start_frame_id_ = 0;
+    // 当前 Atlas 激活段的首帧。重激活旧子图时，旧段轨迹保持已发布世界位姿，
+    // 只让本次连续跟踪段从边界零校正渐进吸收新的跨图闭环。
     SE3 last_valid_pose_world_;
     bool has_last_valid_pose_ = false;
     SE3 per_frame_motion_;              // 相邻有效帧相对运动（Twc：X_cur = X_last·T_rel），
@@ -470,6 +525,10 @@ private:
     ResourceBudget map_budget_;   ///< 预算引擎（默认 §6.2 参数；VOConfig.map_budget 覆写）
     std::atomic<bool> map_growth_stopped_{false};   ///< 第 6 步：仍超预算停止建图
     std::atomic<long long> map_snapshot_bytes_{0};  ///< 在途 Local BA 快照字节估算
+    bool budget_rollover_pending_ = false; ///< 前端提议触发的预算滚动（前端线程）
+    /// 点预算已满时回收长期未命中的旧点，为后续 KF 让出逐点配额；
+    /// 调用方必须持 map_mutex_ 独占锁。
+    void reclaimStaleMapPoints();
     void enforceMapBudget();      ///< KF 插入后触发；调用方必须已持 map_mutex_ 独占锁
 };
 

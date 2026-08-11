@@ -59,6 +59,7 @@ VO:
 Optimizer:
   local_window_size: 12    # 共视窗口略增大, 提升局部 BA 的约束数量
   local_ba_iterations: 10
+  local_ba_max_correction: 1.0 # 通用局部优化安全门，不依赖序列/帧号/GT
   enable_local_ba: true
   global_ba_iterations: 0   # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
 
@@ -68,13 +69,20 @@ LoopClosure:
   vocab_path: "config/ORBvoc.dbow3"
   min_score: 0.1
   temporal_window: 30
-  detection_interval: 10
-  pnp_inlier_ratio: 0.85
+  detection_interval: 5
+  pnp_inlier_ratio: 0.70      # 与 default/mobile/deterministic 统一，非序列特化
   min_loop_inliers: 50
+  pnp_max_rmse: 2.5
+  pnp_min_positive_depth_ratio: 0.95
+  pnp_min_grid_cells: 12
   loop_cooldown_kfs: 20       # 回环校正冷却（关键帧数）：挡同区域重复命中
-  top_candidates: 20          # 词袋查询候选数（Top-N，提高召回）
+  top_candidates: 20          # 与 default 一致，不按 sequence 特化
   position_prior_dist: 40.0   # 位置先验距离阈值(m)
   position_prior_gap: 100     # 位置先验最小关键帧间隔
+  region_max_keyframes: 12    # 与 default 一致，不使用 sequence/帧号特化
+  region_max_points: 800
+  region_max_covisible: 4
+  region_max_temporal: 7
 
 # ---- 运行时 ----
 Runtime:
@@ -100,3 +108,18 @@ Stereo:
   rigid_max_rmse: 0.25
   keyframe_translation: 1.2  # KITTI ~1m/帧: 1.2m 约每 1~2 帧一 KF,
                              # 减少冗余 KF, 同时保留足够三角化基线
+
+# ---- KITTI 00 高精度地图预算 ----
+# 本文件是离线/桌面精度基准档，不继承 default.yaml 面向 <1GiB 产品档的
+# 700-KF 硬顶。700-KF 会在首个真实回环（约 frame 1595）前主动切子图；
+# 当前 Atlas 每子图只有一个刚体 T_ws，无法表达长段内部漂移，实测 ATE 43.94m。
+# 保持单图到 VO.keyframe_max_count=1800 后，同图关键帧 PGO 可把 KITTI 00
+# SE3 ATE 降至 12.22m、轨迹长度比 0.9995、0 LOST。代价是更高内存和
+# p99（本机 120ms）；机器人/mobile 发布仍使用 default/mobile 的 700-KF 档，
+# 直到 M4 子地图内锚定关键帧图与换出机制完成。
+MapBudget:
+  max_active_keyframes: 1800
+  max_active_points: 60000
+  max_descriptor_mb: 512
+  max_snapshot_mb: 256
+  max_total_estimated_mb: 900

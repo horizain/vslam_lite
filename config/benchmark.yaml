@@ -10,12 +10,12 @@
 # ============================================================
 
 Benchmark:
-  dataset: "datasets/sequences/00"
+  dataset: "datasets/kitti/sequences/00"
   config: "config/default.yaml"
   format: "kitti"
-  # 真值轨迹（TUM）。留空则跳过 ATE 门限；提供后自动启用：
-  #   构建真值：scripts/kitti_gt_to_tum.py datasets/sequences/00/poses /tmp/kitti_gt.tum
-  gt: ""
+  # 真值轨迹（TUM）。提交门必须启用 GT；留空会跳过 ATE，不能作为产品门：
+  #   构建真值：scripts/kitti_gt_to_tum.py datasets/kitti/poses/00.txt /tmp/kitti_gt.tum
+  gt: "datasets/kitti/poses/00.tum"
   alignment: "se3"        # 双目 SE3；单目用 sim3
   runs: 5                 # 每配置轮数（§0.1：统计基准至少 5 轮）
   window_frames: 0        # 0 = 全程；>0 = 只跑前 N 帧（提交门快速档用）
@@ -30,6 +30,6 @@ Gates:
   submap_reinit:      { max: 1 }
   jumps_10m:          { max: 0 }       # 连续有效帧 >10m 非物理跳变必须为 0
   latency_p99_ms:     { max: 80.0 }    # §6.5：10Hz 配置跟踪 p99 <80ms
-  deadline_miss_ratio:{ max: 0.01 }    # §6.5：deadline miss <1%
+  deadline_miss_ratio: { max: 0.01 }   # §6.5：deadline miss <1%
   ate_rmse:           { max: 40.0 }    # §7.6 M3 阶段门：ATE worst ≤40m
   ate_std:            { max: 8.0 }     # §7.6：ATE std ≤8m

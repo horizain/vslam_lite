@@ -3,6 +3,9 @@
 #include "perf_monitor.h"
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
+#include <algorithm>
+#include <cstdint>
+#include <unordered_set>
 
 #ifdef HAS_DBOW3
 #include <DBoW3/DBoW3.h>
@@ -27,13 +30,15 @@ SE3 matToSE3(const cv::Mat& R, const cv::Mat& t) {
 
 #ifdef HAS_DBOW3
 // ============================================================
-// PIMPL：DBoW3 具体状态（词袋数据库只在关键帧增长时追加，量级与关键帧数线性）
+// PIMPL：DBoW3 具体状态（与 Map 关键帧生命周期同步）
 // ============================================================
 class LoopClosure::Impl {
 public:
     struct CachedKeyFrame {
         Frame::Ptr frame;
-        Vec3 camera_position = Vec3::Zero();
+        SubmapId submap_id = 0;
+        SE3 T_ws;
+        Vec3 camera_position_local = Vec3::Zero();
     };
 
     std::unique_ptr<DBoW3::Vocabulary> vocab;   // 词典（加载后只读）
@@ -43,6 +48,46 @@ public:
     std::unordered_map<DBoW3::EntryId, unsigned long> db_id_kf;
     std::unordered_map<unsigned long, CachedKeyFrame> kf_cache;  // 候选帧+位置快照
     std::unordered_map<unsigned long, DBoW3::BowVector> kf_bow; // 词袋缓存
+
+    // 一个地点不是单个 KF：相邻历史 KF 形成一个 place cluster。该状态只保留
+    // 最近出现过的有限个假设，用跨查询重复观测给候选排序，不能替代 PnP 几何门。
+    struct PlaceHypothesis {
+        Frame::Ptr representative;
+        SubmapId submap_id = 0;
+        unsigned long anchor_id = 0;
+        unsigned long last_query_id = 0;
+        std::uint64_t last_seen = 0;
+        int support = 0;
+        double best_score = 0.0;
+    };
+    std::vector<PlaceHypothesis> place_hypotheses;
+    std::uint64_t query_serial = 0;
+
+    void rebuildDatabase() {
+        if (!vocab) {
+            db.reset();
+            kf_db_id.clear();
+            db_id_kf.clear();
+            return;
+        }
+        db = std::make_unique<DBoW3::Database>(*vocab, false, 0);
+        kf_db_id.clear();
+        db_id_kf.clear();
+        std::vector<unsigned long> ids;
+        ids.reserve(kf_bow.size());
+        for (const auto& [id, bow] : kf_bow) {
+            (void)bow;
+            ids.push_back(id);
+        }
+        std::ranges::sort(ids);
+        for (const auto id : ids) {
+            const auto bow_it = kf_bow.find(id);
+            if (bow_it == kf_bow.end()) continue;
+            const DBoW3::EntryId eid = db->add(bow_it->second);
+            kf_db_id[id] = eid;
+            db_id_kf[eid] = id;
+        }
+    }
 };
 #endif
 
@@ -59,7 +104,10 @@ void LoopClosure::setParams(double min_score, int temporal_window,
                             double ransac_pixel_threshold, const Camera& camera,
                             int top_candidates,
                             double pos_prior_dist_m,
-                            int pos_prior_gap) {
+                            int pos_prior_gap,
+                            double max_reprojection_rmse,
+                            double min_positive_depth_ratio,
+                            int min_grid_cells) {
     std::lock_guard<std::mutex> lock(mutex_);
     min_score_             = min_score;
     temporal_window_       = temporal_window;
@@ -70,6 +118,9 @@ void LoopClosure::setParams(double min_score, int temporal_window,
     top_candidates_        = std::max(5, top_candidates);
     position_prior_dist_m_ = pos_prior_dist_m;
     position_prior_gap_    = std::max(temporal_window_, pos_prior_gap);
+    max_reprojection_rmse_ = std::max(0.0, max_reprojection_rmse);
+    min_positive_depth_ratio_ = std::clamp(min_positive_depth_ratio, 0.0, 1.0);
+    min_grid_cells_ = std::max(1, min_grid_cells);
 }
 
 bool LoopClosure::loadVocabulary(const std::string& vocab_path) {
@@ -95,20 +146,63 @@ bool LoopClosure::loadVocabulary(const std::string& vocab_path) {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     impl_->vocab = std::move(vocab);
-    impl_->db = std::make_unique<DBoW3::Database>(*impl_->vocab, false, 0);
+    impl_->kf_db_id.clear();
+    impl_->db_id_kf.clear();
+    impl_->kf_cache.clear();
+    impl_->kf_bow.clear();
+    impl_->place_hypotheses.clear();
+    impl_->query_serial = 0;
+    impl_->rebuildDatabase();
     LOG_INFO("LoopClosure: vocabulary loaded (" << vocab_path << "), "
              << impl_->vocab->size() << " words");
     return true;
 #endif
 }
 
-void LoopClosure::addKeyFrame(Frame::Ptr kf) {
+void LoopClosure::removeKeyFrames(
+    const std::vector<KeyframeId>& keyframe_ids) {
 #ifndef HAS_DBOW3
-    (void)kf;
+    (void)keyframe_ids;
+#else
+    if (keyframe_ids.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::unordered_set<KeyframeId> removed;
+    removed.reserve(keyframe_ids.size());
+    bool changed = false;
+    for (const auto id : keyframe_ids) {
+        removed.insert(id);
+        changed = impl_->kf_cache.erase(id) > 0 || changed;
+        changed = impl_->kf_bow.erase(id) > 0 || changed;
+    }
+    if (!changed) return;
+    std::erase_if(impl_->place_hypotheses, [&](const auto& hypothesis) {
+        return removed.contains(hypothesis.anchor_id) ||
+               (hypothesis.representative &&
+                removed.contains(hypothesis.representative->id));
+    });
+    // DBoW3 只有 clear()，没有单条删除；一次批量回收只重建一次，既释放
+    // 倒排表内存，也保证旧条目不再消耗 query 的 Top-N 名额。
+    impl_->rebuildDatabase();
+#endif
+}
+
+size_t LoopClosure::indexedKeyFrameCount() const {
+#ifndef HAS_DBOW3
+    return 0;
+#else
+    std::lock_guard<std::mutex> lock(mutex_);
+    return impl_->kf_cache.size();
+#endif
+}
+
+void LoopClosure::addKeyFrame(Frame::Ptr kf, SubmapId submap_id,
+                              const SE3& T_ws) {
+#ifndef HAS_DBOW3
+    (void)kf; (void)submap_id; (void)T_ws;
 #else
     std::lock_guard<std::mutex> lock(mutex_);
     if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return;
-    const Vec3 camera_position = kf->pose_cs.camera_position();
+    const Vec3 camera_position_local = kf->pose_cs.inverse().t;
     // 异步任务重排时同一 KF 可能重复提交；数据库和保护集合保持幂等。
     if (impl_->kf_db_id.contains(kf->id)) return;
     // 计算词袋向量并入库（复用已算过的，避免重复 transform）
@@ -123,18 +217,23 @@ void LoopClosure::addKeyFrame(Frame::Ptr kf) {
     DBoW3::EntryId eid = impl_->db->add(bow);
     impl_->kf_db_id[kf->id] = eid;
     impl_->db_id_kf[eid]    = kf->id;
-    impl_->kf_cache[kf->id] = {kf, camera_position};
+    impl_->kf_cache[kf->id] = {kf, submap_id, T_ws, camera_position_local};
 #endif
 }
 
-std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
+std::vector<LoopClosure::LoopCandidate> LoopClosure::detectLoop(
+    Frame::Ptr kf, SubmapId query_submap_id, const SE3& query_T_ws,
+    const SubmapPoses& latest_submap_poses) {
 #ifndef HAS_DBOW3
-    (void)kf;
+    (void)kf; (void)query_submap_id; (void)query_T_ws;
+    (void)latest_submap_poses;
     return {};
 #else
     std::lock_guard<std::mutex> lock(mutex_);
     PERF_SCOPE("lc.detect");
-    std::vector<Frame::Ptr> candidates;
+    std::vector<LoopCandidate> candidates;
+    // 计数所有检测调用，使中间没有视觉命中的查询也能形成真实断档。
+    ++impl_->query_serial;
     if (!impl_->vocab || !impl_->db || !kf || kf->descriptors.empty()) return candidates;
 
     // 1. 词袋查询 Top-N（召回扩宽；准确性交给下方时间窗/分数过滤 + PnP 验证）
@@ -143,59 +242,272 @@ std::vector<Frame::Ptr> LoopClosure::detectLoop(Frame::Ptr kf) {
     DBoW3::QueryResults results;
     impl_->db->query(bow, results, top_candidates_);
 
-    // 2. 时间过滤 + 3. 分数过滤：按分数降序收集候选
-    std::vector<std::pair<Frame::Ptr, double>> scored;
+    // 2. 时间过滤 + 3. 分数过滤：保留整个 Top-N，后面按历史邻域聚成地点。
+    //    Top-N 是 DBoW 查询的内存/计算上限，不是几何验证前的 Top-3 截断。
+    std::vector<LoopCandidate> scored;
     for (const auto& r : results) {
         auto it = impl_->db_id_kf.find(r.Id);
         if (it == impl_->db_id_kf.end()) continue;
         const unsigned long cand_id = it->second;
-        // 时间窗：跳过"刚走过的路"（id 差过小不算回环）
-        if (cand_id >= kf->id ||
-            kf->id - cand_id < (unsigned long)temporal_window_) continue;
         // 分数阈值：DBoW3 归一化分数（0~1）
         if (r.Score < min_score_) continue;
         auto kf_it = impl_->kf_cache.find(cand_id);
         if (kf_it == impl_->kf_cache.end()) continue;
-        scored.emplace_back(kf_it->second.frame, r.Score);
+        const auto& cached = kf_it->second;
+        // Frame id 只在同一子地图内可作为时间顺序。跨子地图的全局 id
+        // 可能连续，不能因刚创建子地图而误杀真正的跨图回环。
+        if (cached.submap_id == query_submap_id &&
+            (cand_id >= kf->id ||
+             kf->id - cand_id < (unsigned long)temporal_window_)) continue;
+        scored.push_back({cached.frame, cached.submap_id, r.Score});
     }
-    // 分数降序，取前 3 个（PnP 验证多个候选提高闭环召回；验证失败大概率
-    // 是候选 KF 点被 cull 稀疏，多试几个提高成功率）
-    std::ranges::sort(scored, std::greater<>{}, &std::pair<Frame::Ptr, double>::second);
-    for (size_t i = 0; i < scored.size() && i < 3; i++)
-        candidates.push_back(scored[i].first);
 
-    // 4. 位置先验：估计轨迹自交区域词袋分数常偏低，用世界系距离补召回。
-    //    与词袋候选并列返回（放在后面），由调用方的 PnP 双门槛验证兜底。
-    if (position_prior_dist_m_ > 0.0) {
-        const Vec3 curr_pos = kf->pose_cs.inverse().t;  // 相机光心（世界系）
-        double best_dist = position_prior_dist_m_;
-        Frame::Ptr prior_cand;
-        for (const auto& [cand_id, cached] : impl_->kf_cache) {
-            if (!cached.frame || cand_id >= kf->id ||
-                kf->id - cand_id < (unsigned long)position_prior_gap_) continue;
-            // 候选位置是 addKeyFrame 时记录的 T_cw 光心快照；不读取
-            // map_mutex_ 外可能被后端更新的候选 Frame::pose_cs。
-            const double dist = (cached.camera_position - curr_pos).norm();
-            if (dist < best_dist) {
-                best_dist = dist;
-                prior_cand = cached.frame;
+    // 4. 历史时间邻域聚类。只依赖候选帧自身的子地图身份和关键帧序号；
+    //    跨子地图不借用全局 id 的时间顺序，因此每个跨图地点至少以单 KF
+    //    为一个 cluster，避免把不同子地图的相同 id 错合。
+    struct PlaceCluster {
+        LoopCandidate representative;
+        unsigned long min_id = 0;
+        unsigned long max_id = 0;
+    };
+    const unsigned long cluster_gap = static_cast<unsigned long>(
+        std::max(1, temporal_window_));
+    std::ranges::sort(scored, [](const LoopCandidate& a, const LoopCandidate& b) {
+        if (a.submap_id != b.submap_id) return a.submap_id < b.submap_id;
+        return a.frame->id < b.frame->id;
+    });
+    std::vector<PlaceCluster> clusters;
+    for (const auto& candidate : scored) {
+        if (clusters.empty() ||
+            clusters.back().representative.submap_id != candidate.submap_id ||
+            (candidate.frame->id > clusters.back().max_id &&
+             candidate.frame->id - clusters.back().max_id > cluster_gap)) {
+            PlaceCluster cluster{candidate, candidate.frame->id, candidate.frame->id};
+            cluster.representative.cluster_members.push_back(candidate.frame);
+            clusters.push_back(std::move(cluster));
+            continue;
+        }
+        auto& cluster = clusters.back();
+        cluster.min_id = std::min(cluster.min_id, candidate.frame->id);
+        cluster.max_id = std::max(cluster.max_id, candidate.frame->id);
+        cluster.representative.cluster_members.push_back(candidate.frame);
+        if (candidate.score > cluster.representative.score ||
+            (candidate.score == cluster.representative.score &&
+             candidate.frame->id < cluster.representative.frame->id)) {
+            auto members = std::move(cluster.representative.cluster_members);
+            cluster.representative = candidate;
+            cluster.representative.cluster_members = std::move(members);
+        }
+    }
+
+    // 5. 更新有界的跨查询假设。一次 detectLoop 可能被并发重复调用；同一
+    //    query KF 不重复增加 support，避免并发重排伪造“连续观测”。
+    auto same_cluster = [cluster_gap](const Impl::PlaceHypothesis& h,
+                                      const LoopCandidate& c) {
+        if (h.submap_id != c.submap_id || !h.representative || !c.frame) return false;
+        const unsigned long a = h.anchor_id;
+        const unsigned long b = c.frame->id;
+        return (a >= b) ? (a - b <= cluster_gap) : (b - a <= cluster_gap);
+    };
+    for (const auto& cluster : clusters) {
+        auto hit = std::ranges::find_if(impl_->place_hypotheses,
+                                        [&](const auto& h) {
+                                            return same_cluster(h, cluster.representative);
+                                        });
+        if (hit == impl_->place_hypotheses.end()) {
+            impl_->place_hypotheses.push_back({
+                cluster.representative.frame, cluster.representative.submap_id,
+                cluster.representative.frame->id, kf->id,
+                impl_->query_serial, 1, cluster.representative.score});
+        } else {
+            if (hit->last_query_id != kf->id) {
+                // 允许至多一次缺测；更长断档不应把偶发重复误认为连续
+                // 地点证据，重新从当前查询建立假设。
+                if (impl_->query_serial <= hit->last_seen + 2)
+                    ++hit->support;
+                else
+                    hit->support = 1;
+            }
+            hit->last_query_id = kf->id;
+            hit->last_seen = impl_->query_serial;
+            if (cluster.representative.score >= hit->best_score) {
+                hit->representative = cluster.representative.frame;
+                hit->anchor_id = cluster.representative.frame->id;
+                hit->best_score = cluster.representative.score;
             }
         }
-        if (prior_cand) {
-            // 去重：词袋已包含时跳过
-            const bool dup = std::ranges::any_of(candidates, [&](const Frame::Ptr& c) {
-                return c->id == prior_cand->id;
-            });
-            if (!dup) candidates.push_back(prior_cand);
-            LOG_INFO("LoopClosure: position prior candidate kf#"
-                     << prior_cand->id << " (dist=" << best_dist << "m)");
-        }
     }
+    // 假设是排序辅助而非地图数据；限制数量并老化，保证异常长序列不因
+    // 多帧跟踪额外产生无界内存。当前查询未观测到的假设不输出。
+    constexpr std::size_t kMaxPlaceHypotheses = 256;
+    constexpr std::uint64_t kHypothesisLifetime = 128;
+    std::erase_if(impl_->place_hypotheses, [&](const auto& h) {
+        return impl_->query_serial > h.last_seen &&
+               impl_->query_serial - h.last_seen > kHypothesisLifetime;
+    });
+    if (impl_->place_hypotheses.size() > kMaxPlaceHypotheses) {
+        std::ranges::sort(impl_->place_hypotheses,
+                          [](const auto& a, const auto& b) {
+                              if (a.support != b.support) return a.support > b.support;
+                              return a.last_seen > b.last_seen;
+                          });
+        impl_->place_hypotheses.resize(kMaxPlaceHypotheses);
+    }
+
+    // 将当前查询的各个地点代表按视觉分数和时序支持排序。成熟假设优先，
+    // 但首次观测的 cluster 仍返回，保持旧 API 的单次查询兼容性。
+    struct RankedCluster {
+        LoopCandidate candidate;
+        int support = 1;
+    };
+    std::vector<RankedCluster> ranked;
+    ranked.reserve(clusters.size());
+    for (const auto& cluster : clusters) {
+        int support = 1;
+        if (auto hit = std::ranges::find_if(
+                impl_->place_hypotheses, [&](const auto& h) {
+                    return same_cluster(h, cluster.representative);
+                }); hit != impl_->place_hypotheses.end())
+            support = hit->support;
+        ranked.push_back({cluster.representative, support});
+    }
+    std::ranges::sort(ranked, [](const RankedCluster& a, const RankedCluster& b) {
+        if (a.support != b.support) return a.support > b.support;
+        if (a.candidate.score != b.candidate.score)
+            return a.candidate.score > b.candidate.score;
+        if (a.candidate.submap_id != b.candidate.submap_id)
+            return a.candidate.submap_id < b.candidate.submap_id;
+        return a.candidate.frame->id < b.candidate.frame->id;
+    });
+    // 长期运行中同一外观会在多个历史路段形成 cluster；固定 8 个地点在
+    // 跨子图尾段会把真实旧地点挤掉。仍保持严格有界，但给 BoW/位置先验
+    // 合计 12 个地点槽，几何门负责最终验收。
+    constexpr std::size_t kMaxClustersPerQuery = 12;
+    for (const auto& entry : ranked) {
+        if (candidates.size() >= kMaxClustersPerQuery) break;
+        LoopCandidate candidate = entry.candidate;
+        candidate.temporal_support = entry.support;
+        candidate.mature = entry.support >= 2;
+        candidates.push_back(std::move(candidate));
+    }
+
+    // 6. 位置先验：估计轨迹自交区域词袋分数常偏低，用世界系距离补召回。
+    //    与词袋候选并列返回（放在后面），由调用方的 PnP 双门槛验证兜底。
+    if (position_prior_dist_m_ > 0.0) {
+        const Vec3 curr_pos = query_T_ws * kf->pose_cs.inverse().t;
+        struct PositionPrior {
+            double distance = 0.0;
+            unsigned long id = 0;
+            const Impl::CachedKeyFrame* cached = nullptr;
+        };
+        std::vector<PositionPrior> position_priors;
+        for (const auto& [cand_id, cached] : impl_->kf_cache) {
+            if (!cached.frame) continue;
+            if (cached.submap_id == query_submap_id &&
+                (cand_id >= kf->id ||
+                 kf->id - cand_id < (unsigned long)position_prior_gap_)) continue;
+            // pose_cs.inverse().t 是子地图局部光心。只有先乘最新的
+            // T_ws 才能进入世界系；加入时的快照仅作缺少 Atlas 条目时的回退。
+            SE3 T_ws = cached.T_ws;
+            if (const auto pose_it = latest_submap_poses.find(cached.submap_id);
+                pose_it != latest_submap_poses.end()) {
+                T_ws = pose_it->second;
+            }
+            const Vec3 cand_pos = T_ws * cached.camera_position_local;
+            const double dist = (cand_pos - curr_pos).norm();
+            if (dist < position_prior_dist_m_)
+                position_priors.push_back({dist, cand_id, &cached});
+        }
+        // 先用与 BoW 完全相同的“连续间隔单链”语义建历史地点。
+        // 例如 gap=30 时 0/25/50 是一个连通 cluster，不能因 0↔50
+        // 超过 gap 而浪费第二个 prior 槽。每簇只保留世界距离最近者。
+        std::ranges::sort(position_priors, [](const auto& a, const auto& b) {
+            if (a.cached->submap_id != b.cached->submap_id)
+                return a.cached->submap_id < b.cached->submap_id;
+            return a.id < b.id;
+        });
+        struct PositionPlace {
+            PositionPrior best;
+            SubmapId submap_id = 0;
+            unsigned long min_id = 0;
+            unsigned long max_id = 0;
+        };
+        std::vector<PositionPlace> position_places;
+        if (!position_priors.empty()) {
+            PositionPrior best = position_priors.front();
+            SubmapId cluster_submap = best.cached->submap_id;
+            unsigned long min_id = best.id;
+            unsigned long last_id = best.id;
+            for (size_t i = 1; i < position_priors.size(); ++i) {
+                const auto& prior = position_priors[i];
+                const bool connected = prior.cached->submap_id == cluster_submap &&
+                    prior.id >= last_id && prior.id - last_id <= cluster_gap;
+                if (!connected) {
+                    position_places.push_back(
+                        {best, cluster_submap, min_id, last_id});
+                    best = prior;
+                    cluster_submap = prior.cached->submap_id;
+                    min_id = prior.id;
+                } else if (prior.distance < best.distance ||
+                           (prior.distance == best.distance && prior.id < best.id)) {
+                    best = prior;
+                }
+                last_id = prior.id;
+            }
+            position_places.push_back({best, cluster_submap, min_id, last_id});
+        }
+        std::ranges::sort(position_places, [](const auto& a, const auto& b) {
+            if (a.best.distance != b.best.distance)
+                return a.best.distance < b.best.distance;
+            if (a.submap_id != b.submap_id) return a.submap_id < b.submap_id;
+            return a.min_id < b.min_id;
+        });
+        // 位置先验本身也是多模态的：有累积漂移时“最近的单 KF”
+        // 未必是真实重访地点。从不同历史时间 cluster 中保留最多 4 个，
+        // 且与 BoW 合计仍不超过 12 个几何验证槽。
+        constexpr std::size_t kMaxPositionPriorPlaces = 4;
+        std::vector<LoopCandidate> prior_candidates;
+        for (const auto& place : position_places) {
+            if (prior_candidates.size() >= kMaxPositionPriorPlaces) break;
+            const auto& prior = place.best;
+            if (!prior.cached || !prior.cached->frame) continue;
+            // 跨模态按“子图 + 历史时间簇”去重，不只比较代表 KF id。
+            // 否则 BoW kf#100 和 prior kf#101 会浪费两个几何槽。
+            const bool dup = std::ranges::any_of(candidates, [&](const auto& c) {
+                if (!c.frame || c.submap_id != prior.cached->submap_id) return false;
+                unsigned long bow_min = c.frame->id;
+                unsigned long bow_max = c.frame->id;
+                for (const auto& member : c.cluster_members) {
+                    if (!member) continue;
+                    bow_min = std::min(bow_min, member->id);
+                    bow_max = std::max(bow_max, member->id);
+                }
+                // 两个按相同 gap 形成的单链地点，只要区间相交或端点距离
+                // 不超过 gap，合并后仍是同一连通分量，必须跨模态去重。
+                return place.min_id <= bow_max + cluster_gap &&
+                       bow_min <= place.max_id + cluster_gap;
+            });
+            if (dup) continue;
+            prior_candidates.push_back(
+                {prior.cached->frame, prior.cached->submap_id, 0.0});
+            LOG_INFO("LoopClosure: position prior candidate kf#"
+                     << prior.id << " submap#" << prior.cached->submap_id
+                     << " (dist=" << prior.distance << "m)");
+        }
+        // 一次性从最低优先级 BoW 尾部预留 N 个槽后再 append；不能
+        // 在循环内 pop/push，否则后来的 prior 会弹掉刚加入的更近 prior。
+        const size_t bow_keep = std::min(
+            candidates.size(), kMaxClustersPerQuery - prior_candidates.size());
+        candidates.resize(bow_keep);
+        for (auto& prior : prior_candidates)
+            candidates.push_back(std::move(prior));
+        }
 
     if (!candidates.empty())
         LOG_INFO("LoopClosure: " << candidates.size() << " candidates, top kf#"
-                 << candidates.front()->id << " (score="
-                 << (scored.empty() ? 0.0 : scored.front().second) << ")");
+                 << candidates.front().frame->id << " submap#"
+                 << candidates.front().submap_id << " (score="
+                 << candidates.front().score << ")");
     return candidates;
 #endif
 }
@@ -255,11 +567,42 @@ bool LoopClosure::verifyLoop(Frame::Ptr kf_curr, Frame::Ptr kf_loop,
                                  inliers, cv::SOLVEPNP_ITERATIVE);
     if (!ok || inliers.empty()) return false;
 
-    // 4. 内点判定：数量 + 比例双门槛
+    // 4. 内点判定：数量/比例 + RMSE/正深度/空间覆盖。
     double ratio = (double)inliers.size() / (double)pts3d.size();
-    if ((int)inliers.size() < min_loop_inliers_ || ratio < pnp_inlier_ratio_) {
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(pts3d, rvec, tvec, K, cv::Mat(), projected);
+    double sum_sq = 0.0;
+    int positive_depth = 0;
+    std::unordered_set<int> grid_cells;
+    const SE3 T_cw_quality = matToSE3(rvec, tvec);
+    const double image_width = camera_->img_width > 0
+        ? camera_->img_width : std::max(1.0, camera_->cx * 2.0);
+    const double image_height = camera_->img_height > 0
+        ? camera_->img_height : std::max(1.0, camera_->cy * 2.0);
+    for (const int idx : inliers) {
+        if (idx < 0 || idx >= static_cast<int>(pts3d.size())) continue;
+        const double dx = projected[idx].x - pts2d[idx].x;
+        const double dy = projected[idx].y - pts2d[idx].y;
+        sum_sq += dx * dx + dy * dy;
+        const Vec3 p(pts3d[idx].x, pts3d[idx].y, pts3d[idx].z);
+        if ((T_cw_quality * p).z() > 0.0) ++positive_depth;
+        const int gx = std::clamp(static_cast<int>(
+            pts2d[idx].x * 8.0 / image_width), 0, 7);
+        const int gy = std::clamp(static_cast<int>(
+            pts2d[idx].y * 6.0 / image_height), 0, 5);
+        grid_cells.insert(gy * 8 + gx);
+    }
+    const double rmse = std::sqrt(sum_sq / std::max<size_t>(1, inliers.size()));
+    const double positive_ratio = positive_depth /
+        static_cast<double>(std::max<size_t>(1, inliers.size()));
+    if ((int)inliers.size() < min_loop_inliers_ || ratio < pnp_inlier_ratio_ ||
+        rmse > max_reprojection_rmse_ ||
+        positive_ratio < min_positive_depth_ratio_ ||
+        static_cast<int>(grid_cells.size()) < min_grid_cells_) {
         LOG_WARN("LoopClosure: PnP rejected (" << inliers.size() << " inliers, "
-                 << ratio << " ratio)");
+                 << ratio << " ratio, " << rmse << "px, "
+                 << positive_ratio << " positive, " << grid_cells.size()
+                 << " grid cells)");
         return false;
     }
 

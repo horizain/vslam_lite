@@ -92,7 +92,9 @@ BudgetReclaimResult ResourceBudget::reclaim(
     const std::unordered_set<KeyframeId>& protected_keyframe_ids,
     const std::unordered_map<SubmapId, std::vector<KeyframeId>>& submap_keyframes,
     size_t snapshot_bytes,
-    const std::unordered_map<SubmapId, Map::Ptr>& inactive_submaps) const {
+    const std::unordered_map<SubmapId, Map::Ptr>& inactive_submaps,
+    const std::function<void(const Frame::Ptr&, const Frame::Ptr&)>&
+        before_keyframe_cull) const {
     BudgetReclaimResult r;
     if (!map) return r;
     if (evaluate(map, snapshot_bytes).within_budget) return r;
@@ -155,8 +157,12 @@ BudgetReclaimResult ResourceBudget::reclaim(
             if (protected_keyframe_ids.contains(older->id)) continue;
             if (older->id + config_.kf_image_keep_recent > last_id) continue;
             if (redundantPair(older, newer, map)) {
+                // VO 在同一 map 写事务内把持久轨迹从 older 原子重锚到
+                // newer；回调完成后才允许删除，避免轨迹引用悬空。
+                if (before_keyframe_cull) before_keyframe_cull(older, newer);
                 if (map->removeKeyFrame(older->id)) {
                     r.culled_redundant_keyframes++;
+                    r.culled_keyframe_ids.push_back(older->id);
                     culled_this_pass++;
                 }
             }

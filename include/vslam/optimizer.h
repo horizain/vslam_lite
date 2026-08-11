@@ -75,7 +75,7 @@ struct OptimizationSnapshot {
     std::vector<ObservationState> observations;
     std::vector<LandmarkState> landmarks;
     std::vector<Constraint> constraints;
-    std::vector<unsigned long> fixed_kf_ids;  // BA 锚定（窗口最早 2 帧等）
+    std::vector<unsigned long> fixed_kf_ids;  // BA/位姿图锚定（窗口最早帧、已发布 Atlas 子图等）
 };
 
 struct PoseUpdate {

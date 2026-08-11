@@ -111,6 +111,50 @@ void test_create_map_points_from_stereo() {
     } TEST_PASS();
 }
 
+void test_stereo_point_budget_is_per_point() {
+    TEST("createMapPointsFromStereo: 建点预算逐点执行且不越限") {
+        const vslam::Camera cam = makeStereo();
+        LocalMapper mapper(cam);
+        auto map = std::make_shared<Map>();
+        auto frame = std::make_shared<Frame>(0, 0.0);
+        frame->pose_cs = SE3();
+        frame->keypoints = {
+            cv::KeyPoint(320, 240, 20), cv::KeyPoint(200, 150, 20),
+            cv::KeyPoint(100, 300, 20), cv::KeyPoint(400, 240, 20)};
+        frame->map_points.resize(frame->keypoints.size(), nullptr);
+        for (size_t i = 0; i < frame->keypoints.size(); i++)
+            setStereoPoint(frame, i, 5.0 + static_cast<double>(i));
+        map->insertKeyFrame(frame);
+
+        // 旧实现会为全部有效深度点建图；剩余配额只有两个时必须精确
+        // 建两个点，不能先批量创建再超出上限。
+        mapper.createMapPointsFromStereo(map, frame, 2);
+        assert(map->mapPointCount() == 2);
+        assert(frame->map_points[0] && frame->map_points[1]);
+        assert(frame->map_points[2] == nullptr && frame->map_points[3] == nullptr);
+        assert(map->verifyObservationConsistency());
+    } TEST_PASS();
+}
+
+void test_tracking_hit_keeps_recent_points_fresh() {
+    TEST("Map: KF 关联点命中统计可供 rolling 回收使用") {
+        auto map = std::make_shared<Map>();
+        auto frame = std::make_shared<Frame>(0, 0.0);
+        frame->keypoints = {cv::KeyPoint(320, 240, 20)};
+        frame->map_points.resize(1, nullptr);
+        auto mp = std::make_shared<MapPoint>(map->nextMapPointId());
+        frame->map_points[0] = mp;
+        map->insertMapPoint(mp);
+        map->insertKeyFrame(frame);
+        assert(map->lastHitKeyframeCount(mp->id) == map->keyFrameCount());
+
+        // 普通帧跟踪命中不增加正式 Observation，但必须刷新旁路命中计数，
+        // 这样达到点 cap 时不会把持续使用的强点当成 stale 点删除。
+        map->recordTrackingHit(mp->id);
+        assert(map->lastHitKeyframeCount(mp->id) == map->keyFrameCount());
+    } TEST_PASS();
+}
+
 void test_triangulate_new_points() {
     TEST("triangulateNewPoints: 两帧三角化建点") {
         const vslam::Camera cam = makeStereo();  // 只用其 K
@@ -225,6 +269,8 @@ int main() {
 
     test_include_local_ba_landmark();
     test_create_map_points_from_stereo();
+    test_stereo_point_budget_is_per_point();
+    test_tracking_hit_keeps_recent_points_fresh();
     test_triangulate_new_points();
     test_select_local_window();
     test_build_local_ba_snapshot();

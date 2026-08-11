@@ -36,6 +36,22 @@ bool Map::removeMapPoint(MapPointId id) {
     return true;
 }
 
+size_t Map::removeMapPoints(const std::vector<MapPointId>& ids) {
+    std::vector<MapPoint::Ptr> removed;
+    removed.reserve(ids.size());
+    for (const auto id : ids) {
+        auto it = map_points_.find(id);
+        if (it == map_points_.end()) continue;
+        removed.push_back(it->second);
+        map_points_.erase(it);
+    }
+    if (removed.empty()) return 0;
+    mp_count_.fetch_sub(removed.size(), std::memory_order_relaxed);
+    removeMapPointsUnlocked(removed);
+    bumpTopology();
+    return removed.size();
+}
+
 void Map::cullMapPoints(int min_observations) {
     // 按正式关键帧观测数剔除弱观测点，并同步清空双向引用。
     // 历史教训（2026-08-05 两版实验均失败）：

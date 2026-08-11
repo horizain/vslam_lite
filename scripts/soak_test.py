@@ -36,7 +36,7 @@ from pathlib import Path
 def parse_args():
     p = argparse.ArgumentParser(description="M2.3 §6.5 soak 验收")
     p.add_argument("--bin", default="./build/bin/run_slam")
-    p.add_argument("--dataset", default="datasets/sequences/00")
+    p.add_argument("--dataset", default="datasets/kitti/sequences/00")
     p.add_argument("--config", default="config/default.yaml")
     p.add_argument("--robot-yaml", default="config/robot.yaml")
     p.add_argument("--frames", type=int, default=500)
@@ -149,7 +149,7 @@ def check_metrics(m, args, report, check_valid_ratio=True):
     if check_valid_ratio:
         checks.append(
             ("valid_ratio >= 门限",
-             m["frames_processed"] == 0 or
+             m["frames_processed"] > 0 and
              m["pose_accepted"] / m["frames_processed"] >= args.min_valid_ratio,
              f"valid={m['pose_accepted']}/{m['frames_processed']}"))
     for name, ok, detail in checks:
@@ -202,8 +202,8 @@ def check_fail_inject(args):
         print("  构造失败路径: 进程挂死 >10s -> FAIL")
         return False
     elapsed = time.time() - t0
-    ok = elapsed < 2.0
-    print(f"  构造失败（非法输入）: 退出码 {rc}，耗时 {elapsed:.2f}s（<2s）-> "
+    ok = rc != 0 and elapsed < 2.0
+    print(f"  构造失败（非法输入）: 退出码 {rc}（非零），耗时 {elapsed:.2f}s（<2s）-> "
           f"{'PASS' if ok else 'FAIL'}")
     return ok
 

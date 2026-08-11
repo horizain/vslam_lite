@@ -41,6 +41,10 @@ public:
     /// 原子删除地图点及其全部 observation、共视计数、KF slot。
     /// 调用方必须持有 map_mutex_ 独占锁；不存在时幂等返回 false。
     bool removeMapPoint(MapPointId id);
+    /// 批量删除地图点：正式观测逐点撤销，但所有 KF slot 只扫描一次，
+    /// topology revision 也只发布一次。返回实际删除数量。
+    /// 调用方必须持有 map_mutex_ 独占锁。
+    size_t removeMapPoints(const std::vector<MapPointId>& ids);
     /// 原子计数：供状态栏/状态轮询在锁外读取（无需锁住整个 std::map）。
     /// 与 map_points_.size() 的唯一差别是"插入后计数立即生效"，对统计足够。
     size_t mapPointCount() const { return mp_count_.load(std::memory_order_relaxed); }

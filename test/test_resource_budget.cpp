@@ -285,9 +285,20 @@ void test_reclaim_step4_redundant_keyframes() {
         }
 
         std::unordered_set<KeyframeId> protected_kfs{kf2->id};  // 锚点
-        const auto r = budget.reclaim(map, protected_kfs);
+        size_t cull_callbacks = 0;
+        const auto r = budget.reclaim(
+            map, protected_kfs, {}, 0, {},
+            [&](const Frame::Ptr& removed, const Frame::Ptr& replacement) {
+                cull_callbacks++;
+                assert(removed && replacement);
+                assert(map->getKeyFrame(removed->id) == removed &&
+                       "回调必须发生在 KF 真正删除之前");
+                assert(removed->id == kf0->id && replacement->id == kf1->id);
+            });
 
         assert(r.culled_redundant_keyframes == 1);
+        assert(r.culled_keyframe_ids == std::vector<KeyframeId>{kf0->id});
+        assert(cull_callbacks == 1);
         assert(map->getKeyFrame(kf0->id) == nullptr && "冗余 KF kf0 必须剔除");
         assert(map->getKeyFrame(kf2->id) == kf2 && "锚点 KF 必须保留");
         assert(map->getKeyFrame(kf3->id) == kf3);

@@ -37,6 +37,19 @@ struct AtlasConstraint {
     AtlasConstraintType type = AtlasConstraintType::Relocalization;
 };
 
+/// 从同一相机的跨子地图回环测量构造 Atlas 约束。
+/// verifyLoop 输出 Z = T_cs_loop_kf * P^-1，其中 P 是当前相机在回环
+/// 子地图中的 T_cw；Atlas 边要求 T_ws_loop = T_ws_current * T_rel。
+[[nodiscard]] AtlasConstraint makeCrossSubmapLoopConstraint(
+    SubmapId current_submap_id, SubmapId loop_submap_id,
+    const SE3& current_pose_cs, const SE3& loop_pose_cs,
+    const SE3& T_loop_curr, double weight = 10.0);
+
+/// 同一子地图局部相机位姿不变时，把世界系 T_cw 从旧 Atlas 锚重基到新锚。
+/// T_cw_new = T_cw_old * T_ws_old * T_ws_new^-1。
+[[nodiscard]] SE3 rebaseWorldPoseForSubmapAnchor(
+    const SE3& T_cw_old, const SE3& T_ws_old, const SE3& T_ws_new);
+
 class Atlas {
 public:
     using Ptr = std::shared_ptr<Atlas>;
@@ -68,6 +81,12 @@ public:
     const std::vector<AtlasConstraint>& constraints() const { return constraints_; }
     /// 按子地图过滤约束（a 或 b 命中）
     std::vector<AtlasConstraint> constraintsOf(unsigned long submap_id) const;
+    /// 检查全部高置信 LoopClosure 边在当前 T_ws 解上的残差；低置信
+    /// TrackingBridge/Relocalization 不参与此硬门。
+    [[nodiscard]] bool loopConstraintsConsistent(
+        double max_translation, double max_rotation,
+        double* max_translation_seen = nullptr,
+        double* max_rotation_seen = nullptr) const;
 
 private:
     std::deque<Submap> submaps_;

@@ -50,6 +50,9 @@ def quat_diff_angle(qa, qb):
 
 
 def compare_traj(a, b, tol_trans, tol_rot):
+    if not a or not b:
+        print(f"[FAIL] 轨迹不得为空: {len(a)} vs {len(b)}")
+        return False
     if len(a) != len(b):
         print(f"[FAIL] 行数不一致: {len(a)} vs {len(b)}")
         return False
@@ -79,6 +82,9 @@ def compare_status(a, b):
         rows_a = [l.strip() for l in f if l.strip() and not l.startswith("frame_id")]
     with open(b, "r") as f:
         rows_b = [l.strip() for l in f if l.strip() and not l.startswith("frame_id")]
+    if not rows_a or not rows_b:
+        print(f"[FAIL] 状态序列不得为空: {len(rows_a)} vs {len(rows_b)}")
+        return False
     if len(rows_a) != len(rows_b):
         print(f"[FAIL] 状态行数不一致: {len(rows_a)} vs {len(rows_b)}")
         return False

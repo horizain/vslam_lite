@@ -5,14 +5,12 @@
 #include "vslam/map.h"
 
 #include <cstddef>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace vslam {
-
-/// 子地图 id（与 Atlas::Submap::id 一致）
-using SubmapId = unsigned long;
 
 /// §6.2 首版参数 + §6.3 地图预算算法参数。
 /// 参数变更必须按 §0.1 用不少于 3 类场景的机器人实录数据统一标定，
@@ -84,6 +82,7 @@ struct BudgetReclaimResult {
     size_t frozen_submaps = 0;               // 第 5 步
     size_t unloaded_submap_kf_images = 0;    // 第 5 步
     size_t removed_frozen_submap_points = 0; // 第 5 步：冻结子地图弱陈点删除
+    std::vector<KeyframeId> culled_keyframe_ids; // 第 4 步：供外部索引批量同步
     bool stopped_map_growth = false;         // 第 6 步：仍超预算
 };
 
@@ -120,7 +119,9 @@ public:
         const std::unordered_map<SubmapId, std::vector<KeyframeId>>&
             submap_keyframes = {},
         size_t snapshot_bytes = 0,
-        const std::unordered_map<SubmapId, Map::Ptr>& inactive_submaps = {}) const;
+        const std::unordered_map<SubmapId, Map::Ptr>& inactive_submaps = {},
+        const std::function<void(const Frame::Ptr&, const Frame::Ptr&)>&
+            before_keyframe_cull = {}) const;
 
     /// 描述子字节统计（点代表描述子 + 各 KF 描述子矩阵；供 §6.4 指标复用）
     [[nodiscard]] static size_t descriptorBytes(const Map::Ptr& map);

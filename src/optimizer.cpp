@@ -467,13 +467,17 @@ OptimizationResult Optimizer::solvePoseGraph(const OptimizationSnapshot& snap) {
     // ========================================================
     // 2. 位姿顶点：VertexSE3，estimate 为 T_wc（g2o SE3 群运算标准语义）
     // ========================================================
+    const std::unordered_set<unsigned long> fixed_ids(
+        snap.fixed_kf_ids.begin(), snap.fixed_kf_ids.end());
     std::unordered_map<unsigned long, int> kf_vid;
     for (size_t i = 0; i < snap.keyframes.size(); i++) {
         const auto& kf = snap.keyframes[i];
         auto* v = new g2o::VertexSE3();
         v->setId(static_cast<int>(i));
         v->setEstimate(Eigen::Isometry3d(kf.pose_cs.inverse().matrix()));
-        if (i == 0) v->setFixed(true);  // 最老关键帧锚定坐标系
+        // 首节点始终固定；Atlas 还会显式固定全部历史子图，只允许当前
+        // 活动子图吸收新跨图约束，避免新回环追溯搬动多个已发布边界。
+        if (i == 0 || fixed_ids.contains(kf.id)) v->setFixed(true);
         optimizer.addVertex(v);
         kf_vid[kf.id] = static_cast<int>(i);
     }
