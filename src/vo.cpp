@@ -11,6 +11,7 @@
 #include <set>
 #include <unordered_map>
 #include <algorithm>
+#include <cmath>
 #include <ranges>
 #include <limits>
 #include <numeric>
@@ -95,6 +96,33 @@ bool triangulateNormalizedPoint(const Vec2& p1, const Vec2& p2,
     if (!X_h.allFinite() || std::abs(X_h.w()) < 1e-12) return false;
     point_c1 = X_h.head<3>() / X_h.w();
     return point_c1.allFinite();
+}
+
+bool sampleRgb(const cv::Mat& image, const cv::Point2f& pixel,
+               uint8_t& r, uint8_t& g, uint8_t& b) {
+    if (image.empty() || image.depth() != CV_8U ||
+        !std::isfinite(pixel.x) || !std::isfinite(pixel.y))
+        return false;
+    const int x = cvRound(pixel.x);
+    const int y = cvRound(pixel.y);
+    if (x < 0 || y < 0 || x >= image.cols || y >= image.rows) return false;
+
+    if (image.channels() == 1) {
+        const uint8_t value = image.at<uint8_t>(y, x);
+        r = value; g = value; b = value;
+        return true;
+    }
+    if (image.channels() == 3) {
+        const cv::Vec3b value = image.at<cv::Vec3b>(y, x);  // BGR
+        r = value[2]; g = value[1]; b = value[0];
+        return true;
+    }
+    if (image.channels() == 4) {
+        const cv::Vec4b value = image.at<cv::Vec4b>(y, x);  // BGRA
+        r = value[2]; g = value[1]; b = value[0];
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -2842,6 +2870,45 @@ std::vector<Vec3> VisualOdometry::getMapPointsWorld(size_t max_points) const {
     for (size_t i = 0; i < max_points; ++i) {
         sampled.push_back(all[static_cast<size_t>(i * stride)]);
     }
+    return sampled;
+}
+
+std::vector<ColoredPoint> VisualOdometry::getCurrentStereoPointCloud(
+    size_t max_points) const {
+    if (max_points == 0) return {};
+
+    std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
+    const auto frame = curr_frame_;
+    const auto* active_submap = atlas_ ? atlas_->activeSubmap() : nullptr;
+    if (!frame || !active_submap || frame->image.empty() ||
+        frame->pts_c.empty() || frame->keypoints.empty())
+        return {};
+
+    // pose_cs: 子地图→相机；组合后 T_wc: 相机→世界。
+    const SE3 T_wc = active_submap->T_ws * frame->pose_cs.inverse();
+    const size_t count = std::min(frame->pts_c.size(), frame->keypoints.size());
+    std::vector<ColoredPoint> all;
+    all.reserve(std::min(max_points, count));
+    for (size_t i = 0; i < count; ++i) {
+        const Vec3& p_c = frame->pts_c[i];
+        if (!p_c.allFinite() || p_c.z() <= 0.0) continue;
+
+        ColoredPoint point;
+        point.position_w = T_wc * p_c;
+        if (!point.position_w.allFinite()) continue;
+        if (!sampleRgb(frame->image, frame->keypoints[i].pt,
+                       point.r, point.g, point.b))
+            continue;
+        all.push_back(point);
+    }
+    if (all.size() <= max_points) return all;
+
+    // 超出上限时均匀抽样，避免只显示特征索引前段。
+    std::vector<ColoredPoint> sampled;
+    sampled.reserve(max_points);
+    const double stride = static_cast<double>(all.size()) / max_points;
+    for (size_t i = 0; i < max_points; ++i)
+        sampled.push_back(all[static_cast<size_t>(i * stride)]);
     return sampled;
 }
 

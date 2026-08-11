@@ -185,6 +185,9 @@ int main(int argc, char** argv) {
                                              localizer.keyFrameCount()));
                 viewer.updateMapPoints(
                     localizer.mapPointsWorld(vslam::Viewer::kMaxMapPoints));
+                viewer.updateColoredPointCloud(
+                    localizer.currentStereoPointCloud(
+                        vslam::Viewer::kMaxMapPoints));
             }
         }
 
@@ -362,6 +365,8 @@ int main(int argc, char** argv) {
                                pose, cf->image_right);
             viewer.updateMapPoints(
                 vo.getMapPointsWorld(vslam::Viewer::kMaxMapPoints));
+            viewer.updateColoredPointCloud(
+                vo.getCurrentStereoPointCloud(vslam::Viewer::kMaxMapPoints));
         }
 
         if (frame_count % 30 == 0) {

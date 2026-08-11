@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vslam/common.h"
+#include "vslam/point_cloud.h"
 #include "vslam/camera.h"
 #include "vslam/frame.h"
 #include "vslam/map.h"
@@ -254,6 +255,10 @@ public:
     /// 3D Viewer 绘制点云。max_points 为可视化硬上限；总点超出时对点集
     /// 均匀抽样，保证新旧子地图的点都可见。调用方无需持锁。
     std::vector<Vec3> getMapPointsWorld(size_t max_points) const;
+
+    /// 获取当前帧双目匹配后的有效点，并从当前左目图像采样 RGB 颜色。
+    /// 点从相机系转换到世界系；单目/无有效 pts_c 时返回空向量。
+    std::vector<ColoredPoint> getCurrentStereoPointCloud(size_t max_points) const;
 
     /// M4：轨迹记录——普通帧不再保存全局 T_cw，只记录相对锚定关键帧的
     /// 局部运动；世界位姿读时组合 T_cw = T_ca · (anchor pose_cs · T_ws⁻¹)。

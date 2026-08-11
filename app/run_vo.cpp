@@ -178,6 +178,8 @@ int main(int argc, char** argv) {
                                pose, cf->image_right);
             viewer.updateMapPoints(
                 vo.getMapPointsWorld(vslam::Viewer::kMaxMapPoints));
+            viewer.updateColoredPointCloud(
+                vo.getCurrentStereoPointCloud(vslam::Viewer::kMaxMapPoints));
         }
 
         // 打印状态

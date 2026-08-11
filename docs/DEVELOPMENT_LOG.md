@@ -2050,3 +2050,18 @@ Local BA 锚点重基和跨子图渐进校正几何回归。
 
 **边界**：3D 视图仅是有显示环境下的可视化辅助，headless 评估路径不受影响；
 点云上限 60000 超出时均匀抽样会略去部分点，仅影响显示密度、不影响轨迹/地图数据。
+
+### 3.44 当前帧双目 RGB 点云查看与 PLY 导出（2026-08-11）
+
+新增 `ColoredPoint` 和 `VisualOdometry::getCurrentStereoPointCloud`：对当前帧有效
+`Frame::pts_c` 按 `T_wc` 转换到世界系，并从左目图像对应 `KeyPoint` 像素采样 RGB。
+颜色只服务于可视化，不写入 `MapPoint`，因此不改变地图、BA、回环和点生命周期。
+
+Viewer 面板新增默认关闭的 `Show colored stereo points`，只有在 `Show 3D map` 开启时
+绘制当前帧彩色点云。新增 `tools/stereo_cloud_viewer`，产物为 `build*/bin/stereo_cloud_viewer`，
+可实时查看并用 `--export-ply` 导出最后一帧 ASCII PLY。KITTI 原始图像是灰度图，导出的
+RGB 通道因此通常相同；彩色双目数据会保留真实颜色。
+
+验证：CMake 重新配置后 `stereo_cloud_viewer`、`run_slam`、`run_vo` 构建通过；KITTI 00
+前 80 帧无头运行成功，导出 `/tmp/stereo_last.ply`，包含 1175 个彩色点。尚未做完整
+4541 帧彩色 viewer 性能门；当前点云是当前帧快照，不是持久化的全局彩色地图。

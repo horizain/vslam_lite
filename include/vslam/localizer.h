@@ -102,6 +102,9 @@ public:
     [[nodiscard]] size_t keyFrameCount() const;
     /// 世界系地图点云（p_w = T_ws · p_s），供实时 3D Viewer 绘制（透传 VO）。
     [[nodiscard]] std::vector<Vec3> mapPointsWorld(size_t max_points) const;
+    /// 当前帧双目 RGB 点云（透传 VO），供实时 3D Viewer 绘制。
+    [[nodiscard]] std::vector<ColoredPoint> currentStereoPointCloud(
+        size_t max_points) const;
 
     // ---- M2.3 结构化指标（§6.4）----
     /// §6.4：指标快照（线程安全；含实时 map 字节/规模统计与 backend 计数）

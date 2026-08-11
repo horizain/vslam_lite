@@ -277,6 +277,13 @@ void Viewer::updateMapPoints(const std::vector<Vec3>& world_points) {
     ++map_points_revision_;
 }
 
+void Viewer::updateColoredPointCloud(
+    const std::vector<ColoredPoint>& points) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    colored_points_ = points;
+    ++colored_points_revision_;
+}
+
 void Viewer::renderLoop() {
     pangolin::CreateWindowAndBind("VSLAM Dashboard", 1440, 900);
     glDisable(GL_DEPTH_TEST);
@@ -309,6 +316,8 @@ void Viewer::renderLoop() {
     pangolin::Var<bool> show_features("ui.Show features", true, true);
     pangolin::Var<bool> show_3d_map("ui.Show 3D map", false, true);
     pangolin::Var<bool> show_map_points("ui.Show map points", true, true);
+    pangolin::Var<bool> show_colored_points(
+        "ui.Show colored stereo points", false, true);
     pangolin::Var<bool> show_camera("ui.Show camera", true, true);
     pangolin::Var<bool> show_grid("ui.Show grid", true, true);
     pangolin::Var<bool> follow_camera("ui.Follow camera", true, true);
@@ -330,11 +339,13 @@ void Viewer::renderLoop() {
     cv::Mat status_upload;
     std::vector<Vec3> trajectory_snapshot;
     std::vector<Vec3> map_points_snapshot;
+    std::vector<ColoredPoint> colored_points_snapshot;
     SE3 camera_pose_snapshot;
     uint64_t uploaded_image_revision = 0;
     uint64_t uploaded_status_revision = 0;
     uint64_t copied_trajectory_revision = 0;
     uint64_t copied_map_points_revision = 0;
+    uint64_t copied_colored_points_revision = 0;
     int image_width = 0;
     int image_height = 0;
     bool has_image = false;
@@ -369,6 +380,10 @@ void Viewer::renderLoop() {
             if (copied_map_points_revision != map_points_revision_) {
                 map_points_snapshot = map_points_;
                 copied_map_points_revision = map_points_revision_;
+            }
+            if (copied_colored_points_revision != colored_points_revision_) {
+                colored_points_snapshot = colored_points_;
+                copied_colored_points_revision = colored_points_revision_;
             }
         }
         {
@@ -555,6 +570,21 @@ void Viewer::renderLoop() {
                 glBegin(GL_POINTS);
                 for (const auto& pt : map_points_snapshot)
                     glVertex3f((float)pt.x(), (float)pt.y(), (float)pt.z());
+                glEnd();
+            }
+
+            // 当前帧双目深度点，颜色来自左目图像对应像素。
+            if (static_cast<bool>(show_colored_points) &&
+                !colored_points_snapshot.empty()) {
+                glPointSize(3.0f);
+                glBegin(GL_POINTS);
+                for (const auto& point : colored_points_snapshot) {
+                    glColor3f(point.r / 255.0f, point.g / 255.0f,
+                               point.b / 255.0f);
+                    glVertex3f((float)point.position_w.x(),
+                               (float)point.position_w.y(),
+                               (float)point.position_w.z());
+                }
                 glEnd();
             }
 

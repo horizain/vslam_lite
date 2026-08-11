@@ -2,6 +2,7 @@
 
 #include "vslam/common.h"
 #include "vslam/frame.h"
+#include "vslam/point_cloud.h"
 #include <opencv2/core.hpp>
 #include <thread>
 #include <mutex>
@@ -40,6 +41,9 @@ public:
     /// 上游传入的向量按 kMaxMapPoints 上限截取；空向量表示隐藏点云。
     void updateMapPoints(const std::vector<Vec3>& world_points);
 
+    /// 更新当前帧双目 RGB 点云；只在 3D 模式和开关打开时绘制。
+    void updateColoredPointCloud(const std::vector<ColoredPoint>& points);
+
 private:
     void renderLoop();
 
@@ -48,11 +52,13 @@ private:
     cv::Mat          status_img_;    // 独立状态卡片，避免改变视频宽高比
     std::vector<Vec3> trajectory_;   // 只保留可视化需要的最近轨迹点
     std::vector<Vec3> map_points_;   // 世界系地图点云（p_w = T_ws · p_s）
+    std::vector<ColoredPoint> colored_points_;  // 当前帧双目 RGB 点云
     SE3               camera_pose_wc_;  // 当前相机在世界系中的位姿
     uint64_t image_revision_ = 0;
     uint64_t status_revision_ = 0;
     uint64_t trajectory_revision_ = 0;
     uint64_t map_points_revision_ = 0;
+    uint64_t colored_points_revision_ = 0;
 
     std::thread render_thread_;
     std::atomic<bool> running_{false};

@@ -154,6 +154,7 @@ set(VSLAM_HEADERS
     include/vslam/map.h
     include/vslam/atlas.h
     include/vslam/feature.h
+    include/vslam/point_cloud.h
     include/vslam/vo.h
     include/vslam/optimizer.h
     include/vslam/viewer.h
@@ -213,6 +214,12 @@ set_target_properties(run_vo PROPERTIES
 add_executable(run_slam app/run_slam.cpp)
 target_link_libraries(run_slam vslam)
 set_target_properties(run_slam PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# --- stereo_cloud_viewer: 当前帧双目 RGB 点云查看/PLY 导出工具 ---
+add_executable(stereo_cloud_viewer tools/stereo_cloud_viewer.cpp)
+target_link_libraries(stereo_cloud_viewer vslam)
+set_target_properties(stereo_cloud_viewer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # ============================================================

@@ -431,6 +431,17 @@ Pangolin 仪表盘：**左上 = 彩色视频流 + 绿色特征点**（双目左�
 `run_vo` 数据集跑完后 Viewer 保持打开（显示最终地图），关闭窗口或按 Esc 才退出，
 `--headless` 不受影响。
 
+开启 `Show colored stereo points` 后，3D 视图还会叠加当前帧双目匹配的 RGB 点云。
+点的位置来自 `Frame::pts_c`，转换到世界系后绘制；颜色从左目图像的对应特征像素采样。
+该点云只用于当前帧可视化，不写入 `MapPoint`。也可以使用工具导出最后一帧的 ASCII PLY：
+
+```bash
+./build/bin/stereo_cloud_viewer datasets/kitti/sequences/00 config/kitti00.yaml \
+    --frames 200 --export-ply /tmp/stereo_last.ply
+```
+
+KITTI 图像本身是灰度图，所以 KITTI 导出的 RGB 通常为灰度；真实彩色双目数据会保留颜色。
+
 ### 5.8 `dataset.cpp` —— 数据输入
 
 一个抽象，四种来源：KITTI（图片目录）、TUM（`rgb.txt` 时间戳）、EuRoC
