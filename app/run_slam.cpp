@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <format>
 #include <chrono>
+#include <thread>
 #include <algorithm>
 #include <cstdlib>
 
@@ -182,10 +183,19 @@ int main(int argc, char** argv) {
                                              est.prediction_only ? " PRED" : "",
                                              localizer.mapPointCount(),
                                              localizer.keyFrameCount()));
+                viewer.updateMapPoints(
+                    localizer.mapPointsWorld(vslam::Viewer::kMaxMapPoints));
             }
         }
 
-        if (!headless) viewer.stop();
+        if (!headless) {
+            // 跑完后保持 Viewer 打开，直到用户关闭窗口/按 Esc。
+            LOG_INFO("Dataset finished. Viewer stays open; "
+                     "close the window or press ESC to exit.");
+            while (!viewer.shouldQuit())
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            viewer.stop();
+        }
         localizer.stop();
 
         // M2.3（§6.4）：结构化指标 JSON/CSV（soak_test.py / nightly 消费）
@@ -350,6 +360,8 @@ int main(int argc, char** argv) {
             viewer.updateFrame(cf->image, cf->keypoints,
                                vo.getTrajectory(vslam::Viewer::kMaxTrajectoryPoints),
                                pose, cf->image_right);
+            viewer.updateMapPoints(
+                vo.getMapPointsWorld(vslam::Viewer::kMaxMapPoints));
         }
 
         if (frame_count % 30 == 0) {
@@ -361,9 +373,6 @@ int main(int argc, char** argv) {
                      << " Loops: " << vo.loopClosureCount());
         }
     }
-
-    // ---- 清理 ----
-    if (!headless) viewer.stop();
 
     // 批量评估必须等待排队中的 BA/回环全部写回；否则末次优化、闭环计数和
     // perf 数据可能发生在轨迹保存之后，结果随线程时序变化。
@@ -441,6 +450,17 @@ int main(int argc, char** argv) {
         m.keyframes = (long long)vo.getMap()->keyFrameCount();
         vslam::writeRunMetricsJson(metrics_json_path, m);
         LOG_INFO("Structured metrics -> " << metrics_json_path);
+    }
+
+    // ---- 保持 Viewer 打开（仅非 headless；headless 立即退出）----
+    // 数据集跑完后不立即关闭窗口：渲染线程继续显示最终地图/轨迹/点云，
+    // 直到用户关闭窗口或按 Esc（renderLoop 退出时把 quit_ 置真）。
+    if (!headless) {
+        LOG_INFO("Dataset finished. Viewer stays open; "
+                 "close the window or press ESC to exit.");
+        while (!viewer.shouldQuit())
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        viewer.stop();
     }
 
     return 0;

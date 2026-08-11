@@ -2818,4 +2818,31 @@ std::vector<Vec3> VisualOdometry::getTrajectory(size_t max_points) const {
     return trajectory;
 }
 
+std::vector<Vec3> VisualOdometry::getMapPointsWorld(size_t max_points) const {
+    if (max_points == 0) return {};
+
+    // 地图点/子地图 T_ws 均受 map_mutex_ 保护；与 getTrajectory 相同的
+    // 共享锁模式，避免可视化读取与后端提交/前端插入交错。
+    std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
+    std::vector<Vec3> all;
+    all.reserve(std::min<size_t>(max_points, 1u << 16));
+    for (const auto& submap : atlas_->submaps()) {
+        if (!submap.map) continue;
+        for (const auto& mp : submap.map->getAllMapPoints()) {
+            // M3 几何契约：p_w = T_ws · p_s
+            all.push_back(submap.T_ws * mp->pos_s);
+        }
+    }
+    if (all.size() <= max_points) return all;
+
+    // 均匀抽样，避免只保留 id 靠前（最早创建）的点而缺失新子地图点。
+    std::vector<Vec3> sampled;
+    sampled.reserve(max_points);
+    const double stride = static_cast<double>(all.size()) / max_points;
+    for (size_t i = 0; i < max_points; ++i) {
+        sampled.push_back(all[static_cast<size_t>(i * stride)]);
+    }
+    return sampled;
+}
+
 } // namespace vslam

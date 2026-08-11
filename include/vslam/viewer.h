@@ -15,7 +15,11 @@ namespace vslam {
 /// Pangolin 仪表盘式可视化
 class Viewer {
 public:
-    static constexpr size_t kMaxTrajectoryPoints = 3000;
+    /// 轨迹保留上限：覆盖 KITTI 00（4541 帧）/ EuRoC V1（2912 帧）全程，
+    /// 避免长序列运行时前半段轨迹从可视化中消失。内存约 20000×24B ≈ 0.5MB。
+    static constexpr size_t kMaxTrajectoryPoints = 20000;
+    /// 3D 地图点云可视化硬上限（与 MapBudget.max_active_points 一致的量级）
+    static constexpr size_t kMaxMapPoints = 60000;
 
     Viewer();
     void start();
@@ -32,6 +36,10 @@ public:
     /// 更新状态文本（显示在右侧状态卡片）
     void setStatus(const std::string& text);
 
+    /// 更新世界系地图点云（p_w = T_ws · p_s），供 3D 地图视图绘制。
+    /// 上游传入的向量按 kMaxMapPoints 上限截取；空向量表示隐藏点云。
+    void updateMapPoints(const std::vector<Vec3>& world_points);
+
 private:
     void renderLoop();
 
@@ -39,10 +47,12 @@ private:
     cv::Mat          display_img_;   // 3 通道 RGB，渲染线程直接上传
     cv::Mat          status_img_;    // 独立状态卡片，避免改变视频宽高比
     std::vector<Vec3> trajectory_;   // 只保留可视化需要的最近轨迹点
+    std::vector<Vec3> map_points_;   // 世界系地图点云（p_w = T_ws · p_s）
     SE3               camera_pose_wc_;  // 当前相机在世界系中的位姿
     uint64_t image_revision_ = 0;
     uint64_t status_revision_ = 0;
     uint64_t trajectory_revision_ = 0;
+    uint64_t map_points_revision_ = 0;
 
     std::thread render_thread_;
     std::atomic<bool> running_{false};

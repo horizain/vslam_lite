@@ -2009,3 +2009,42 @@ Local BA 锚点重基和跨子图渐进校正几何回归。
 50.25%，RSS 也未在本轮复测，因此仍不能宣称 M2 产品验收完成；候选扩宽的
 `O(K log K)` 位置扫描和最多 12 轮区域验证还需做性能分层。生产控制位姿仍需按
 §3 的 `T_ob/T_wo` 双坐标契约分离，不能把平滑后的离线全局轨迹当作实时控制输出。
+
+### 3.42 可交互 3D 地图点云可视化（2026-08-11）
+
+把右上角原来固定正交的 X-Z 俯视轨迹窗改为 **Pangolin Handler3D 可交互 3D 地图视图**：
+鼠标左键旋转、右键平移、滚轮缩放（`r` 复位）；叠加世界系地图点云、3D 轨迹折线、当前
+相机视锥与 XZ 参考网格。纯可视化增强，不影响 SLAM 数据路径与数值。
+
+**实现**：
+
+- `VisualOdometry::getMapPointsWorld(max_points)`：在 `map_mutex_` 共享锁下遍历
+  Atlas 全部子地图，按几何契约组合 `p_w = T_ws · p_s`（`src/vo.cpp`）。超过
+  `max_points`（`Viewer::kMaxMapPoints = 60000`，与 MapBudget 同量级）时对点集均匀
+  抽样，避免只保留最早 id 段而缺失新子地图点。`Localizer::mapPointsWorld` 做只读透传。
+- `Viewer::updateMapPoints`：与轨迹同锁同 revision 机制缓存点云，渲染线程仅在新
+  版本时拷贝一次；`run_slam`/`run_vo` 每个可视化帧喂入。
+- 跟随模式默认开，但**只在用户空闲约 0.8 s 后重新对准当前相机**——用包装
+  `MapViewHandler3D` 记录最近鼠标/键盘交互时间，避免每帧 `SetModelViewMatrix`
+  覆盖用户拖拽（首个实现会“拖不动视角”）。
+- **跑完后保持 Viewer 打开**（run_slam 两个路径 + run_vo）：数据集 EOF 后主线程
+  等待 `viewer.shouldQuit()`（渲染循环退出时把 `quit_` 置真）再 `stop()`，窗口
+  持续显示最终地图/轨迹/点云，用户关闭窗口或按 Esc 才退出；headless 路径立即
+  返回，不影响 benchmark/gate。
+- **完整轨迹保留**：`kMaxTrajectoryPoints` 3000→20000（覆盖 KITTI 00 全程 4541
+  帧），`Trail points` 滑杆默认/上限同步为 20000——修复长序列后半段时前半段轨迹
+  从可视化中消失的问题。存储 20000×Vec3≈0.5MB，有界。
+- 面板新增 `Show map points` / `Show camera` 开关；`Show grid`、`Follow camera`、
+  `Show trail`、`Pause render`、截图等保留。右侧地图列宽 340→460px。
+- `scripts/plot_traj.py` 字体优先级调整为 Noto Sans CJK 优先（DroidSansFallbackFull
+  仅含 CJK 字形、缺 ASCII，会渲染方块标签；系统安装 `fonts-noto-cjk` 后中文/英文
+  标签恢复正常）。
+
+**验证**：`cmake --build build -j` 通过；CTest 除 `test_vo` 的存量 DBoW3 flat
+检索断言失败（干净树同样失败，与本次改动无关）外 18/18 PASS（`test_soak` 首轮
+偶发失败、重跑通过，时序相关）；无头与有显示环境下 `run_slam` KITTI 00 150 帧
+烟雾运行正常，3D 渲染循环、Handler3D 输入、点云/视锥/轨迹渲染路径均未崩溃。
+未做 4541 帧完整基准重跑与回环 oracle——本功能不改变任何几何/并发行为。
+
+**边界**：3D 视图仅是有显示环境下的可视化辅助，headless 评估路径不受影响；
+点云上限 60000 超出时均匀抽样会略去部分点，仅影响显示密度、不影响轨迹/地图数据。

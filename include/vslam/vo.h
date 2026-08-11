@@ -250,6 +250,11 @@ public:
     /// 获取轨迹尾部，供实时 Viewer 避免每帧组合完整历史。
     std::vector<Vec3> getTrajectory(size_t max_points) const;
 
+    /// 收集全部子地图地图点在世界系中的坐标（p_w = T_ws · p_s），供实时
+    /// 3D Viewer 绘制点云。max_points 为可视化硬上限；总点超出时对点集
+    /// 均匀抽样，保证新旧子地图的点都可见。调用方无需持锁。
+    std::vector<Vec3> getMapPointsWorld(size_t max_points) const;
+
     /// M4：轨迹记录——普通帧不再保存全局 T_cw，只记录相对锚定关键帧的
     /// 局部运动；世界位姿读时组合 T_cw = T_ca · (anchor pose_cs · T_ws⁻¹)。
     /// 回环/子地图对齐只更新锚点（KF 局部位姿 / T_ws），轨迹自动跟随，

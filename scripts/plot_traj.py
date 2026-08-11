@@ -21,8 +21,8 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
 # 中文字体（无 CJK 字体环境时标签显示为方块，可改用英文）
-for fp in ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-           "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"):
+for fp in ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+           "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"):
     if os.path.exists(fp):
         font_manager.fontManager.addfont(fp)
         plt.rcParams["font.family"] = font_manager.FontProperties(fname=fp).get_name()

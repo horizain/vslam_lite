@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <format>
 #include <chrono>
+#include <thread>
 
 int main(int argc, char** argv) {
     std::string input_path;
@@ -175,6 +176,8 @@ int main(int argc, char** argv) {
             viewer.updateFrame(cf->image, cf->keypoints,
                                vo.getTrajectory(vslam::Viewer::kMaxTrajectoryPoints),
                                pose, cf->image_right);
+            viewer.updateMapPoints(
+                vo.getMapPointsWorld(vslam::Viewer::kMaxMapPoints));
         }
 
         // 打印状态
@@ -188,9 +191,6 @@ int main(int argc, char** argv) {
                      << " | Keyframes: " << st.keyframes);
         }
     }
-
-    // ---- 清理 ----
-    if (!headless) viewer.stop();
 
     // ---- 保存轨迹（TUM 格式：time tx ty tz qx qy qz qw，位姿为 T_wc）----
     if (!traj_saved.empty()) {
@@ -251,6 +251,15 @@ int main(int argc, char** argv) {
 
     // 性能监测 dump（VSLAM_ENABLE_PERF 关闭时为空操作）
     vslam::perf_dump("perf.csv");
+
+    // ---- 保持 Viewer 打开（仅非 headless；headless 立即退出）----
+    if (!headless) {
+        LOG_INFO("Dataset finished. Viewer stays open; "
+                 "close the window or press ESC to exit.");
+        while (!viewer.shouldQuit())
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        viewer.stop();
+    }
 
     return 0;
 }

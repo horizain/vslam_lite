@@ -419,9 +419,16 @@ trackLK(prev, curr) // 光流跟踪（LK 模式用）
 
 ### 5.7 `viewer.cpp` —— 可视化
 
-Pangolin 双窗口：**左 = 世界系 2D 轨迹图**（x-z 俯视，红色箭头表示相机朝向），
-**右 = 彩色视频流 + 绿色特征点**。双目左右图上下排列，避免超宽画面被压缩；
-独立渲染线程 + `std::mutex` 保护共享数据——这是多线程编程的最小示范。
+Pangolin 仪表盘：**左上 = 彩色视频流 + 绿色特征点**（双目左右图上下排列），
+**右上 = 可交互 3D 地图视图**——鼠标左键旋转、右键平移、滚轮缩放（`r` 复位），
+叠加世界系地图点云（绿色）、3D 轨迹折线（青色）、当前相机视锥与 XZ 参考网格。
+`Follow camera` 开启时视角自动跟随当前相机，用户拖动后约 0.8 s 内不会被重设。
+面板可切换 `Show map points` / `Show camera` / `Show grid` / `Show trail`。
+地图点云来自 `VisualOdometry::getMapPointsWorld`（按 `p_w = T_ws · p_s` 组合），
+视图独立渲染线程 + `std::mutex` 保护共享数据——这是多线程编程的最小示范。
+轨迹默认保留全程（上限 20000 点，覆盖 KITTI 00 / EuRoC 全程）；`run_slam` /
+`run_vo` 数据集跑完后 Viewer 保持打开（显示最终地图），关闭窗口或按 Esc 才退出，
+`--headless` 不受影响。
 
 ### 5.8 `dataset.cpp` —— 数据输入
 

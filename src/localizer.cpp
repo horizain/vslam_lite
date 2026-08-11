@@ -360,6 +360,10 @@ size_t Localizer::keyFrameCount() const {
     return vo_ ? vo_->getMap()->keyFrameCount() : 0;
 }
 
+std::vector<Vec3> Localizer::mapPointsWorld(size_t max_points) const {
+    return vo_ ? vo_->getMapPointsWorld(max_points) : std::vector<Vec3>{};
+}
+
 MetricsSnapshot Localizer::metricsSnapshot() const {
     // M2.3（§6.4）：backend/loop/map 统计在快照时现算（collector 只存值；
     // metrics_ 为 mutable：const 快照可刷新）。snapshot_bytes 由调用方
