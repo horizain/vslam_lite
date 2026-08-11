@@ -39,6 +39,16 @@ struct MapBudgetConfig {
     size_t weak_point_stale_kf_window = 30;
     /// 第 3 步：保留图像的最近 KF 数（其余视为"非活动"，卸载原图/灰度图）
     size_t kf_image_keep_recent = 2;
+    /// 第 5 步：最近活动稠密窗口完整保留；更早的普通 KF 只保留为
+    /// Essential Anchor。该窗口服务跟踪/Local BA，不得因全局历史增长而扩大。
+    size_t active_dense_keyframes = 240;
+    /// 第 5 步：活动子地图历史部分最多保留的 Essential Anchor 数。
+    /// protected 回环端点优先于此软配额；若 protected 本身突破硬预算，
+    /// 进入 stopped_map_growth，不得删除回环约束端点。
+    size_t max_historical_anchors = 128;
+    /// 第 5 步：普通历史 KF 的首选抽样步长；首锚、历史尾锚和 protected
+    /// 端点不受步长影响。
+    size_t historical_anchor_stride = 8;
     /// 第 4 步：共视重叠率（shared / min(count_a, count_b)）超过该值且
     /// 相邻位姿差小于位移/旋转门限的 KF 视为冗余
     double redundant_overlap_threshold = 0.9;
@@ -79,11 +89,12 @@ struct BudgetReclaimResult {
     size_t removed_weak_stale_points = 0;    // 第 2 步
     size_t unloaded_kf_images = 0;           // 第 3 步
     size_t culled_redundant_keyframes = 0;   // 第 4 步
-    size_t frozen_submaps = 0;               // 第 5 步
-    size_t unloaded_submap_kf_images = 0;    // 第 5 步
-    size_t removed_frozen_submap_points = 0; // 第 5 步：冻结子地图弱陈点删除
+    size_t compacted_historical_keyframes = 0; // 第 5 步：普通历史 KF → Anchor 骨架
+    size_t frozen_submaps = 0;               // 第 6 步
+    size_t unloaded_submap_kf_images = 0;    // 第 6 步
+    size_t removed_frozen_submap_points = 0; // 第 6 步：冻结子地图弱陈点删除
     std::vector<KeyframeId> culled_keyframe_ids; // 第 4 步：供外部索引批量同步
-    bool stopped_map_growth = false;         // 第 6 步：仍超预算
+    bool stopped_map_growth = false;         // 第 7 步：仍超预算
 };
 
 /// §6.3 地图预算引擎：无锁、无线程、不持有 Map/Atlas 状态。

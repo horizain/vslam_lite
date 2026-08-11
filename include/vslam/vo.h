@@ -9,6 +9,7 @@
 #include "vslam/feature.h"
 #include "vslam/loop_closure.h"
 #include "vslam/loop_region.h"
+#include "vslam/loop_graph.h"
 #include "vslam/optimizer.h"
 #include "vslam/backend_committer.h"
 #include "vslam/backend_scheduler.h"
@@ -30,8 +31,8 @@
 namespace vslam {
 
 /// 回环事务的身份边界；候选发现后只携带 Map/submap/KF 身份进入事务。
-/// 最终验证必须在事务独占 map 锁内重新执行，revision 仅用于记录候选发现时的
-/// 版本，不能把锁外计算结果直接写回新的几何版本。
+/// 最终验证/前缀快照在 map 共享锁下重做，求解在锁外；提交时必须在独占锁下
+/// 联合复验 Map/Submap、geometry revision 和全部前缀对象身份，再重基尾段。
 struct LoopCorrectionContext {
     Map::Ptr map;                 // 当前活动子地图
     Map::Ptr loop_map;            // 候选所属子地图（同图时等于 map）
@@ -102,6 +103,8 @@ struct VOConfig {
 
     // ---- 回环检测 (Phase 2) ----
     bool   enable_loop_closure   = false;   // run_slam 默认开、run_vo 默认关（A/B 对比）
+    std::string loop_retrieval_backend = "dbow3"; // dbow3 | flat_dbow3 | compact_binary
+    size_t loop_compact_max_keyframes = 256;       // flat/compact 索引硬上限
     std::string vocab_path       = "";      // 词袋词典路径（config/ORBvoc.dbow3）
     double min_score             = 0.3;     // 词袋候选最低分
     int    temporal_window       = 30;      // 跳过最近 N 个关键帧（时间过滤）
@@ -110,10 +113,14 @@ struct VOConfig {
     int    min_loop_inliers      = 50;      // 与各 YAML 生产档一致
     int    loop_cooldown_kfs     = 20;      // 回环校正冷却（关键帧数）：防止同区域连续校正（D 曾改 12，实测同区域 43 KF 内连续回环叠加拉扯变形，回退）
     int    loop_top_candidates   = 20;      // 词袋召回池；聚类后与位置先验合计硬限 12 地点
+    int    loop_mature_verification_limit = 0; // 0=验证全部候选；mobile 用有限成熟地点级联
     double loop_position_prior_dist = 40.0; // 位置先验距离阈值(m)：轨迹自交区域补召回（A3 放宽）
     int    loop_position_prior_gap   = 100; // 位置先验最小关键帧间隔
     LoopRegionConfig loop_region;            // 单 KF PnP 失败后的有限历史区域验证
     int    global_ba_iterations  = 20;      // 回环后全局 BA 迭代次数
+    int    pose_graph_iterations = 20;      // Essential/Submap Graph 最大迭代数
+    int    pose_graph_max_anchors = 256;    // 单子图 PGO 锚点硬上限
+    int    pose_graph_anchor_stride = 8;    // 普通 KF 首选抽样步长（回环端点必留）
 
     // ---- 异步后端（P2-1）----
     bool   async_backend         = false;   // Local BA / 回环检测 / 回环校正在后台线程执行，
@@ -295,6 +302,15 @@ public:
     /// (Phase 2) 已闭合的回环次数（状态栏/评估用）
     unsigned long loopClosureCount() const { return loop_closure_count_; }
 
+    /// 连续 odom 相机位姿 T_oc；只由前端相邻运动积分，回环不得改写。
+    [[nodiscard]] SE3 continuousCameraPose() const;
+    /// 全局校正 T_wo，满足 T_wc = T_wo * T_oc。
+    [[nodiscard]] SE3 globalCorrection() const;
+    /// T_wo 结构化发布代次（初始坐标建立为 0，显著全局修正后递增）。
+    [[nodiscard]] uint64_t globalCorrectionGeneration() const {
+        return global_correction_generation_.load(std::memory_order_relaxed);
+    }
+
     /// M2.3：后台调度器只读统计（§6.4 backend 指标；Localizer 指标采集用）
     [[nodiscard]] BackendSchedulerStats backendStats() const {
         return backend_scheduler_.stats();
@@ -379,6 +395,10 @@ private:
     /// snap_/last_valid_pose_world_ 由前端线程在 map_mutex_ 下重基，避免异步
     /// 回环把旧局部位姿和新世界锚混用。调用方须持 map_mutex_ 读/写锁。
     void syncFrontendAnchor(SubmapId submap_id, const SE3& T_ws);
+    /// 同子图全局 PGO 在两帧之间发布时，把上一有效世界位姿重基到新参考
+    /// 几何；只改变全局基线，不改变 per_frame_motion_/连续 T_oc。
+    void syncFrontendGeometry(const TrackingSnapshot& old_snapshot,
+                              const TrackingSnapshot& new_snapshot);
     /// 组合单条锚定记录为世界位姿（调用方必须已持 map_mutex_ 读/写锁）
     SE3 composeRecordWorld(const FramePoseRecord& rec) const;
     bool tryInitialize();
@@ -390,9 +410,6 @@ private:
     SE3 trackFrameLK();
     bool tryRelocalize();               // LOST 状态重定位
     void createSubmap();                // 长时间丢失后锚定全局位姿并新建子地图
-    /// KF/描述子/总量预算阻塞但前端确实请求 KF 时，主动滚动到新子地图。
-    /// 当前帧直接成为新图首个 KF，保持世界位姿连续；调用方不应处于 LOST。
-    bool rolloverBudgetSubmap();
     /// 子地图重建成功后与历史轨迹做 Umeyama 刚体对齐（双目），
     /// 消除丢失期位移未知导致的锚点残留偏差。延迟到子地图有 ≥3 个
     /// 关键帧时在 insertKeyFrame 中触发（重建瞬间 KF 数不足无法拟合）
@@ -413,6 +430,9 @@ private:
     void runBackendTask(BackendTask& task);
     /// 提交任务到后台调度器（覆盖式单任务槽，永不阻塞）
     void submitBackendTask(BackendTask task);
+    /// 资源边缘化只在 Map 锁内合并待删 id；DBoW clear/rebuild 由后台 worker
+    /// 锁外执行，避免索引重建卡住跟踪。同步档在 Map 锁释放后执行同一路径。
+    void drainLoopKeyframeCleanup();
 
     // ---- M1：Optimizer 只读快照 / Result / 提交 ----
     /// 构建 Local BA 只读快照（调用方需持 map_mutex_ 读锁；窗口内已被
@@ -490,7 +510,9 @@ private:
     std::unique_ptr<LoopClosure> loop_closure_;
     bool loop_closure_enabled_ = false;
     std::atomic<unsigned long> loop_closure_count_{0};  // 已闭合回环次数（前后端共享）
-    std::atomic<unsigned long> last_loop_kf_count_{0};  // 上次回环校正时的 KF 数（冷却基准）
+    /// 当前活动子地图累计插入 KF 序号；资源压缩只删容器元素，不回退该序号。
+    std::atomic<unsigned long> active_keyframe_serial_{0};
+    std::atomic<unsigned long> last_loop_keyframe_serial_{0};
 
     // 最近一次 Local BA 成功发布的几何版本。帧尾若发现本帧快照恰好被
     // 该提交跨越，则按 live reference 记录相对位姿，避免在途帧跟随局部
@@ -505,6 +527,7 @@ private:
     // 写者饥饿由前端周期性独占锁（insertKeyFrame）天然消解。
     mutable std::shared_mutex map_mutex_;  // 保护地图集合/KF 位姿/点坐标/edges 的读写
     mutable std::mutex traj_mutex_;  // 保护 pose_records_（getter 为 const）
+    mutable std::mutex output_pose_mutex_;  // 保护 T_oc/T_wo 发布快照
     /// M1.3：单后台线程 + 覆盖式单任务槽（§5.4）。锁序：scheduler 的槽锁绝不
     /// 与 map/traj 嵌套持锁（worker 在槽锁外执行任务分发）。
     BackendScheduler backend_scheduler_;
@@ -519,6 +542,11 @@ private:
     SE3 per_frame_motion_;              // 相邻有效帧相对运动（Twc：X_cur = X_last·T_rel），
                                         // LOST 期匀速外推新子地图锚点用
     bool has_per_frame_motion_ = false;
+    SE3 continuous_pose_oc_;            // camera -> continuous odom（控制连续输出）
+    SE3 global_correction_T_wo_;        // odom -> world（回环/重定位全局校正）
+    bool has_continuous_pose_ = false;
+    uint64_t last_valid_geometry_revision_ = 0;
+    std::atomic<uint64_t> global_correction_generation_{0};
     bool submap_needs_alignment_ = false;  // 子地图重建后待对齐标记（≥3 KF 时执行）
     int tracking_failures_ = 0;
     int relocalization_frames_ = 0;
@@ -533,9 +561,11 @@ private:
 
     // ---- M2.2 遗留清理：§6.3 地图资源预算运行时接线 ----
     ResourceBudget map_budget_;   ///< 预算引擎（默认 §6.2 参数；VOConfig.map_budget 覆写）
-    std::atomic<bool> map_growth_stopped_{false};   ///< 第 6 步：仍超预算停止建图
+    std::atomic<bool> map_growth_stopped_{false};   ///< 第 7 步：仍超预算停止建图
     std::atomic<long long> map_snapshot_bytes_{0};  ///< 在途 Local BA 快照字节估算
-    bool budget_rollover_pending_ = false; ///< 前端提议触发的预算滚动（前端线程）
+    std::mutex loop_cleanup_mutex_;
+    std::vector<KeyframeId> pending_loop_cleanup_ids_;
+    std::atomic<bool> loop_cleanup_pending_{false};
     /// 点预算已满时回收长期未命中的旧点，为后续 KF 让出逐点配额；
     /// 调用方必须持 map_mutex_ 独占锁。
     void reclaimStaleMapPoints();

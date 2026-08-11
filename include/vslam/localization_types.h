@@ -47,6 +47,7 @@ struct PoseEstimate {
     uint64_t sequence = 0;                    ///< 输入帧序号
     double timestamp = 0.0;                   ///< 帧时间戳（秒）
     SE3 T_ob;                                 ///< 机器人基座 b -> 连续 odom 系 o（不因回环跳变）
+    SE3 T_wo;                                 ///< 连续 odom 系 o -> 全局地图 w（仅全局校正更新）
     SE3 T_wb;                                 ///< 机器人基座 b -> 全局地图 w（允许全局修正）
     Mat6 covariance = Mat6::Zero();           ///< T_ob 左扰动在 odom 系中的 6x6 协方差
     TrackingState state = TrackingState::Initializing;
@@ -54,6 +55,15 @@ struct PoseEstimate {
     bool pose_valid = false;                  ///< 位姿是否有效（可被控制器消费）
     bool prediction_only = false;             ///< 是否仅为外推预测
     uint64_t map_generation = 0;              ///< 当前地图 generation（回环提交后递增）
+    uint64_t global_correction_generation = 0;///< T_wo 原子发布代次
+};
+
+/// 回环/重定位发布全局校正时的结构化事件。控制器不消费该事件来改写 T_ob；
+/// 规划/地图层用它识别 T_wb 的合法全局修正。
+struct GlobalCorrectionEvent {
+    uint64_t generation = 0;
+    SE3 old_T_wo;
+    SE3 new_T_wo;
 };
 
 // ---------- 输出质量契约：§3 硬不变量（静态部分） ----------
@@ -87,8 +97,9 @@ struct PoseEstimate {
 /// pose_valid=true 时还要求协方差正定（prediction_only 不影响静态校验）。
 [[nodiscard]] inline bool isPublishable(const PoseEstimate& p) {
     if (!isValidTimestamp(p.timestamp)) return false;
-    if (!isFinite(p.T_ob) || !isFinite(p.T_wb)) return false;
-    if (!isUnitQuaternion(p.T_ob.q) || !isUnitQuaternion(p.T_wb.q)) return false;
+    if (!isFinite(p.T_ob) || !isFinite(p.T_wo) || !isFinite(p.T_wb)) return false;
+    if (!isUnitQuaternion(p.T_ob.q) || !isUnitQuaternion(p.T_wo.q) ||
+        !isUnitQuaternion(p.T_wb.q)) return false;
     if (p.pose_valid && !isPositiveDefiniteCovariance(p.covariance)) return false;
     return true;
 }

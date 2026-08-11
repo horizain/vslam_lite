@@ -123,6 +123,7 @@ set(VSLAM_SOURCES
     src/viewer.cpp
     src/loop_closure.cpp
     src/loop_region.cpp
+    src/loop_graph.cpp
     src/tracking_state_machine.cpp
     src/localizer.cpp
     src/pose_gate.cpp
@@ -159,7 +160,8 @@ set(VSLAM_HEADERS
     include/vslam/optimizer.h
     include/vslam/viewer.h
     include/vslam/loop_closure.h
-    include/vslam/loop_region.h)
+    include/vslam/loop_region.h
+    include/vslam/loop_graph.h)
 
 add_library(vslam STATIC ${VSLAM_SOURCES} ${VSLAM_HEADERS})
 target_include_directories(vslam
@@ -198,6 +200,9 @@ if(DBoW3_FOUND)
     # 不导出 imported target，因此用变量链接而非 DBoW3::DBoW3。
     target_link_libraries(vslam PUBLIC ${DBoW3_LIBS})
     target_include_directories(vslam PUBLIC ${DBoW3_INCLUDE_DIRS})
+    # flat_dbow3 复用 DBoW3 二进制词表的 QuickLZ 格式，但不实例化百万个
+    # cv::Mat/vector 节点；仅私有包含解析格式声明，不向公共接口泄漏。
+    target_include_directories(vslam PRIVATE ${CMAKE_SOURCE_DIR}/thirdparty/DBoW3/src)
 endif()
 
 # ============================================================
@@ -246,6 +251,14 @@ if(BUILD_TESTS)
         target_compile_options(test_loop_region PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_loop_region COMMAND test_loop_region)
+
+    # 回环前缀快照 / T_ob-T_wo 分层 / Essential Anchor Graph（独立 CTest）
+    add_executable(test_loop_graph test/test_loop_graph.cpp)
+    target_link_libraries(test_loop_graph vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_loop_graph PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_loop_graph COMMAND test_loop_graph)
 
     # M0.1 定位契约类型（独立 CTest，不与 test_vo 混排）
     add_executable(test_localization_types test/test_localization_types.cpp)

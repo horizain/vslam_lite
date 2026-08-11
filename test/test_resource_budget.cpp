@@ -9,10 +9,12 @@
  *   4. reclaim 第 3 步：卸载非活动 KF 原图/灰度图，保留关键点/描述子/位姿/观测
  *   5. reclaim 第 4 步：共视重叠 >0.9 + 相邻位姿差 <0.15m/3deg 的冗余 KF 剔除，
  *      回环/子地图锚点（protected）必须保留
- *   6. reclaim 第 5 步：冻结超过 2 个的非活动子地图并卸载其 KF 图像缓存
- *   7. reclaim 第 6 步：仍超预算时停止增加地图（stopped_map_growth），
+ *   6. reclaim 第 5 步：普通历史 KF 压缩为有界 Essential Anchor 骨架，
+ *      保留首尾、protected 回环端点和最近活动稠密窗口
+ *   7. reclaim 第 6 步：冻结超过 2 个的非活动子地图并卸载其 KF 图像缓存
+ *   8. reclaim 第 7 步：仍超预算时停止增加地图（stopped_map_growth），
  *      不得随机删除强点/锚点
- *   8. Map 新 API：removeKeyFrame 一致性、recordTrackingHit 旁路统计
+ *   9. Map 新 API：removeKeyFrame 一致性、recordTrackingHit 旁路统计
  *
  * 编译: cmake -DBUILD_TESTS=ON .. && make test_resource_budget
  * 运行: ./build/test_resource_budget（独立 CTest）
@@ -226,7 +228,10 @@ void test_reclaim_step2_weak_stale_points() {
 void test_reclaim_step3_unload_inactive_kf_images() {
     TEST("reclaim 第3步: 非活动 KF 图像卸载、几何数据保留、最近 KF 图像保留") {
         vslam::MapBudgetConfig cfg;
-        cfg.max_active_keyframes = 2;
+        cfg.max_active_keyframes = 100;
+        cfg.max_total_estimated_mb = 1;
+        cfg.overhead_bytes_per_keyframe = 0;
+        cfg.overhead_bytes_per_point = 0;
         cfg.kf_image_keep_recent = 2;
         ResourceBudget budget(cfg);
         auto map = std::make_shared<Map>();
@@ -256,7 +261,7 @@ void test_reclaim_step3_unload_inactive_kf_images() {
 void test_reclaim_step4_redundant_keyframes() {
     TEST("reclaim 第4步: 冗余 KF 剔除、锚点保护、大位移 KF 保留") {
         vslam::MapBudgetConfig cfg;
-        cfg.max_active_keyframes = 3;
+        cfg.max_active_keyframes = 5;
         cfg.redundant_overlap_threshold = 0.9;
         cfg.redundant_max_translation_m = 0.15;
         cfg.redundant_max_rotation_deg = 3.0;
@@ -308,10 +313,11 @@ void test_reclaim_step4_redundant_keyframes() {
     } TEST_PASS();
 }
 
-void test_reclaim_step5_freeze_submaps() {
-    TEST("reclaim 第5步: 超过 2 个非活动子地图 → 冻结并卸载其 KF 图像缓存") {
+void test_reclaim_step6_freeze_submaps() {
+    TEST("reclaim 第6步: 超过 2 个非活动子地图 → 冻结并卸载其 KF 图像缓存") {
         vslam::MapBudgetConfig cfg;
-        cfg.max_active_keyframes = 2;  // 触发回收
+        cfg.max_active_keyframes = 100;
+        cfg.max_descriptor_mb = 0;     // 描述子压力持续到第 6 步
         cfg.kf_image_keep_recent = 4;  // 全部 KF 都在图像保留窗口内（隔离第 3 步）
         ResourceBudget budget(cfg);
         auto map = std::make_shared<Map>();
@@ -337,10 +343,75 @@ void test_reclaim_step5_freeze_submaps() {
     } TEST_PASS();
 }
 
-void test_reclaim_step5_freeze_submap_weak_points() {
-    TEST("reclaim 第5步: 冻结子地图同时删除弱陈点（M2 遗留清理，RSS 硬门槛）") {
+void test_reclaim_essential_history_compaction() {
+    TEST("reclaim 第5步: 历史普通 KF 压成 Essential Anchor 骨架") {
         vslam::MapBudgetConfig cfg;
-        cfg.max_active_keyframes = 2;   // 触发回收
+        cfg.max_active_keyframes = 8;
+        cfg.active_dense_keyframes = 3;
+        cfg.max_historical_anchors = 3;
+        cfg.historical_anchor_stride = 2;
+        cfg.kf_image_keep_recent = 1;
+        cfg.max_active_points = 100000;
+        cfg.max_descriptor_mb = 256;
+        cfg.max_total_estimated_mb = 4096;
+        ResourceBudget budget(cfg);
+        auto map = std::make_shared<Map>();
+        for (unsigned long id = 0; id < 12; ++id)
+            makeKeyframe(map, id, Vec3(static_cast<double>(id), 0, 0), 0, false);
+
+        std::unordered_set<KeyframeId> protected_kfs{3};
+        std::unordered_map<KeyframeId, KeyframeId> replacements;
+        const auto r = budget.reclaim(
+            map, protected_kfs, {}, 0, {},
+            [&](const Frame::Ptr& removed, const Frame::Ptr& replacement) {
+                assert(removed && replacement);
+                replacements.emplace(removed->id, replacement->id);
+            });
+
+        assert(r.compacted_historical_keyframes == 6);
+        assert(r.culled_keyframe_ids.size() == 6);
+        assert(map->keyFrameCount() == 6);
+        assert(map->getKeyFrame(0) && "历史首锚必须保留");
+        assert(map->getKeyFrame(3) && "回环/protected 端点必须保留");
+        assert(map->getKeyFrame(8) && "历史尾锚必须保留");
+        assert(map->getKeyFrame(9) && map->getKeyFrame(10) &&
+               map->getKeyFrame(11) && "最近活动稠密窗口必须完整保留");
+        assert(replacements.size() == r.compacted_historical_keyframes);
+        assert(!r.stopped_map_growth);
+        assert(map->verifyObservationConsistency());
+    } TEST_PASS();
+}
+
+void test_mobile_history_compaction_scale() {
+    TEST("reclaim 第5步: mobile 321 KF 压到约 220 个检索/活动锚") {
+        vslam::MapBudgetConfig cfg;
+        cfg.max_active_keyframes = 320;
+        cfg.active_dense_keyframes = 120;
+        cfg.max_historical_anchors = 128;
+        cfg.historical_anchor_stride = 2;
+        cfg.max_active_points = 100000;
+        cfg.max_descriptor_mb = 256;
+        cfg.max_total_estimated_mb = 4096;
+        ResourceBudget budget(cfg);
+        auto map = std::make_shared<Map>();
+        for (unsigned long id = 0; id < 321; ++id)
+            makeKeyframe(map, id, Vec3(static_cast<double>(id), 0, 0), 0, false);
+
+        const auto r = budget.reclaim(map);
+        assert(r.compacted_historical_keyframes == 100);
+        assert(map->keyFrameCount() == 221);
+        assert(map->getKeyFrame(0) && map->getKeyFrame(200));
+        for (unsigned long id = 201; id < 321; ++id)
+            assert(map->getKeyFrame(id) && "最近 120 KF 活动稠密窗口必须完整保留");
+        assert(!r.stopped_map_growth);
+    } TEST_PASS();
+}
+
+void test_reclaim_step6_freeze_submap_weak_points() {
+    TEST("reclaim 第6步: 冻结子地图同时删除弱陈点（M2 遗留清理，RSS 硬门槛）") {
+        vslam::MapBudgetConfig cfg;
+        cfg.max_active_keyframes = 100;
+        cfg.max_descriptor_mb = 0;      // 描述子压力持续到第 6 步
         cfg.kf_image_keep_recent = 4;   // 隔离第 3 步
         cfg.weak_point_min_observations = 2;
         cfg.weak_point_stale_kf_window = 1;
@@ -386,8 +457,8 @@ void test_reclaim_step5_freeze_submap_weak_points() {
     } TEST_PASS();
 }
 
-void test_reclaim_step6_stop_growth() {
-    TEST("reclaim 第6步: 仍超预算 → stopped_map_growth，强点不随机删除") {
+void test_reclaim_step7_stop_growth() {
+    TEST("reclaim 第7步: 仍超预算 → stopped_map_growth，强点不随机删除") {
         vslam::MapBudgetConfig cfg;
         cfg.max_active_keyframes = 10;
         cfg.max_active_points = 2;  // 3 个强点无法回收回预算内
@@ -488,7 +559,8 @@ void test_reclaim_full_consistency() {
         observe(map, kf0, 2, strong_b);
         observe(map, kf1, 2, strong_b);
 
-        std::unordered_set<KeyframeId> protected_kfs{kf0->id};
+        std::unordered_set<KeyframeId> protected_kfs{
+            kf0->id, kf1->id, 2, 3, 4, 5};
         const auto r = budget.reclaim(map, protected_kfs);
 
         assert(r.removed_zero_obs_points == 1);
@@ -518,9 +590,11 @@ int main() {
     test_reclaim_step2_weak_stale_points();
     test_reclaim_step3_unload_inactive_kf_images();
     test_reclaim_step4_redundant_keyframes();
-    test_reclaim_step5_freeze_submaps();
-    test_reclaim_step5_freeze_submap_weak_points();
-    test_reclaim_step6_stop_growth();
+    test_reclaim_essential_history_compaction();
+    test_mobile_history_compaction_scale();
+    test_reclaim_step6_freeze_submaps();
+    test_reclaim_step6_freeze_submap_weak_points();
+    test_reclaim_step7_stop_growth();
     test_map_remove_keyframe();
     test_map_last_hit_side_statistics();
     test_reclaim_full_consistency();

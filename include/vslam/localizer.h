@@ -45,8 +45,8 @@ struct LocalizerConfig {
 /// 异步模式（M2.1，§6.1）：enable_async_input=true 时启动一个跟踪 worker；
 /// submitFrame 只做 §4.3 输入校验并入队（满丢最旧、保最新、永不阻塞），
 /// 结果经 latestPose() 轮询获取。两种模式不得混用。
-/// 坐标契约（§2）：输出 T_wb = T_wc · T_bc⁻¹；M0 尚未接入 ESKF，T_ob = T_wb
-/// （odom 系与全局系重合），M6 后再由 T_wo 分离，届时回环只更新 T_wo。
+/// 坐标契约（§2）：VO 前端积分连续 T_oc，Localizer 输出
+/// T_ob = T_oc · T_bc⁻¹；全局后端只更新 T_wo，T_wb = T_wo · T_ob。
 class Localizer {
 public:
     /// @param camera  双目/单目相机（内参、图像尺寸即 §4.3 输入尺寸契约）

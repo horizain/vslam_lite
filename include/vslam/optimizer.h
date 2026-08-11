@@ -128,7 +128,8 @@ public:
     /// 内置防护（M0）：回环边残差预检、chi2 收敛、有限值、最大校正/相邻步长
     /// 检查——任一失败 → valid=false，调用方不得提交。
     static OptimizationResult solvePoseGraph(
-        const OptimizationSnapshot& snap);
+        const OptimizationSnapshot& snap,
+        int max_iterations = 20);
 };
 
 } // namespace vslam

@@ -393,7 +393,8 @@ OptimizationResult Optimizer::solveLocalBA(
 #endif
 }
 
-OptimizationResult Optimizer::solvePoseGraph(const OptimizationSnapshot& snap) {
+OptimizationResult Optimizer::solvePoseGraph(
+    const OptimizationSnapshot& snap, int max_iterations) {
     OptimizationResult result;
     result.submap_id = snap.submap_id;
     result.base_topology_revision = snap.topology_revision;
@@ -521,7 +522,7 @@ OptimizationResult Optimizer::solvePoseGraph(const OptimizationSnapshot& snap) {
     optimizer.initializeOptimization();
     optimizer.computeActiveErrors();
     const double initial_chi2 = optimizer.activeRobustChi2();
-    const int iterations = optimizer.optimize(100);
+    const int iterations = optimizer.optimize(std::max(1, max_iterations));
     optimizer.computeActiveErrors();
     const double final_chi2 = optimizer.activeRobustChi2();
 

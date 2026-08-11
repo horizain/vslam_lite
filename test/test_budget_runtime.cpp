@@ -3,7 +3,8 @@
  *
  * 覆盖（先失败后实现的集成级验证）：
  *   1. VOConfig 从 default.yaml 解析 MapBudget 段（§6.2 首版参数）
- *   2. KF 插入触发预算：极小预算下地图 KF 数被控制在门限内（第 4 步冗余剔除）
+ *   2. KF 插入触发预算：活动稠密窗口 + 历史 Essential Anchor 骨架受硬上限控制，
+ *      预算回收不得创建新的坐标子图
  *   3. 点配额耗尽后 mapGrowthStopped() 生效，但仍允许 KF 继续插入
  *   4. mapSnapshotBytes() 在异步 Local BA 提交后有非零在途快照字节
  *   5. 预算内配置（默认 §6.2 参数）100 帧全程零回收，地图行为不变
@@ -76,6 +77,9 @@ void test_yaml_map_budget_parsing() {
         assert(cfg.map_budget.max_descriptor_mb == 256);
         assert(cfg.map_budget.max_snapshot_mb == 256);
         assert(cfg.map_budget.max_total_estimated_mb == 500);
+        assert(cfg.map_budget.active_dense_keyframes == 240);
+        assert(cfg.map_budget.max_historical_anchors == 128);
+        assert(cfg.map_budget.historical_anchor_stride == 8);
     } TEST_PASS();
 }
 
@@ -95,12 +99,15 @@ void test_default_budget_no_reclaim() {
 }
 
 void test_tiny_budget_controls_keyframes() {
-    TEST("runtime: 极小预算触发连续滚动且活动图受硬上限控制") {
+    TEST("runtime: KF 预算压缩活动图而不滚动坐标子图") {
         VOConfig cfg;
         cfg.rng_seed = 0x5A17;
         cfg.async_backend = false;
         cfg.enable_local_ba = false;
-        cfg.map_budget.max_active_keyframes = 2;
+        cfg.map_budget.max_active_keyframes = 6;
+        cfg.map_budget.active_dense_keyframes = 3;
+        cfg.map_budget.max_historical_anchors = 2;
+        cfg.map_budget.historical_anchor_stride = 2;
         cfg.map_budget.max_active_points = 100000;
         cfg.map_budget.max_descriptor_mb = 256;
         cfg.map_budget.max_total_estimated_mb = 4096;
@@ -109,18 +116,19 @@ void test_tiny_budget_controls_keyframes() {
         assert(runFrames(vo, ds, 40));
         vo.finishPendingBackendWork();
         const size_t kfs = vo.getMap()->keyFrameCount();
-        assert(kfs >= 2 && "仍应有最低限度的关键帧（锚点/最近窗口保护）");
-        const bool stopped = vo.mapGrowthStopped();
-        assert(stopped && "极小预算下当前活动图应报告硬预算耗尽");
-        assert(vo.getAtlas()->submapCount() > 1 &&
-               "硬预算不能通过永久拒绝 KF 维持，应主动滚动连续子图");
+        assert(kfs >= 3 && kfs <= cfg.map_budget.max_active_keyframes &&
+               "最近稠密窗口与历史锚点必须共同受 KF 硬上限控制");
+        assert(!vo.mapGrowthStopped() && "压缩后应恢复地图增长");
+        assert(vo.getAtlas()->submapCount() == 1 &&
+               "资源预算不得创建新的坐标子图");
 
         // stopped 后继续少量帧：地图不得出现预算外增长。
         assert(runFrames(vo, ds, 10));
         vo.finishPendingBackendWork();
         const size_t kfs_after = vo.getMap()->keyFrameCount();
-        assert(kfs_after <= kfs + 2 &&
-               "每个滚动后的活动子图仍必须受同一 KF 硬上限约束");
+        assert(kfs_after <= cfg.map_budget.max_active_keyframes &&
+               "滑动压缩后的活动图必须持续受同一 KF 硬上限约束");
+        assert(vo.getAtlas()->submapCount() == 1);
 
     } TEST_PASS();
 }
@@ -151,12 +159,15 @@ void test_point_budget_does_not_block_keyframes() {
     } TEST_PASS();
 }
 
-void test_hard_keyframe_budget_rollover_keeps_pose_live() {
-    TEST("runtime: KF 硬预算触顶主动滚动子图且不进入 LOST") {
+void test_hard_keyframe_budget_compaction_keeps_pose_live() {
+    TEST("runtime: KF 硬预算触顶压缩历史且不进入 LOST") {
         VOConfig cfg;
         cfg.rng_seed = 0x5A17;
         cfg.async_backend = false;
-        cfg.map_budget.max_active_keyframes = 1;
+        cfg.map_budget.max_active_keyframes = 6;
+        cfg.map_budget.active_dense_keyframes = 3;
+        cfg.map_budget.max_historical_anchors = 2;
+        cfg.map_budget.historical_anchor_stride = 2;
         cfg.map_budget.max_active_points = 10000;
         cfg.map_budget.max_descriptor_mb = 256;
         cfg.map_budget.max_total_estimated_mb = 4096;
@@ -175,8 +186,10 @@ void test_hard_keyframe_budget_rollover_keeps_pose_live() {
             (void)rt;
         }
         vo.finishPendingBackendWork();
-        assert(vo.getAtlas()->submapCount() > 1 &&
-               "KF 硬预算触顶后应创建连续的新子图");
+        assert(vo.getAtlas()->submapCount() == 1 &&
+               "KF 硬预算只能压缩历史，不得制造坐标子图边界");
+        assert(vo.getMap()->keyFrameCount() <=
+               cfg.map_budget.max_active_keyframes);
     } TEST_PASS();
 }
 
@@ -206,7 +219,7 @@ int main() {
     test_default_budget_no_reclaim();
     test_tiny_budget_controls_keyframes();
     test_point_budget_does_not_block_keyframes();
-    test_hard_keyframe_budget_rollover_keeps_pose_live();
+    test_hard_keyframe_budget_compaction_keeps_pose_live();
     test_map_snapshot_bytes_reported();
 
     std::cout << "全部通过" << std::endl;

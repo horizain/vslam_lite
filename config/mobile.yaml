@@ -1,5 +1,5 @@
 # ============================================================
-# 移动端低资源配置
+# 移动端 balanced 配置：优先保证长程跟踪，再以有界历史骨架控制资源。
 # 用法: ./build/bin/run_vo <dataset> config/mobile.yaml traj.txt --headless
 # 相机参数仅为 KITTI 兜底；有数据集标定时仍优先使用 calib.txt。
 # ============================================================
@@ -18,46 +18,72 @@ Camera:
   k3: 0.0
 
 Feature:
-  num_features: 600
+  num_features: 800
   scale_factor: 1.2
-  pyramid_levels: 6
-  orb_max_bands: 1         # 避免 ORB 内部并行之外再叠加分带任务
+  pyramid_levels: 8
+  orb_max_bands: 2         # 两带覆盖 ARM 大小核；不恢复桌面 8 带超订
   match_ratio: 0.7
   ransac_threshold: 3.0
 
 Runtime:
-  opencv_threads: 4        # 低功耗设备可进一步改为 2
+  opencv_threads: 2        # ARM 首测先控制嵌套并行/热功耗
+  async_backend: true      # PGO 在前缀快照上锁外求解，前端不等待
 
 VO:
   method: 0
   min_parallax: 0.025      # 单目初始化最小三角化角（弧度，约1.4°）；低资源噪声下略保守
-  min_init_inliers: 18     # 单目初始化最小对极几何内点数（低资源特征较少）
-  min_matches_init: 80
+  min_init_inliers: 20
+  min_matches_init: 100
   min_matches_track: 20
   pnp_min_inliers: 15
   pnp_min_inlier_ratio: 0.3
   pnp_max_rmse: 2.5
   max_tracking_failures: 5
   max_relocalize_frames: 20
-  max_frame_translation: 3.0
+  max_frame_translation: 5.0  # KITTI 10Hz 高速段避免把真实运动误拒为 LOST
   max_frame_rotation: 0.35
   keyframe_translation: 0.5
   keyframe_rotation: 0.2
-  keyframe_min_inliers: 15
+  keyframe_min_inliers: 20
   min_keyframe_interval: 10
   max_keyframe_interval: 15
+  keyframe_max_count: 320
+  guided_match: true
+  local_map_tracking: true
+  local_map_min_shared: 2
+  local_map_max_points: 280
+  local_map_search_radius_px: 25.0
 
 Optimizer:
   local_window_size: 6
-  local_ba_iterations: 3
+  local_ba_iterations: 4
   local_ba_max_correction: 1.0
   enable_local_ba: true
   global_ba_iterations: 0   # M4 暂关：sampled-GBA 与锚定轨迹不兼容
+  pose_graph_iterations: 15
+  pose_graph_max_anchors: 64
+  pose_graph_anchor_stride: 6
+
+# 这是 ARM/4GB 级设备的首测活动地图预算，不包含 DBoW3 词表常驻内存。
+# 更小内存设备需另行生成紧凑词表，不能只靠压低 KF 预算。
+MapBudget:
+  max_active_keyframes: 320
+  max_active_points: 24000
+  max_descriptor_mb: 96
+  max_snapshot_mb: 64
+  max_total_estimated_mb: 220
+  active_dense_keyframes: 120
+  # 检索/重定位骨架与 64 顶点 PGO 预算解耦：约每 2 个历史 KF 留 1 个，
+  # 首轮 320→约 220 KF；避免 6 步长只剩约 35 个 place 代表而丢失回环召回。
+  max_historical_anchors: 128
+  historical_anchor_stride: 2
 
 LoopClosure:
   enable_loop_closure: true
+  retrieval_backend: "flat_dbow3"  # 相同 TF-IDF/L1，连续节点避免官方重对象树膨胀
+  compact_max_keyframes: 256
   vocab_path: "config/ORBvoc.dbow3"
-  min_score: 0.1
+  min_score: 0.1              # 与高精度 DBoW3 召回阈值一致；PnP 接受门保持统一
   temporal_window: 30
   detection_interval: 10
   pnp_inlier_ratio: 0.70      # 不因设备/数据集改变回环几何语义
@@ -67,6 +93,7 @@ LoopClosure:
   pnp_min_grid_cells: 12
   loop_cooldown_kfs: 60  # 回环校正冷却（关键帧数）：挡同区域重复命中
   top_candidates: 20
+  mature_verification_limit: 4  # 仅 mobile：最多 4 个成熟 BoW 地点 + 1 个位置先验
   position_prior_dist: 25.0
   position_prior_gap: 100
   region_max_keyframes: 8
@@ -89,4 +116,4 @@ Stereo:
   rigid_min_inlier_ratio: 0.5
   rigid_ransac_threshold: 0.25
   rigid_max_rmse: 0.25
-  keyframe_translation: 0.9
+  keyframe_translation: 0.9  # 1.5m 在 KITTI 转弯段令参考帧过旧，1000 帧短测已否决

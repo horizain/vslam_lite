@@ -92,8 +92,10 @@ void test_pose_estimate_default() {
         assert(!p.pose_valid);
         assert(!p.prediction_only);
         assert(p.map_generation == 0);
+        assert(p.global_correction_generation == 0);
         assert(p.covariance == Mat6::Zero());
         assert(p.T_ob.q.w() == 1.0 && p.T_ob.t.norm() == 0.0);
+        assert(p.T_wo.q.w() == 1.0 && p.T_wo.t.norm() == 0.0);
         assert(p.T_wb.q.w() == 1.0 && p.T_wb.t.norm() == 0.0);
     } TEST_PASS();
 
@@ -102,6 +104,7 @@ void test_pose_estimate_default() {
         p.sequence = 42;
         p.timestamp = 123.456;
         p.T_ob = SE3(Eigen::Quaterniond::Identity(), Vec3(1, 2, 3));
+        p.T_wo = SE3(Eigen::Quaterniond::Identity(), Vec3(-1, -2, -3));
         p.T_wb = SE3(Eigen::Quaterniond(
                          Eigen::AngleAxisd(0.5, Vec3::UnitZ())),
                      Vec3(0.5, 0.25, 0.125));
@@ -111,16 +114,19 @@ void test_pose_estimate_default() {
         p.pose_valid = true;
         p.prediction_only = false;
         p.map_generation = 7;
+        p.global_correction_generation = 3;
 
         assert(p.sequence == 42);
         assert(p.timestamp == 123.456);
         assert(p.T_ob.t == Vec3(1, 2, 3));
+        assert(p.T_wo.t == Vec3(-1, -2, -3));
         assert(std::abs(p.T_wb.t.z() - 0.125) < 1e-12);
         assert(p.covariance(0, 0) == 2.0 && p.covariance(5, 5) == 2.0);
         assert(p.state == vslam::TrackingState::Degraded);
         assert(p.reason == vslam::FailureReason::MotionDiscontinuity);
         assert(p.pose_valid && !p.prediction_only);
         assert(p.map_generation == 7);
+        assert(p.global_correction_generation == 3);
     } TEST_PASS();
 }
 
@@ -238,6 +244,10 @@ void test_is_publishable() {
     TEST("isPublishable: NaN/非单位四元数/非法时间戳拒绝") {
         PoseEstimate p;
         p.T_ob.t.x() = kNaN;
+        assert(!vslam::isPublishable(p));
+
+        p = PoseEstimate();
+        p.T_wo.q.coeffs() *= 2.0;
         assert(!vslam::isPublishable(p));
 
         p = PoseEstimate();

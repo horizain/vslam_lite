@@ -227,8 +227,20 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
     out.sequence = seq;
     out.timestamp = timestamp;
     const SE3 T_wc = T_cw.inverse();
-    out.T_wb = T_wc * cfg_.T_bc.inverse();  // §2：T_wb = T_wc · T_bc⁻¹
-    out.T_ob = out.T_wb;                    // M0：odom 系 = 全局系，M6 后由 T_wo 分离
+    const SE3 T_oc = vo_->continuousCameraPose();
+    // 以本次 addFrame 的确切全局输出与同一次连续快照现场分解，
+    // 避免在 RECOVERING/重定位边界把上一个 T_wo 与本帧 T_wc 混用。
+    out.T_wo = splitGlobalCameraPose(T_wc, T_oc).T_wo;
+    out.T_ob = T_oc * cfg_.T_bc.inverse();  // §2：T_ob = T_oc · T_bc⁻¹
+    const SE3 expected_T_wb = T_wc * cfg_.T_bc.inverse();
+    // 对外的全局位姿保留旧 run_slam 直接组合的数值路径，避免多一次
+    // 四元数乘法破坏确定性回归；T_wo/T_ob 是显式分层输出，并在下方验算。
+    out.T_wb = expected_T_wb;
+    if (st.pose_valid &&
+        (((out.T_wo * out.T_ob).t - expected_T_wb.t).norm() > 1e-9 ||
+         (out.T_wo * out.T_ob).q.angularDistance(expected_T_wb.q) > 1e-9)) {
+        LOG_WARN("Localizer pose split recomposition drifted from VO global pose");
+    }
     // M2.1：状态机写入 + 结果发布在 result_mutex_ 内（异步模式 worker 写、
     // 调用方 state()/latestPose() 并发读；同步模式单线程无竞争）
     {
@@ -246,6 +258,7 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
         latest_estimate_ = out;
     }
     out.map_generation = vo_->getMap()->topologyRevision();
+    out.global_correction_generation = vo_->globalCorrectionGeneration();
     feedFrameMetrics(out, frame_ms);
     return out;
 }

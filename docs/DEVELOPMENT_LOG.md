@@ -1,7 +1,8 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-11（长程回环召回与轨迹连续性修复见 §3.40；M2 仍未通过实时/RSS 产品门）
+> 最后更新: 2026-08-11（Flat-DBoW3/mobile 全程与 full gate 失败证据见 §3.43；
+> 彩色双目点云见 §3.44；M2 仍未通过准确度/实时/RSS 产品门）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
 > 当前接口说明。当前坐标/观测模型以 §3.20、§3.22 为准，当前完整基准以 §3.23 为准。
@@ -2010,6 +2011,48 @@ Local BA 锚点重基和跨子图渐进校正几何回归。
 `O(K log K)` 位置扫描和最多 12 轮区域验证还需做性能分层。生产控制位姿仍需按
 §3 的 `T_ob/T_wo` 双坐标契约分离，不能把平滑后的离线全局轨迹当作实时控制输出。
 
+### 3.41 回环前缀快照、Essential/Submap Graph、双坐标分层与 mobile 首测（2026-08-11）
+
+本轮直接针对 KITTI 00 高精度档的实测性能根因：旧同子图回环从最终 PnP 重验、
+全图快照、约 1800 KF 的 g2o PGO 到点同步/提交始终持有 `map_mutex_` 独占锁。旧跑
+`kitti_00.txt.perf.csv` 中六次 PGO 为 17.3～39.8s，帧延迟最大 40.3s，因此“回环时前端卡住”
+不是 ORB 参数问题，而是锁域和图规模问题。
+
+**实现收口**：
+
+- 同子图回环在共享锁下重验几何并深拷贝冻结前缀；tracking 的共享读不等待。位姿图构建、
+  g2o 求解和点校正全在 Map 锁外执行。
+- 提交时短持独占锁，联合复验 Map/Submap 身份、geometry revision 和每个冻结 KF/点的
+  对象身份。求解期间前端新增的 KF 保持相对冻结端点的位姿不变后重基；新点保持在
+  最早存活观测 KF 中的相机坐标不变。前缀删除/替换或几何变化则整笔 stale。
+- 子图内从全量 KF 图改为有界 Essential Anchor Graph：首尾、最新回环端点必优先保留，其余
+  均匀抽样；默认/KITTI 上限 256，mobile 上限 64。锚点校正在 SE3 上渐进传播到冻结前缀；
+  跨子图仍以 Submap 为顶点优化 Atlas `T_ws`。PGO 迭代由 100 次硬编码改为配置项。
+- `PoseEstimate` 显式发布 `T_ob/T_wo/T_wb`：纯视觉前端积分相邻已发布位姿得到连续
+  `T_ob`，全局差异留在 `T_wo`，并校验 `T_wb = T_wo*T_ob`。这不是 ESKF；IMU 传播和
+  `GlobalCorrectionEvent` 订阅通道仍未实现。
+- `config/mobile.yaml` 首测值：600 ORB/6 层、2 OpenCV 线程、异步后端、6 KF 局部 BA/3 迭代、
+  64 个 PGO 锚/15 迭代、320 KF/24000 点/220MB 活动地图估算预算。这是 ARM/4GB 级设备
+  起点，不是多场景标定完成值。
+
+**回归与门禁**：
+
+- `ctest --test-dir build --output-on-failure --no-tests=error`：19/19 PASS。
+- `bash scripts/benchmark_gate.sh`：新鲜 Release 构建，`g2o vendored` + `DBoW3 found`；19/19 CTest；
+  KITTI 00 前 1000 帧确定性轨迹平移差 0、旋转差 `5.562e-17rad`；3轮×500 帧 L2 最差
+  p99 `51.81ms`、deadline miss 0、ATE RMSE `1.218m`、valid 500/500，整门 PASS。
+- mobile 烟雾：`/usr/bin/time -v ./build/bin/run_slam datasets/kitti/sequences/00 config/mobile.yaml
+  /tmp/vslam_mobile_smoke.tum --headless --frames 200 --status-csv /tmp/vslam_mobile_smoke.csv
+  --metrics-json /tmp/vslam_mobile_smoke.json`。结果 200/200 有效、0 LOST、20.88 FPS，p50/p95/p99/max
+  `38.93/46.73/51.58/68.98ms`，100ms deadline miss 0，117 KF/13019 点，RSS 峰值
+  `727664KiB`。SE3 评估仅前 200 帧：ATE RMSE `0.621m`、RPE trans `0.046m/frame`、
+  路径比 `0.9853`、0 个 >3m 跳变。
+
+**边界**：mobile 切片只覆盖 KITTI 00 的 4.40%，没有触发真实回环，因此不证明前缀事务的
+长序列 p99 或回环精度。本轮没有重跑 `kitti00.yaml` 4541 帧与回环 oracle，也没有 ARM 实机、
+8～24h soak 或多场景统计。RSS 727.7MiB 表明 97 万词 DBoW3 词表常驻仍是嵌入式主要障碍；
+只压活动 KF/点不足以进入 512MB 级设备，下一步必须做紧凑词表/数据库分层并用同一回环 oracle 重验召回率。
+
 ### 3.42 可交互 3D 地图点云可视化（2026-08-11）
 
 右上角保留原来的 **2D X-Z 俯视轨迹视图**作为默认模式；面板的 `Show 3D map`
@@ -2050,6 +2093,65 @@ Local BA 锚点重基和跨子图渐进校正几何回归。
 
 **边界**：3D 视图仅是有显示环境下的可视化辅助，headless 评估路径不受影响；
 点云上限 60000 超出时均匀抽样会略去部分点，仅影响显示密度、不影响轨迹/地图数据。
+
+### 3.43 Flat-DBoW3、有界历史索引与简单验证级联（2026-08-11）
+
+目标是先落地不改变几何语义、容易回退且能直接减少 RSS/后台工作量的部分；本节没有把
+全局描述子硬过滤、在线词表剪枝、SIMD 或新阈值体系放进生产路径。
+
+**实现**：
+
+- 新增 `flat_dbow3` 检索后端，直接解析现有 DBoW3 二进制词表，保持层次量化、TF-IDF、
+  L1 normalize/score 与官方后端一致。词表热/冷字段用连续 SoA 保存，节点载荷约
+  `51.60MiB`；每帧 BoW 用排序稀疏数组，避免 `std::map` 的逐节点分配。单测用同一批 ORB
+  descriptor 对比两套后端的候选 id、顺序和分数。
+- mobile 的回环索引硬限 256 个 KF。首 KF 固定保留，其余用确定性 reservoir-style 覆盖整个
+  时间轴；单纯 FIFO 在长序列会删除所有早期地点，完整 KITTI 00 曾得到 0 回环，已否决。
+  预算剔除产生的 LoopClosure 清理由合并 id 队列交给异步 `LoopMaintenance`，不在 Map
+  独占锁内重建数据库或释放大量描述子。
+- 检索先过滤同子图最近帧；mobile 用 `mature_verification_limit: 4` 按连续地点假设成熟度
+  级联，最多验证 4 个成熟 BoW 地点，加 1 个独立位置先验。默认 0 保留桌面/高精度档的
+  全候选验证。最终 PnP 门仍是至少 50 内点、0.70 内点率以及既有 RMSE、正深度、网格
+  覆盖门；没有用降低接受标准制造回环。
+- 资源压力不再创建新子图；活动密集 KF 之外压成有界历史锚点。跨子图图只固定最早一个
+  gauge，同子图 PGO 使用最多 64 个 Essential Anchor，锁外求解后按前缀事务提交尾段重基。
+
+**被否决的捷径**：`compact_binary` 全局签名完整 KITTI 00 的 RSS 约 `221376KiB`、
+p99 `102.96ms`，但 5 个预期区间全部漏检，不能作为 mobile 默认。词袋 Top-K 稀疏化、
+低区分度 word 在线剪枝也没有在当前词表上证明召回等价，因此本轮未实现。
+
+**完整 KITTI 00 证据（4541 帧，SE3，一一时间关联）**：
+
+| 配置/阶段 | 有效帧 | LOST | 回环 oracle | ATE RMSE | FPS / p99 | 峰值 RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| 官方 DBoW3 旧 mobile 基线 | 未复测 | 5 | 1/5，precision 1.0 | 65.377m | 17.65 / 206.6ms | 1106696KiB |
+| Flat + reservoir，级联前 | 4484/4541 | 3 | 1/5，precision 1.0 | 30.434m | 13.24 / 211.3ms | 290100KiB |
+| Flat + reservoir + 简单级联 | 4465/4541 | 4 | 1/5，precision 1.0 | 53.900m | 14.11 / 347.0ms | 290244KiB |
+
+级联前后 `lc.verify` 从 1963 次降到 990 次，累计约 `27.9s→12.9s`；`lc.detect`
+累计约 `49.1s→23.4s`。1000 帧切片保持 1000/1000 有效、0 LOST，峰值 RSS
+`202496KiB`，p99 `76.35ms`。这证明 SoA 与简单级联确实减少资源和后台工作，但完整序列
+两次 ATE/LOST/p99 差异很大，也说明瓶颈已经转向长程前端恢复、保留地点覆盖和调度尾延迟，
+不能再靠继续压候选数量解决。
+
+**结论与边界**：本轮把词表/索引常驻从约 1.06GiB 级降到约 283MiB，并大幅减少 PnP
+验证工作；但 mobile 仍未达到 ≥99% 有效、≤3 次重建、ATE ≤30m、低尾延迟和 5/5 回环
+召回门，不能宣称适合 ARM 上线。未做 ARM 实机、8～24h soak、多场景统计，也未在最终
+级联代码上重跑高精度 `kitti00.yaml` 完整序列；后续应先定位 3～4 个 LOST 区间和 p99
+尖峰归属，再决定是补前端恢复还是做调度隔离，而不是继续堆检索层级。官方 `dbow3`
+桌面后端仍依赖异步维护任务批量重建索引，长后台任务期间待删 KF 的强引用/BoW 可暂时
+滞留，尚未证明全局硬上限；不能把 mobile 的 256-KF Flat 上限外推到所有 Atlas/后端。
+
+**最终回归**：`build-essential-anchor/test_vo` 通过；本地完整 CTest 19/19 通过。低系统
+负载下执行 `bash scripts/benchmark_gate.sh --full`，新鲜 Release 配置确认 `g2o vendored`
+与 `DBoW3 found`，L0 19/19、L1 确定性 1000 帧（平移差 0、旋转差
+`5.562e-17rad`）通过；L2 的 5×4541 帧 **FAILED**：ATE RMSE worst `37.8833m`
+虽过 40m 门，但 ATE std worst `21.1334m > 8m`，1/5 轮有 1 个 >10m 跳变，p99
+worst `99.2828ms > 80ms`。valid ratio worst `0.9958`、deadline miss ratio worst
+`0.0099`、LOST worst 1，5 轮均为 0 回环。一次与并发 soak 同跑的门禁曾因系统 load
+12～17 令 p99 超门，已废弃；上述最终数据是在所有 Luna/其他基准停止、1 分钟 load
+降至约 1.95 后独占得到。没有降低门限、更新黄金参考或选择最好一轮，因此当前变更仍不能
+作为通过 full gate 的提交候选。
 
 ### 3.44 当前帧双目 RGB 点云查看与 PLY 导出（2026-08-11）
 

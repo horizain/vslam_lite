@@ -5,8 +5,9 @@
  *   1. 单后台线程 + 覆盖式单任务槽（容量 1）
  *   2. 同类 Local BA 新任务覆盖旧任务
  *   3. LoopClosure 优先于 Local BA（覆盖任何等待任务；不被后续 Local BA 覆盖）
- *   4. stop() 设置标志、排空槽内任务、join；不得 detach；可重复调用
- *   5. start() 幂等、stop 后 pending 状态正确
+ *   4. LoopMaintenance 优先于 Local BA、低于 LoopClosure
+ *   5. stop() 设置标志、排空槽内任务、join；不得 detach；可重复调用
+ *   6. start() 幂等、stop 后 pending 状态正确
  *
  * 编译: cmake -DBUILD_TESTS=ON .. && make test_backend_scheduler
  * 运行: ./build/test_backend_scheduler（独立 CTest）
@@ -102,6 +103,12 @@ BackendTask makeLoop() {
     return t;
 }
 
+BackendTask makeMaintenance() {
+    BackendTask t;
+    t.type = BackendTask::Type::LoopMaintenance;
+    return t;
+}
+
 void test_basic_execution() {
     TEST("基础执行：提交 → worker 执行 → stop 正常退出") {
         Harness h;
@@ -187,6 +194,30 @@ void test_localba_not_overwrite_pending_loop() {
     } TEST_PASS();
 }
 
+void test_loop_maintenance_priority() {
+    TEST("LoopMaintenance 覆盖 Local BA，但不覆盖 LoopClosure") {
+        Harness h;
+        BackendScheduler sched([&](BackendTask& t) { h.handler(t); });
+        sched.start();
+
+        sched.submit(makeLocalBA(0));
+        assert(h.waitInHandler());
+        sched.submit(makeLocalBA(1));
+        sched.submit(makeMaintenance());
+        sched.submit(makeLocalBA(2));
+        sched.submit(makeLoop());
+        sched.submit(makeMaintenance());
+
+        h.release();
+        assert(h.rec.waitCount(2));
+        assert(h.rec.count() == 2);
+        assert(h.rec.types[0] == BackendTask::Type::LocalBA);
+        assert(h.rec.types[1] == BackendTask::Type::LoopClosure &&
+               "最终等待槽必须保留最高优先级 LoopClosure");
+        sched.stop();
+    } TEST_PASS();
+}
+
 void test_stop_drains_pending() {
     TEST("stop() 排空槽内任务后 join") {
         Harness h;
@@ -238,6 +269,7 @@ int main() {
     test_same_type_overwrite();
     test_loop_overwrites_localba();
     test_localba_not_overwrite_pending_loop();
+    test_loop_maintenance_priority();
     test_stop_drains_pending();
     test_stop_without_start_and_double_stop();
     test_destructor_joins();

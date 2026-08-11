@@ -287,6 +287,11 @@ void test_valid_frames_and_equivalence() {
             const SE3 raw_Twc = raw_pose.inverse();                // T_wc
             const auto est = loc2.processFrame(l_b, r_b, t);       // T_bc 单位阵 → T_wb = T_wc
             const double trans_diff = (est.T_wb.t - raw_Twc.t).norm();
+            const SE3 recomposed = est.T_wo * est.T_ob;
+            if (est.pose_valid) {
+                assert((recomposed.t - est.T_wb.t).norm() < 1e-9);
+                assert(recomposed.q.angularDistance(est.T_wb.q) < 1e-9);
+            }
             // 相对旋转角：T_wb · T_cw 应接近单位
             const Eigen::Quaterniond rel = est.T_wb.q * raw_pose.q;
             const double rot_rad = 2.0 * std::acos(std::min(1.0, std::abs(rel.w())));

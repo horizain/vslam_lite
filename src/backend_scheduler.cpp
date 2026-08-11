@@ -25,6 +25,16 @@ void BackendScheduler::submit(BackendTask task) {
             // LoopClosure 优先：覆盖任何等待任务（含 Local BA）——被覆盖任务计丢弃
             if (slot_.has_value()) dropped_.fetch_add(1, std::memory_order_relaxed);
             slot_ = std::move(task);
+        } else if (task.type == BackendTask::Type::LoopMaintenance) {
+            // 索引维护优先于 Local BA；若 LoopClosure 已等待，它本身会先
+            // drain 合并后的清理 id，因此无需覆盖高优先级任务。
+            if (!slot_ || slot_->type == BackendTask::Type::LocalBA) {
+                if (slot_.has_value())
+                    dropped_.fetch_add(1, std::memory_order_relaxed);
+                slot_ = std::move(task);
+            } else {
+                return false;
+            }
         } else {
             // Local BA：只覆盖等待中的旧 Local BA；等待中的 LoopClosure 不让位
             if (!slot_ || slot_->type == BackendTask::Type::LocalBA) {

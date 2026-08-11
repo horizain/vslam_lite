@@ -6,9 +6,15 @@
 > LOST、跨子地图候选被当前 Map 过滤，以及异步回环直接改前端快照的数据竞争。
 > 修复必须以新鲜构建、负例门禁和 KITTI 00 全程 SE3 ATE/LOST/跳变复测为准；
 > §3.40 的通用多候选/历史区域回环与轨迹锚点事务把高精度档推进到 ATE 3.49m、
-> 0 LOST、4/4 回环区间召回、7/7 precision、0 个 >3m 跳变；但 p99 219.8ms、
-> deadline miss 50.25%，RSS 未复测，且 `T_ob/T_wo` 尚未正式分层。因此只能标记
-> “实现完成”，不得恢复“产品验收完成”。
+> 0 LOST、4/4 回环区间召回、7/7 precision、0 个 >3m 跳变；§3.41 进一步落地
+> 回环前缀快照、锁外 Essential Anchor Graph、尾段 KF/点重基和视觉 `T_ob/T_wo`
+> 分层。§3.43 又将资源压力改为活动稠密窗口 + 历史 Essential Anchor 压缩（不再
+> 创建预算子图），把 DBoW3 97 万词树改为相同 TF-IDF/L1 语义的 flat SoA，并以
+> mobile 以两级成熟地点 cascade 限制 PnP（高精度档默认不截断）。mobile 完整
+> KITTI 00 的 RSS 已降至约 283MiB，
+> 但两轮仍只有 1/5 回环召回、3～4 次 LOST、ATE 30.43～53.90m、p99 211～347ms。
+> 因而内存/回环阻塞方向有效，长程前端和召回产品门仍未通过，ARM 实机也未验证。
+> 因此只能标记“实现完成”，不得恢复“产品验收完成”。
 > 审计基线：`d90cfac`，2026-08-10
 > 适用范围：把当前单目/双目 VO + Local BA + DBoW3 回环 + Atlas 原型，演进为
 > 可供机器人连续运行 8～24 小时的核心定位组件。
@@ -348,9 +354,11 @@ MapBudget:
 3. 卸载非活动 KF 的原图和灰度图，仅保留关键点、描述子、位姿和 Observation。
 4. 对共视重叠率 `>0.9`、相邻位姿差 `<0.15 m/3 deg`、且不是回环/子地图锚点的 KF
    做冗余剔除。
-5. 冻结超过 2 个非活动子地图并卸载图像缓存；M4 完成后才能把完整子地图换出到磁盘，
+5. 把最近活动稠密窗口之前的普通 KF 压缩成有界 Essential Anchor 历史；首锚、历史
+   尾锚和回环端点保留，轨迹记录先原子重锚。资源压力不得创建新坐标子图。
+6. 冻结超过 2 个非活动子地图并卸载图像缓存；M4 完成后才能把完整子地图换出到磁盘，
    M4 前不得假装已经具备可靠的磁盘换入/换出。
-6. 仍超预算时停止增加地图，进入 `Degraded + BackendOverloaded`，不得随机删除锚点。
+7. 仍超预算时停止增加地图，进入 `Degraded + BackendOverloaded`，不得随机删除锚点。
 
 地图点的“最近命中 KF”需新增显式字段或旁路统计，禁止复用 `observed_count` 旧语义。
 
@@ -564,14 +572,17 @@ SHA-256 用于身份指纹，CRC32 用于快速损坏检查；不得用文件名
 
 ### 9.1 固定算法方向
 
-生产路径采用 **DBoW3 多候选召回 → ORB 双向匹配 → PnP 几何验证 → 重复观测确认 →
+生产路径采用 **DBoW3 语义多候选召回 → ORB 双向匹配 → PnP 几何验证 → 重复观测确认 →
 SE3 子地图图优化 → 可选点融合**。双目/VIO 使用 SE3；纯单目不做持久跨会话融合。
+桌面可用官方 DBoW3；嵌入式档允许 `flat_dbow3`，但必须保持相同层次量化、TF-IDF/L1
+分数与候选排序，布局优化不能改变几何接受门。
 
 ### 9.2 候选召回
 
-- DBoW3 Top-20，跳过最近 30 KF。
+- 跳过同子图最近 30 KF 后再取 DBoW3 Top-20；不得先截 Top-20 再过滤近期帧。
 - ORB KNN ratio 初值 0.8，并要求 mutual check。
-- 每个 query 最多对 5 个候选做完整 PnP，限制最坏延迟。
+- 资源受限档的普通候选连续至少两次命中才进入 PnP；每 query 最多验证 4 个成熟地点和
+  1 个位置先验。高精度档默认保留全部召回候选验证，不能外推 mobile 截断。
 - 位置先验只追加候选，不能单独接受回环。
 - 记录 annotated loop ground truth 下的 candidate recall@20。
 
@@ -821,9 +832,9 @@ M0
 |---|---|---|
 | M0 API/状态机 | 完成 | M0.1/M0.2/M0.3 全部落地（契约 19 + 状态机 24 + Facade 16 项测试，6/6 CTest 全过） |
 | M1 模块拆分 | 完成 | M1.1~M1.5 全部落地（PoseGate 11 + Relocalizer 9 + BackendScheduler 7 + FrontendTracker 6 + LocalMapper 5 项测试，10/10 CTest 全过，1000 帧确定性验收通过：轨迹逐位一致、旋转差 5.5e-17 rad）；M1.6 基准门已落地（`--metrics-json` + benchmark.py v2 多轮 mean/std/worst + `.githooks/pre-commit`）；下一步 M2 |
-| M2 实时/资源/指标 | 实现完成；产品验收未通过 | 新鲜构建 18/18 CTest；§3.40 的通用候选假设、有限历史区域 PnP、离线回环 oracle、Local BA 轨迹锚点事务和跨子图渐进校正使桌面高精度档 KITTI 00 达到 ATE 3.49m、4541/4541、0 LOST、4/4 区间 recall、7/7 precision、0 个 >3m 跳变。仍未通过 p99 219.8ms、deadline miss 50.25% 和未复测 RSS，且正式 `T_ob/T_wo` 分层未实现；不得恢复产品完成。下一步做候选检索性能分层、多轮 worst/std、RSS/soak 与双坐标发布。详见开发日志 §3.40。 |
+| M2 实时/资源/指标 | 实现完成；产品验收未通过 | §3.41 的前缀快照/Essential Graph/尾段重基基础上，§3.43 已落地无预算切图的历史锚点压缩、异步 LoopMaintenance、单 gauge Atlas 图、flat DBoW3 SoA 和 mobile 成熟地点 cascade。mobile 完整 KITTI 00 两轮：RSS 290100～290244KiB、precision 1.0、recall 1/5，但仅 98.33～98.74% 有效、3～4 LOST、ATE 30.43～53.90m、p99 211～347ms；最终 5 轮 full gate 也因 ATE std、>10m 跳变、p99 失败。准确度/实时性和多轮稳定性未过门，ARM 未测。 |
 | M3 前端鲁棒/协方差 | 未开始 | 现有质量 gate 为基础 |
 | M4 地图持久化/纯定位 | 未开始 | 当前无版本化 MapStore |
 | M5 多会话/Atlas 融合 | 未开始 | 当前 Atlas 只连坐标，不融合点 |
-| M6 ESKF/双坐标系 | 未开始 | 当前无 IMU 数据模型 |
+| M6 ESKF/双坐标系 | 部分开始 | 纯视觉 `T_ob/T_wo/T_wb` 分层和发布代次已落地；无 IMU 数据模型、ESKF 传播/融合和完整 `GlobalCorrectionEvent` 订阅通道 |
 | M7 发布/运维 | 未开始 | 当前只有本地 CTest 和有限数据集双轮基准 |

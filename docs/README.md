@@ -19,7 +19,7 @@
 |---|---|
 | [`PHASE2_DESIGN.md`](PHASE2_DESIGN.md) | 历史 Phase 2 设计稿；部分目标已实现，部分 Sim3/跨子地图方案仍未落地，不能当作 API 说明 |
 | [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) | 历史 KITTI 基线与改进计划；数字依赖具体数据集、词典和构建配置 |
-| [`DEVELOPMENT_LOG.md`](DEVELOPMENT_LOG.md) | 追加式历史记录，保留旧字段和实验结论；当前实现与完整基准见 §3.22-3.23，产品化规划见 §3.24 |
+| [`DEVELOPMENT_LOG.md`](DEVELOPMENT_LOG.md) | 追加式历史记录，保留旧字段和实验结论；当前回环快照/Essential Graph 见 §3.41，Flat-DBoW3/mobile 全程证据见 §3.43 |
 | [`../data/eval/README.md`](../data/eval/README.md) | 旧提交 `ff09804` 的回环跳变复现档案；当前 HEAD 指标见开发日志 §3.23 |
 
 ## 当前命名速查
@@ -45,5 +45,7 @@ ctest --test-dir build --output-on-failure
 git diff --check
 ```
 
-本轮验证边界：本地构建、`test_vo` 与 `test_trajectory_alignment` 通过；真实 KITTI 与
-EuRoC 双轮完整基准见开发日志 §3.23。CTest 与数据集基准是两条独立证据，不能互相替代。
+当前验证边界见开发日志 §3.43：mobile KITTI 00 已完成两轮 4541 帧与回环 oracle，
+但有效率、ATE、召回和 p99 均未通过产品门，ARM 实机也未测。CTest 与数据集基准是两条
+独立证据，不能互相替代；最终 `benchmark_gate.sh --full` 也因 ATE std、>10m 跳变和
+p99 三项失败。不能从较低 RSS 推导出实时性或定位质量已经合格。

@@ -14,8 +14,8 @@ namespace vslam {
 
 /// 回环检测模块（Phase 2）
 ///
-/// 数据流：词袋检测(DBoW3) → 候选过滤（时间窗 + 分数）→ 历史地点聚类/时序
-/// 假设跟踪 → PnP 几何验证 → SE3 回环约束。
+/// 数据流：DBoW3 或紧凑二进制签名召回 → 候选过滤（时间窗 + 分数）→
+/// 历史地点聚类/时序假设跟踪 → PnP 几何验证 → SE3 回环约束。
 /// 只负责"检测 + 验证"，位姿/地图校正由 VisualOdometry::handleLoopCorrection 完成。
 class LoopClosure {
 public:
@@ -57,6 +57,17 @@ public:
     /// 从文件加载预训练词袋词典（.txt / .dbow3），并初始化数据库
     bool loadVocabulary(const std::string& vocab_path);
 
+    /// 加载与 DBoW3 完全相同的二进制层次词表和 TF-IDF/L1 量化语义，但将
+    /// 百万节点存成连续 POD，且不复制 Vocabulary/预分配百万倒排表。
+    bool loadFlatVocabulary(const std::string& vocab_path,
+                            size_t max_keyframes = 256);
+
+    /// 启用实验性紧凑检索：每个 KF 仅保留 global+2x2 的 ORB bit-statistics
+    /// 签名，线性扫描有界历史，不加载 97 万词 DBoW3 树。该模式尚未通过
+    /// 长序列回环召回门；它只替代候选召回，
+    /// 后续时间窗、地点聚类和 PnP/残差/正深度/网格接受门完全复用。
+    bool enableCompactRetrieval(size_t max_keyframes = 256);
+
     /// 将关键帧加入数据库（词袋向量入库 + 缓存，供回查）。
     /// @param submap_id 关键帧所属子地图，不能用当前活动子地图替代。
     /// @param T_ws 加入时的子地图→世界位姿快照；仅作没有最新 Atlas 快照时
@@ -70,6 +81,10 @@ public:
 
     /// 当前由回环模块持有并可参与检索的关键帧数（资源指标/回归测试）。
     [[nodiscard]] size_t indexedKeyFrameCount() const;
+
+    /// 检索特征的载荷字节数（不含 Frame 强引用和容器开销）。用于验证紧凑
+    /// 后端的确定性内存上界；DBoW3 返回缓存 BowVector 的保守估计。
+    [[nodiscard]] size_t retrievalIndexBytes() const;
 
     /// 检测回环：返回候选关键帧列表（按优先级排序，可空）。
     /// 候选来源：① DBoW3 Top-N 词袋候选（分数过滤 + 时间窗）按地点聚类；
@@ -94,10 +109,8 @@ public:
                     SE3& T_loop_curr);
 
 private:
-#ifdef HAS_DBOW3
-    class Impl;  // DBoW3 具体状态，在 .cpp 中定义
+    class Impl;  // 检索后端具体状态，在 .cpp 中定义
     std::unique_ptr<Impl> impl_;
-#endif
 
     // ---- 非 DBoW3 状态（几何验证）----
     double min_score_            = 0.3;   // 词袋候选最低分（归一化 0~1）

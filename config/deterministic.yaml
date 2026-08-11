@@ -71,6 +71,9 @@ Optimizer:
   local_ba_max_correction: 1.0
   enable_local_ba: true
   global_ba_iterations: 0
+  pose_graph_iterations: 20
+  pose_graph_max_anchors: 256
+  pose_graph_anchor_stride: 8
 
 # ---- 回环检测 ----
 LoopClosure:

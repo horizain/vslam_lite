@@ -18,7 +18,7 @@ namespace vslam {
 
 /// 异步后台任务（M1.3：调度单元，从 vo.h 迁移；§5.4）。
 struct BackendTask {
-    enum class Type { LocalBA, LoopClosure };
+    enum class Type { LocalBA, LoopMaintenance, LoopClosure };
     Type type = Type::LocalBA;
     Map::Ptr map;                       // 入队时所属 Map；revision 不能替代实例身份
     unsigned long submap_id = 0;       // 入队时所属 Submap
@@ -63,6 +63,8 @@ struct BackendSchedulerStats {
 ///   - 同类 Local BA 新任务覆盖旧任务（保新鲜，等待槽恒为最新）。
 ///   - LoopClosure 优先于 Local BA：LoopClosure 覆盖任何等待任务；等待中的
 ///     LoopClosure 不被后续 Local BA 覆盖（槽满则丢弃新 Local BA）。
+///   - LoopMaintenance 清理已边缘化 KF 的 DBoW 索引：优先于 Local BA，
+///     但不覆盖等待中的 LoopClosure；实际 id 在模块侧合并，因此任务覆盖不丢清理。
 ///   - 任务槽容量固定 1（等待中的任务内存由 M2 预算控制）。
 ///   - 正在执行的任务不强制取消，其结果由调用方 stale gate 丢弃。
 ///   - stop() 设置标志、notify、join；不得 detach。

@@ -213,17 +213,167 @@ void test_mobile_config() {
         const auto config_path = std::filesystem::path(__FILE__).parent_path()
             .parent_path() / "config/mobile.yaml";
         const auto cfg = vslam::VOConfig::fromYaml(config_path.string());
-        assert(cfg.num_features == 600);
-        assert(cfg.pyramid_levels == 6);
-        assert(cfg.orb_max_bands == 1);
-        assert(cfg.opencv_threads == 4);
+        assert(cfg.num_features == 800);
+        assert(cfg.pyramid_levels == 8);
+        assert(cfg.orb_max_bands == 2);
+        assert(cfg.opencv_threads == 2);
+        assert(cfg.async_backend);
         assert(cfg.local_window_size == 6);
-        assert(cfg.local_ba_iterations == 3);
+        assert(cfg.local_ba_iterations == 4);
+        assert(cfg.pose_graph_iterations == 15);
+        assert(cfg.pose_graph_max_anchors == 64);
+        assert(cfg.pose_graph_anchor_stride == 6);
+        assert(cfg.map_budget.max_active_keyframes == 320);
+        assert(cfg.map_budget.max_active_points == 24000);
+        assert(cfg.map_budget.max_total_estimated_mb == 220);
+        assert(cfg.map_budget.active_dense_keyframes == 120);
+        assert(cfg.map_budget.max_historical_anchors == 128);
+        assert(cfg.map_budget.historical_anchor_stride == 2);
+        assert(cfg.loop_retrieval_backend == "flat_dbow3");
+        assert(cfg.loop_compact_max_keyframes == 256);
+        assert(cfg.loop_mature_verification_limit == 4);
         assert(std::abs(cfg.local_ba_max_correction - 1.0) < 1e-12);
         assert(cfg.enable_loop_closure);
         assert(std::abs(cfg.min_parallax - 0.025) < 1e-12);
-        assert(cfg.min_init_inliers == 18);
+        assert(cfg.min_init_inliers == 20);
+        assert(std::abs(cfg.keyframe_translation_stereo - 0.9) < 1e-12);
     } TEST_PASS();
+}
+
+void test_loop_mature_verification_config_scope() {
+    TEST("回环成熟地点验证上限仅 mobile 配置启用") {
+        const auto config_root = std::filesystem::path(__FILE__)
+            .parent_path().parent_path() / "config";
+        const auto default_cfg = vslam::VOConfig::fromYaml(
+            (config_root / "default.yaml").string());
+        const auto kitti_cfg = vslam::VOConfig::fromYaml(
+            (config_root / "kitti00.yaml").string());
+        assert(default_cfg.loop_mature_verification_limit == 0);
+        assert(kitti_cfg.loop_mature_verification_limit == 0);
+        // 未配置 LoopClosure.mature_verification_limit 时保持桌面默认行为。
+        assert(vslam::VOConfig{}.loop_mature_verification_limit == 0);
+    } TEST_PASS();
+}
+
+void test_compact_loop_retrieval_budget() {
+    TEST("LoopClosure 紧凑检索：不加载词表且索引有硬上限") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500;
+        cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+
+        vslam::LoopClosure lc;
+        lc.setParams(0.80, 1, 8, 0.1, 3.0, cam, 20, 0.0, 1);
+        assert(lc.enableCompactRetrieval(2));
+
+        cv::Mat appearance(64, 32, CV_8U);
+        for (int r = 0; r < appearance.rows; ++r)
+            for (int c = 0; c < appearance.cols; ++c)
+                appearance.at<unsigned char>(r, c) =
+                    static_cast<unsigned char>((r * 37 + c * 19) & 255);
+        cv::Mat distractor;
+        cv::bitwise_not(appearance, distractor);
+
+        auto add = [&](unsigned long id, const cv::Mat& descriptors) {
+            auto frame = std::make_shared<vslam::Frame>(id, id * 0.1);
+            frame->pose_cs = vslam::SE3();
+            frame->descriptors = descriptors.clone();
+            lc.addKeyFrame(frame, 0, vslam::SE3());
+        };
+        add(10, appearance);
+        add(100, distractor);
+        add(200, appearance);  // 超过硬上限后采样全程历史，首锚不得 FIFO 丢失
+
+        assert(lc.indexedKeyFrameCount() == 2);
+        assert(lc.retrievalIndexBytes() ==
+               2 * (1280 + 5 * sizeof(std::uint16_t)));
+
+        auto query = std::make_shared<vslam::Frame>(1000, 100.0);
+        query->pose_cs = vslam::SE3();
+        query->descriptors = appearance.clone();
+        const auto candidates = lc.detectLoop(
+            query, 0, vslam::SE3(), {{0, vslam::SE3()}});
+        assert(!candidates.empty());
+        assert(std::ranges::any_of(candidates, [](const auto& candidate) {
+            return candidate.frame && candidate.frame->id == 10;
+        }));
+        lc.removeKeyFrames({100, 200});
+        assert(lc.indexedKeyFrameCount() == 1);
+        const auto after = lc.detectLoop(query, 0, vslam::SE3(),
+                                         {{0, vslam::SE3()}});
+        assert(after.size() == 1 && after.front().frame->id == 10);
+    } TEST_PASS();
+}
+
+void test_flat_dbow3_matches_reference() {
+#ifdef HAS_DBOW3
+    TEST("LoopClosure flat DBoW3：候选与官方实现逐项一致") {
+        auto cam = std::make_shared<vslam::MonocularCamera>();
+        cam->fx = cam->fy = 500;
+        cam->cx = 320; cam->cy = 240;
+        cam->img_width = 640; cam->img_height = 480;
+        const std::string vocabulary = VSLAM_SOURCE_DIR "/config/ORBvoc.dbow3";
+
+        std::vector<cv::Mat> appearances;
+        for (int image = 0; image < 4; ++image) {
+            cv::Mat descriptors(64, 32, CV_8U);
+            for (int row = 0; row < descriptors.rows; ++row)
+                for (int col = 0; col < descriptors.cols; ++col)
+                    descriptors.at<unsigned char>(row, col) =
+                        static_cast<unsigned char>(
+                            (row * 37 + col * 19 + image * 53) & 255);
+            appearances.push_back(std::move(descriptors));
+        }
+        auto populate = [&](vslam::LoopClosure& closure) {
+            for (size_t i = 0; i < appearances.size(); ++i) {
+                auto frame = std::make_shared<vslam::Frame>(
+                    10 + i * 100, static_cast<double>(i));
+                frame->pose_cs = vslam::SE3();
+                frame->descriptors = appearances[i].clone();
+                closure.addKeyFrame(frame, 0, vslam::SE3());
+            }
+            // 29 个与查询完全相同、但处于 temporal window 内的近期 KF。
+            // Top-N 若在时间过滤前截断，会把真正历史候选全部挤掉。
+            for (unsigned long id = 971; id < 1000; ++id) {
+                auto frame = std::make_shared<vslam::Frame>(id, id * 0.1);
+                frame->pose_cs = vslam::SE3();
+                frame->descriptors = appearances[2].clone();
+                closure.addKeyFrame(frame, 0, vslam::SE3());
+            }
+        };
+        auto query = std::make_shared<vslam::Frame>(1000, 100.0);
+        query->pose_cs = vslam::SE3();
+        query->descriptors = appearances[2].clone();
+
+        std::vector<vslam::LoopClosure::LoopCandidate> reference;
+        {
+            vslam::LoopClosure closure;
+            closure.setParams(0.0, 30, 8, 0.1, 3.0, cam, 20, 0.0, 30);
+            assert(closure.loadVocabulary(vocabulary));
+            populate(closure);
+            reference = closure.detectLoop(
+                query, 0, vslam::SE3(), {{0, vslam::SE3()}});
+        }
+
+        vslam::LoopClosure flat;
+        flat.setParams(0.0, 30, 8, 0.1, 3.0, cam, 20, 0.0, 30);
+        assert(flat.loadFlatVocabulary(vocabulary, 64));
+        assert(flat.retrievalIndexBytes() < 96ULL * 1024 * 1024);
+        populate(flat);
+        const auto actual = flat.detectLoop(
+            query, 0, vslam::SE3(), {{0, vslam::SE3()}});
+        assert(actual.size() == reference.size());
+        for (size_t i = 0; i < actual.size(); ++i) {
+            assert(actual[i].frame && reference[i].frame);
+            assert(actual[i].frame->id == reference[i].frame->id);
+            assert(std::abs(actual[i].score - reference[i].score) < 1e-12);
+        }
+    } TEST_PASS();
+#else
+    TEST("LoopClosure flat DBoW3：候选与官方实现逐项一致") {
+        std::cout << "SKIPPED (built without DBoW3)";
+    } TEST_PASS();
+#endif
 }
 
 void test_monocular_initialization_quality() {
@@ -2633,6 +2783,8 @@ int main() {
     test_loop_closure_keeps_all_place_clusters();
     test_loop_closure_removes_culled_keyframes();
     test_loop_closure_reserves_multiple_position_priors();
+    test_compact_loop_retrieval_budget();
+    test_flat_dbow3_matches_reference();
     test_cross_submap_loop_constraint_direction();
     test_frontend_world_pose_rebase_after_atlas_correction();
     test_atlas_rejects_solution_that_reopens_old_loop();
@@ -2641,6 +2793,7 @@ int main() {
     test_feature_extraction();
     test_frame_image_lifecycle();
     test_mobile_config();
+    test_loop_mature_verification_config_scope();
     test_monocular_initialization_quality();
 
     std::cout << "\n[VO Initialization]\n";

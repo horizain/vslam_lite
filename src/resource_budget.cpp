@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <unordered_set>
 
 namespace vslam {
@@ -87,6 +88,62 @@ bool ResourceBudget::redundantPair(const Frame::Ptr& older,
            config_.redundant_overlap_threshold;
 }
 
+namespace {
+
+std::unordered_set<KeyframeId> selectEssentialHistory(
+    const std::vector<Frame::Ptr>& all,
+    const std::unordered_set<KeyframeId>& protected_keyframe_ids,
+    const MapBudgetConfig& config) {
+    std::unordered_set<KeyframeId> keep;
+    if (all.empty()) return keep;
+
+    const size_t dense_count = std::min({
+        all.size(), config.active_dense_keyframes,
+        config.max_active_keyframes});
+    const size_t history_count = all.size() - dense_count;
+    for (size_t i = history_count; i < all.size(); ++i)
+        keep.insert(all[i]->id);
+    if (history_count == 0) return keep;
+
+    const size_t hard_history_slots = config.max_active_keyframes > dense_count
+        ? config.max_active_keyframes - dense_count : 0;
+    const size_t anchor_budget = std::min(
+        config.max_historical_anchors, hard_history_slots);
+
+    // 回环端点是数学约束的一部分，即使超过软 anchor 配额也不能删除。
+    for (size_t i = 0; i < history_count; ++i)
+        if (protected_keyframe_ids.contains(all[i]->id)) keep.insert(all[i]->id);
+
+    if (anchor_budget > 0) keep.insert(all.front()->id);
+    if (anchor_budget > 1) keep.insert(all[history_count - 1]->id);
+
+    std::vector<KeyframeId> optional;
+    const size_t stride = std::max<size_t>(1, config.historical_anchor_stride);
+    for (size_t i = stride; i + 1 < history_count; i += stride)
+        if (!keep.contains(all[i]->id)) optional.push_back(all[i]->id);
+
+    const size_t kept_history = std::count_if(
+        all.begin(), all.begin() + static_cast<std::ptrdiff_t>(history_count),
+        [&](const Frame::Ptr& kf) { return keep.contains(kf->id); });
+    const size_t slots = anchor_budget > kept_history
+        ? anchor_budget - kept_history : 0;
+    if (optional.size() <= slots) {
+        keep.insert(optional.begin(), optional.end());
+    } else if (slots > 0) {
+        // 覆盖整段历史，不把剩余名额集中在路径开头。
+        for (size_t i = 0; i < slots; ++i) {
+            const size_t index = std::min(
+                optional.size() - 1,
+                static_cast<size_t>(std::floor(
+                    (static_cast<double>(i) + 0.5) * optional.size() / slots)));
+            keep.insert(optional[index]);
+        }
+    }
+    return keep;
+}
+
+} // namespace
+
 BudgetReclaimResult ResourceBudget::reclaim(
     const Map::Ptr& map,
     const std::unordered_set<KeyframeId>& protected_keyframe_ids,
@@ -171,7 +228,42 @@ BudgetReclaimResult ResourceBudget::reclaim(
     }
     if (evaluate(map, snapshot_bytes).within_budget) return r;
 
-    // 第 5 步：冻结超过 max_inactive_submaps 个的非活动子地图并卸载图像
+    // 第 5 步：把活动子地图中最近稠密窗口之前的普通 KF 压缩为有界
+    // Essential Anchor 骨架。首锚、历史尾锚、回环端点与最近稠密窗口保留；
+    // 被删除 KF 的持久轨迹由调用方在同一事务内重锚。资源压力不再通过
+    // 创建新坐标子图释放，避免把里程计 yaw 漂移固化成 Atlas 边界误差。
+    {
+        const auto all = map->getAllKeyFrames();
+        const auto keep = selectEssentialHistory(
+            all, protected_keyframe_ids, config_);
+        if (keep.size() < all.size()) {
+            std::map<KeyframeId, Frame::Ptr> kept_frames;
+            for (const auto& kf : all)
+                if (keep.contains(kf->id)) kept_frames.emplace(kf->id, kf);
+
+            for (const auto& removed : all) {
+                if (keep.contains(removed->id) || kept_frames.empty()) continue;
+                auto replacement = kept_frames.lower_bound(removed->id);
+                if (replacement == kept_frames.end()) replacement = std::prev(kept_frames.end());
+                if (before_keyframe_cull)
+                    before_keyframe_cull(removed, replacement->second);
+                if (map->removeKeyFrame(removed->id)) {
+                    r.compacted_historical_keyframes++;
+                    r.culled_keyframe_ids.push_back(removed->id);
+                }
+            }
+
+            // KF 观测撤销后，立即删除新产生的孤儿点，防止它们在下一次
+            // 20-KF 周期回收前继续占用地图与描述子预算。
+            std::vector<MapPointId> orphan_ids;
+            for (const auto& mp : map->getAllMapPoints())
+                if (mp->observationCount() == 0) orphan_ids.push_back(mp->id);
+            r.removed_zero_obs_points += map->removeMapPoints(orphan_ids);
+        }
+        if (evaluate(map, snapshot_bytes).within_budget) return r;
+    }
+
+    // 第 6 步：冻结超过 max_inactive_submaps 个的非活动子地图并卸载图像
     // 缓存。保留子地图 id 最大的（最新）2 个，冻结更老的；M4 前不进行
     // 磁盘换出（§6.3：不得假装已经具备可靠的换入/换出）。冻结子地图的
     // 弱陈点一并删除（inactive_submaps 提供 Map 时）——点主体不再被访问，
@@ -222,7 +314,7 @@ BudgetReclaimResult ResourceBudget::reclaim(
         if (evaluate(map, snapshot_bytes).within_budget) return r;
     }
 
-    // 第 6 步：全部手段耗尽仍超预算 → 停止增加地图（调用方上报
+    // 第 7 步：全部手段耗尽仍超预算 → 停止增加地图（调用方上报
     // Degraded + BackendOverloaded）；不得随机删除锚点。
     r.stopped_map_growth = !evaluate(map, snapshot_bytes).within_budget;
     return r;

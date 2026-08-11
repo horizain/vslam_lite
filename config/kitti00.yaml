@@ -62,6 +62,9 @@ Optimizer:
   local_ba_max_correction: 1.0 # 通用局部优化安全门，不依赖序列/帧号/GT
   enable_local_ba: true
   global_ba_iterations: 0   # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
+  pose_graph_iterations: 25
+  pose_graph_max_anchors: 256
+  pose_graph_anchor_stride: 8
 
 # ---- 回环检测 (run_vo 强制关闭, 供 run_slam 使用) ----
 LoopClosure:
@@ -123,3 +126,6 @@ MapBudget:
   max_descriptor_mb: 512
   max_snapshot_mb: 256
   max_total_estimated_mb: 900
+  active_dense_keyframes: 480
+  max_historical_anchors: 192
+  historical_anchor_stride: 8
