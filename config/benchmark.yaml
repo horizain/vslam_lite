@@ -19,6 +19,7 @@ Benchmark:
   alignment: "se3"        # 双目 SE3；单目用 sim3
   runs: 5                 # 每配置轮数（§0.1：统计基准至少 5 轮）
   window_frames: 0        # 0 = 全程；>0 = 只跑前 N 帧（提交门快速档用）
+  expected_frames: 4541   # KITTI 00 完整输入帧数；切片时由 --window 覆盖
   deadline_ms: 100        # 10Hz 地面机器人单帧延迟门限
   measure_rss: false      # true = 用 /usr/bin/time -v 测 RSS 峰值（仅 Linux）
 

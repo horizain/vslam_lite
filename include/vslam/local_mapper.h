@@ -57,7 +57,8 @@ public:
     [[nodiscard]] OptimizationSnapshot buildLocalBASnapshot(
         const Map::Ptr& map, const Atlas::Ptr& atlas,
         const std::vector<Frame::Ptr>& window,
-        KeyframeId anchor_kf_id, int min_observed = 0) const;
+        KeyframeId anchor_kf_id, int min_observed = 0,
+        size_t max_landmarks = std::numeric_limits<size_t>::max()) const;
 
 private:
     Camera camera_;

@@ -14,7 +14,8 @@ public:
 
     /// 设置 ORB 提取参数（重建提取器）
     void setParams(int num_features, double scale_factor, int pyramid_levels,
-                   int orb_max_bands = 8);
+                   int orb_max_bands = 8,
+                   bool stereo_reverse_prune = true);
 
     /// 对一帧图像提取 ORB 特征，结果写入 frame.keypoints / frame.descriptors
     void extract(Frame::Ptr frame);
@@ -26,6 +27,14 @@ public:
         const Frame::Ptr& f2,
         double ratio_thresh = 0.7,
         bool use_ransac = true);
+
+    /// 复用已有描述子匹配，只执行基础矩阵 RANSAC。关键帧插入时使用，
+    /// 避免在同一对 KF/当前帧上再次做 O(N^2) BF 匹配。
+    std::vector<cv::DMatch> filterFundamental(
+        const Frame::Ptr& f1,
+        const Frame::Ptr& f2,
+        const std::vector<cv::DMatch>& matches,
+        double ransac_threshold = 3.0) const;
 
     /// 在上一帧特征点位置做光流跟踪（用于与 ORB 对比学习用）
     /// 返回追踪成功的索引
@@ -62,6 +71,7 @@ private:
     double scale_factor_ = 1.2;
     int pyramid_levels_ = 8;
     int orb_max_bands_ = 8;        // 分带上限；1 禁用外层分带并行
+    bool stereo_reverse_prune_ = true;
 };
 
 } // namespace vslam

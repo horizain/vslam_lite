@@ -122,7 +122,8 @@ public:
         const OptimizationSnapshot& snap,
         int max_iterations = 10,
         std::optional<bool> fix_points = std::nullopt,
-        size_t max_points = 4000);
+        size_t max_points = 4000,
+        int passes = 2);
 
     /// 位姿图优化（快照上）：约束 = 里程计边（无鲁棒核）+ 回环边（Huber）。
     /// 内置防护（M0）：回环边残差预检、chi2 收敛、有限值、最大校正/相邻步长

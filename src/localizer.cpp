@@ -42,6 +42,23 @@ LocalizerConfig LocalizerConfig::fromYaml(const std::string& path) {
             cfg.tracking_deadline_ms = rt["tracking_deadline_ms"].as<long long>();
         if (rt["enable_metrics"])
             cfg.enable_metrics = rt["enable_metrics"].as<bool>();
+        if (rt["max_backend_task_age_ms"])
+            cfg.max_backend_task_age_ms = rt["max_backend_task_age_ms"].as<long long>();
+        if (rt["shutdown_timeout_ms"])
+            cfg.shutdown_timeout_ms = rt["shutdown_timeout_ms"].as<long long>();
+    }
+    if (robot["MapBudget"]) {
+        const auto& budget = robot["MapBudget"];
+        if (budget["max_active_keyframes"])
+            cfg.map_budget.max_active_keyframes = budget["max_active_keyframes"].as<size_t>();
+        if (budget["max_active_points"])
+            cfg.map_budget.max_active_points = budget["max_active_points"].as<size_t>();
+        if (budget["max_descriptor_mb"])
+            cfg.map_budget.max_descriptor_mb = budget["max_descriptor_mb"].as<size_t>();
+        if (budget["max_snapshot_mb"])
+            cfg.map_budget.max_snapshot_mb = budget["max_snapshot_mb"].as<size_t>();
+        if (budget["max_total_estimated_mb"])
+            cfg.map_budget.max_total_estimated_mb = budget["max_total_estimated_mb"].as<size_t>();
     }
     if (robot["T_bc"]) {
         const auto& tbc = robot["T_bc"];
@@ -73,6 +90,8 @@ Localizer::Localizer(const Camera& camera, const VOConfig& vo_cfg,
     if (!isFinite(cfg_.T_bc) || !isUnitQuaternion(cfg_.T_bc.q))
         throw std::invalid_argument(
             "Localizer: T_bc must be finite with unit quaternion (norm error < 1e-6)");
+    vo_cfg_.max_backend_task_age_ms = static_cast<int>(cfg_.max_backend_task_age_ms);
+    vo_cfg_.map_budget = cfg_.map_budget;
     vo_ = std::make_unique<VisualOdometry>(camera_, vo_cfg_);
     // M2.1（§6.1）：异步模式启动跟踪 worker（传感器回调只入队）
     if (cfg_.enable_async_input) {
@@ -300,6 +319,7 @@ void Localizer::feedFinalMetrics() {
     if (!cfg_.enable_metrics || !vo_) return;
     metrics_.recordBackend(vo_->backendStats());
     metrics_.recordLoopCommitted(static_cast<long long>(vo_->loopClosureCount()));
+    metrics_.recordRuntime(vo_->runtimeResourceSnapshot());
     const Map::Ptr map = vo_->getMap();
     long long observations = 0;
     for (const auto& mp : map->getAllMapPoints())
@@ -309,8 +329,7 @@ void Localizer::feedFinalMetrics() {
                        static_cast<long long>(ResourceBudget::descriptorBytes(map)),
                        static_cast<long long>(ResourceBudget::imageBytes(map)),
                        vo_->mapSnapshotBytes(),
-                       static_cast<long long>(
-                           ResourceBudget{}.evaluate(map).estimated_total_bytes));
+                       static_cast<long long>(vo_->mapBudgetStatus().estimated_total_bytes));
 }
 
 PoseEstimate Localizer::rejectedOutput(double timestamp, FailureReason reason) const {
@@ -390,6 +409,7 @@ MetricsSnapshot Localizer::metricsSnapshot() const {
     if (cfg_.enable_metrics && vo_) {
         metrics_.recordBackend(vo_->backendStats());
         metrics_.recordLoopCommitted(static_cast<long long>(vo_->loopClosureCount()));
+        metrics_.recordRuntime(vo_->runtimeResourceSnapshot());
         const Map::Ptr map = vo_->getMap();
         long long observations = 0;
         for (const auto& mp : map->getAllMapPoints())
@@ -399,8 +419,7 @@ MetricsSnapshot Localizer::metricsSnapshot() const {
                            static_cast<long long>(ResourceBudget::descriptorBytes(map)),
                            static_cast<long long>(ResourceBudget::imageBytes(map)),
                            vo_->mapSnapshotBytes(),
-                           static_cast<long long>(
-                               ResourceBudget{}.evaluate(map).estimated_total_bytes));
+                           static_cast<long long>(vo_->mapBudgetStatus().estimated_total_bytes));
     }
     return metrics_.snapshot();
 }

@@ -36,6 +36,27 @@ trap 'rm -rf "$TMP"' EXIT
 BUILD_DIR="$TMP/build"
 FAILED=0
 
+# 数据目录在历史提交中曾从 datasets/sequences 迁移到 datasets/kitti/sequences。
+# 只在标准路径不存在时使用仓库内已有的历史路径；GT 始终必须存在，不能无 GT 放行。
+if [ -d "datasets/kitti/sequences/00" ]; then
+    BENCH_DATASET="datasets/kitti/sequences/00"
+    LEGACY_DATASET=0
+elif [ -d "datasets/sequences/00" ]; then
+    BENCH_DATASET="datasets/sequences/00"
+    LEGACY_DATASET=1
+else
+    echo "[gate] KITTI 00 数据集不存在（标准/历史路径均未找到）" >&2
+    exit 2
+fi
+if [ -f "datasets/kitti/poses/00.tum" ]; then
+    BENCH_GT="datasets/kitti/poses/00.tum"
+elif [ -f "data/eval/kitti_00_gt.tum" ]; then
+    BENCH_GT="data/eval/kitti_00_gt.tum"
+else
+    echo "[gate] KITTI 00 GT 不存在；禁止跳过 ATE 门" >&2
+    exit 2
+fi
+
 # ---- L0: Python 门限逻辑单测 ----
 echo "===== [gate] L0 Python 门限/soak 单测 ====="
 if ! python3 scripts/test_benchmark.py; then
@@ -55,13 +76,30 @@ fi
 
 # ---- L1: 确定性回归 ----
 echo "===== [gate] L1 确定性回归 (KITTI 00 前 1000 帧, deterministic.yaml) ====="
-if ! "$BUILD_DIR/bin/run_slam" datasets/kitti/sequences/00 config/deterministic.yaml \
+if ! "$BUILD_DIR/bin/run_slam" "$BENCH_DATASET" config/deterministic.yaml \
         "$TMP/traj.txt" --headless --frames 1000 --status-csv "$TMP/status.csv" \
         >/dev/null 2>&1; then
     echo "[gate] L1 确定性运行失败" >&2
     exit 1
 fi
-if [ "$UPDATE_REF" = "1" ]; then
+if [ "$LEGACY_DATASET" = "1" ]; then
+    if [ "$UPDATE_REF" = "1" ]; then
+        echo "[gate] 历史数据目录没有对应黄金参考，禁止更新 reference" >&2
+        exit 2
+    fi
+    if ! "$BUILD_DIR/bin/run_slam" "$BENCH_DATASET" config/deterministic.yaml \
+            "$TMP/traj_repeat.txt" --headless --frames 1000 \
+            --status-csv "$TMP/status_repeat.csv" >/dev/null 2>&1; then
+        echo "[gate] L1 历史数据目录第二次确定性运行失败" >&2
+        exit 1
+    fi
+    if ! python3 scripts/compare_trajectories.py "$TMP/traj.txt" \
+            "$TMP/traj_repeat.txt" --status "$TMP/status.csv" \
+            "$TMP/status_repeat.csv"; then
+        echo "[gate] L1 历史数据目录两次运行不一致" >&2
+        FAILED=1
+    fi
+elif [ "$UPDATE_REF" = "1" ]; then
     cp "$TMP/traj.txt" scripts/benchmark/reference/pose.txt
     cp "$TMP/status.csv" scripts/benchmark/reference/status.csv
     echo "[gate] L1 参考已更新（随本次提交一起提交参考文件）"
@@ -80,14 +118,15 @@ fi
 if [ "$FULL" = "1" ]; then
     echo "===== [gate] L2 统计基准（完整档） ====="
     if ! python3 scripts/benchmark.py config/benchmark.yaml "$TMP/bench" \
-            --bin "$BUILD_DIR/bin/run_slam"; then
+            --bin "$BUILD_DIR/bin/run_slam" --dataset "$BENCH_DATASET" --gt "$BENCH_GT"; then
         echo "[gate] L2 统计基准未通过门限" >&2
         FAILED=1
     fi
 else
     echo "===== [gate] L2 统计基准（快速档: window=500, runs=3） ====="
     if ! python3 scripts/benchmark.py config/benchmark.yaml "$TMP/bench" \
-            --window 500 --runs 3 --bin "$BUILD_DIR/bin/run_slam"; then
+            --window 500 --runs 3 --bin "$BUILD_DIR/bin/run_slam" \
+            --dataset "$BENCH_DATASET" --gt "$BENCH_GT"; then
         echo "[gate] L2 统计基准未通过门限" >&2
         FAILED=1
     fi

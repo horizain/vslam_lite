@@ -37,6 +37,14 @@ struct RunMetrics {
     long long loops = 0;                 // 已闭合回环次数
     long long map_points = 0;            // 最终地图点
     long long keyframes = 0;             // 最终关键帧
+    long long process_rss_bytes = 0;
+    long long process_thread_count = 0;
+    long long allowed_cpu_count = 0;
+    long long backend_submitted = 0;
+    long long backend_executed = 0;
+    long long backend_dropped = 0;
+    long long backend_expired = 0;
+    double backend_service_max_ms = 0.0;
 };
 
 /// 已排序向量的百分位（线性插值）
@@ -74,7 +82,15 @@ inline void writeRunMetricsJson(const std::string& path, const RunMetrics& m) {
     ofs << "  \"submap_reinit\": " << m.submap_reinit << ",\n";
     ofs << "  \"loops\": " << m.loops << ",\n";
     ofs << "  \"map_points\": " << m.map_points << ",\n";
-    ofs << "  \"keyframes\": " << m.keyframes << "\n";
+    ofs << "  \"keyframes\": " << m.keyframes << ",\n";
+    ofs << "  \"process_rss_bytes\": " << m.process_rss_bytes << ",\n";
+    ofs << "  \"process_thread_count\": " << m.process_thread_count << ",\n";
+    ofs << "  \"allowed_cpu_count\": " << m.allowed_cpu_count << ",\n";
+    ofs << "  \"backend_submitted\": " << m.backend_submitted << ",\n";
+    ofs << "  \"backend_executed\": " << m.backend_executed << ",\n";
+    ofs << "  \"backend_dropped\": " << m.backend_dropped << ",\n";
+    ofs << "  \"backend_expired\": " << m.backend_expired << ",\n";
+    ofs << "  \"backend_service_max_ms\": " << m.backend_service_max_ms << "\n";
     ofs << "}\n";
 }
 

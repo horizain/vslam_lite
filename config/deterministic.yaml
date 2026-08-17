@@ -36,6 +36,16 @@ Runtime:
   opencv_threads: 1          # 单线程（确定性；默认配置为物理核数）
   async_backend: false       # 异步后端关闭（确定性；默认配置为 true）
   rng_seed: 0x5A17           # 固定全局 RNG（确定性；默认配置为 0=不设置）
+  max_cpu_cores: 1            # 确定性路径不做多核调度
+  max_rss_mb: 12288
+  backend_reserved_cores: 0
+  enforce_cpu_affinity: false
+  pin_backend_worker: false
+  max_backend_task_age_ms: 500
+  reuse_keyframe_matches: false
+  stereo_reverse_prune: false
+  use_raw_stereo_gray: false
+  copy_gray_before_clahe: false
 
 # ---- VO 参数 ----
 VO:
@@ -68,6 +78,8 @@ VO:
 Optimizer:
   local_window_size: 10
   local_ba_iterations: 10
+  local_ba_passes: 2       # 保持确定性参考的父版本优化轮数
+  local_ba_max_points: 0       # 不在快照入口预裁剪，保持父版本输入语义
   local_ba_max_correction: 1.0
   enable_local_ba: true
   global_ba_iterations: 0

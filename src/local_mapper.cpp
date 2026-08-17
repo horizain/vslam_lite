@@ -170,7 +170,8 @@ std::vector<Frame::Ptr> LocalMapper::selectLocalWindow(
 OptimizationSnapshot LocalMapper::buildLocalBASnapshot(
     const Map::Ptr& map, const Atlas::Ptr& atlas,
     const std::vector<Frame::Ptr>& window,
-    KeyframeId anchor_kf_id, int min_observed) const {
+    KeyframeId anchor_kf_id, int min_observed,
+    size_t max_landmarks) const {
     OptimizationSnapshot snap;
     const auto* active_submap = atlas->activeSubmap();
     snap.submap_id = active_submap ? active_submap->id : 0;
@@ -282,6 +283,24 @@ OptimizationSnapshot LocalMapper::buildLocalBASnapshot(
             snap.landmarks.push_back({id, mp->pos_s,
                                       static_cast<int>(mp->observationCount())});
         }
+    }
+    if (max_landmarks > 0 && snap.landmarks.size() > max_landmarks) {
+        std::ranges::partial_sort(
+            snap.landmarks,
+            snap.landmarks.begin() + static_cast<std::ptrdiff_t>(max_landmarks),
+            [](const LandmarkState& a, const LandmarkState& b) {
+                if (a.observations != b.observations)
+                    return a.observations > b.observations;
+                return a.id < b.id;
+            });
+        snap.landmarks.resize(max_landmarks);
+        std::unordered_set<MapPointId> selected;
+        selected.reserve(snap.landmarks.size());
+        for (const auto& landmark : snap.landmarks)
+            selected.insert(landmark.id);
+        std::erase_if(snap.observations, [&](const ObservationState& observation) {
+            return !selected.contains(observation.map_point_id);
+        });
     }
     // 锚定局部观测分量最早 2 帧（固定 = 局部基线长度，避免全局 kf#0/#1
     // 与当前窗口断开时造成 gauge 漂移）。Optimizer 还会按实际 BA 边再次

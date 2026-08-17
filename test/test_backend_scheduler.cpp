@@ -246,6 +246,17 @@ void test_stop_without_start_and_double_stop() {
     } TEST_PASS();
 }
 
+void test_submit_after_stop_is_rejected() {
+    TEST("stop 后提交：不得重新产生 pending 任务") {
+        BackendScheduler sched([](BackendTask&) {});
+        sched.start();
+        sched.stop();
+        sched.submit(makeLocalBA(11));
+        assert(!sched.hasPending() && "已停止的 scheduler 不得接收新任务");
+        assert(sched.stats().dropped >= 1 && "stop 后任务应计为 dropped");
+    } TEST_PASS();
+}
+
 void test_destructor_joins() {
     TEST("析构自动 stop + join（不 detach）") {
         {
@@ -272,6 +283,7 @@ int main() {
     test_loop_maintenance_priority();
     test_stop_drains_pending();
     test_stop_without_start_and_double_stop();
+    test_submit_after_stop_is_rejected();
     test_destructor_joins();
 
     std::cout << "全部通过" << std::endl;

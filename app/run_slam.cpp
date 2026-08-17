@@ -453,6 +453,16 @@ int main(int argc, char** argv) {
         m.loops = (long long)vo.loopClosureCount();
         m.map_points = (long long)vo.getMap()->mapPointCount();
         m.keyframes = (long long)vo.getMap()->keyFrameCount();
+        const auto resources = vo.runtimeResourceSnapshot();
+        m.process_rss_bytes = static_cast<long long>(resources.rss_bytes);
+        m.process_thread_count = static_cast<long long>(resources.thread_count);
+        m.allowed_cpu_count = static_cast<long long>(resources.allowed_cpu_count);
+        const auto backend = vo.backendStats();
+        m.backend_submitted = backend.submitted;
+        m.backend_executed = backend.executed;
+        m.backend_dropped = backend.dropped;
+        m.backend_expired = backend.expired;
+        m.backend_service_max_ms = backend.task_service_max_ms;
         vslam::writeRunMetricsJson(metrics_json_path, m);
         LOG_INFO("Structured metrics -> " << metrics_json_path);
     }

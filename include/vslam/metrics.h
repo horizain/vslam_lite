@@ -2,6 +2,7 @@
 
 #include "vslam/backend_scheduler.h"
 #include "vslam/localization_types.h"
+#include "vslam/runtime_resources.h"
 
 #include <array>
 #include <cstdint>
@@ -53,6 +54,9 @@ struct MetricsSnapshot {
     long long backend_pending = 0;
     double backend_task_age_max_ms = -1.0;
     double backend_task_age_avg_ms = -1.0;
+    long long backend_expired = 0;
+    double backend_service_max_ms = -1.0;
+    double backend_service_avg_ms = -1.0;
     /// 提交结果计数（§6.4 backend committed/stale/invalid；queued 即 submitted）
     long long backend_committed = 0;
     long long backend_stale = 0;
@@ -70,6 +74,9 @@ struct MetricsSnapshot {
     long long map_image_bytes = 0;
     long long map_snapshot_bytes = -1;
     long long map_estimated_total_bytes = 0;
+    long long process_rss_bytes = 0;
+    long long process_thread_count = 0;
+    long long allowed_cpu_count = 0;
 
     // ---- lost / relocalization（§6.4）----
     long long lost_count = 0;
@@ -102,6 +109,8 @@ public:
     void recordPose(const PoseEstimate& pose);
     /// 后端调度统计（取最新值；§6.4 backend 指标）
     void recordBackend(const BackendSchedulerStats& stats);
+    /// 进程级资源观测（RSS/线程/affinity）。
+    void recordRuntime(const RuntimeResourceSnapshot& snapshot);
     /// 已闭合回环总数（取最新值）
     void recordLoopCommitted(long long committed);
     /// 地图规模与字节统计（取最新值；snapshot_bytes < 0 表示未上报）
@@ -148,6 +157,9 @@ private:
 
     BackendSchedulerStats backend_stats_;
     long long loop_committed_ = 0;
+    long long process_rss_bytes_ = 0;
+    long long process_thread_count_ = 0;
+    long long allowed_cpu_count_ = 0;
 
     long long map_keyframes_ = 0;
     long long map_points_ = 0;

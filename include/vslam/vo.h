@@ -18,6 +18,7 @@
 #include "vslam/pose_gate.h"
 #include "vslam/relocalizer.h"
 #include "vslam/resource_budget.h"
+#include "vslam/runtime_resources.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -44,6 +45,10 @@ struct LoopCorrectionContext {
     KeyframeId loop_kf_id = 0;
     Frame::Ptr curr_kf;
     Frame::Ptr loop_kf;
+    bool preverified = false;
+    SE3 preverified_T_loop_curr;
+    uint64_t preverified_geometry_revision = 0;
+    double preverified_reference_time = 0.0;
 };
 
 /// VO/Feature/Optimizer 参数（默认值与 config/default.yaml 一致）
@@ -55,6 +60,12 @@ struct VOConfig {
     double ransac_pixel_threshold = 3.0;    // PnP RANSAC 重投影误差阈值(px)
     int    orb_max_bands          = 8;      // ORB 外层并行分带上限（1=单带）
     int    opencv_threads         = 0;      // OpenCV 线程数（0=保持库默认值）
+    RuntimeResourceConfig runtime_resources; // 进程 CPU/RSS 资源契约
+    int    max_backend_task_age_ms = 500;   // 后台任务最大排队年龄
+    bool   reuse_keyframe_matches = true;   // 关键帧建点复用跟踪匹配
+    bool   stereo_reverse_prune = true;     // 反向 LK 只验证正向有效点
+    bool   use_raw_stereo_gray = true;      // 双目 LK 使用未做 CLAHE 的灰度
+    bool   copy_gray_before_clahe = true;   // 避免增强原地改写调用方图像
     int    rng_seed               = 0;      // M1 确定性：非 0 时构造调用 cv::setRNGSeed(rng_seed)
                                             // （固定 solvePnPRansac 等内部 RNG，见 config/deterministic.yaml）
     int    min_matches_init       = 100;    // 初始化最小匹配数
@@ -82,6 +93,8 @@ struct VOConfig {
     int    max_keyframe_interval  = 15;     // 最长关键帧间隔（防尺度低估导致参考帧过旧）
     int    local_window_size      = 10;     // 局部 BA 滑动窗口
     int    local_ba_iterations    = 10;     // 局部 BA 迭代次数
+    int    local_ba_passes        = 1;      // 每次 Local BA 的优化轮数（1=实时）
+    size_t local_ba_max_points    = 1500;   // Local BA 地图点硬上限
     double local_ba_max_correction = 1.0;   // 局部 BA 单次最大位姿校正(m)
     bool   enable_local_ba        = true;   // 局部 BA 开关（诊断/教学对比用）
     int    feature_method         = 0;      // 0: ORB匹配, 1: LK光流
@@ -322,6 +335,14 @@ public:
         return map_snapshot_bytes_.load(std::memory_order_relaxed);
     }
 
+    /// 当前活动 Map 的预算快照；调用方无需自行绕过 map_mutex_。
+    [[nodiscard]] BudgetStatus mapBudgetStatus() const;
+
+    /// 进程级资源观测（RSS、线程数、允许 CPU 数）。
+    [[nodiscard]] RuntimeResourceSnapshot runtimeResourceSnapshot() const {
+        return RuntimeResources::snapshot();
+    }
+
     /// M2.3 遗留清理：§6.3 第 6 步——预算耗尽或点配额已满是否停止增加点
     /// （Localizer 据此上报 Degraded；不等价于停止关键帧）
     [[nodiscard]] bool mapGrowthStopped() const {
@@ -381,7 +402,8 @@ private:
     /// M1.1：跟踪/重定位共用的运动连续性已迁移至 PoseGate::checkMotionContinuity。
     /// 双目/RGB-D：为当前帧的每个特征点计算相机系 3D 观测 pts_c
     /// （M1.4：转调 FrontendTracker::computeStereoDepths 后应用深度统计）
-    void computeStereoDepths();
+    void computeStereoDepths(const cv::Mat& left_gray = cv::Mat(),
+                             const cv::Mat& right_gray = cv::Mat());
     /// M1.4：正常跟踪的运动基线（世界系 T_wc = 上一有效位姿，门限
     /// max_frame_translation/rotation），与 acceptPose 的正常跟踪基线同一规则；
     /// 单目/无上一有效位姿 → 空基线（跳过连续性）。
@@ -505,6 +527,9 @@ private:
     std::vector<FramePoseRecord> pose_records_;
     std::vector<LoopEdge> odometry_edges_;   // KF 插入时冻结，不能从优化后位姿重算
     std::vector<LoopEdge> loop_edges_;       // 累积保留历史回环约束
+    std::vector<cv::DMatch> last_tracking_matches_;
+    KeyframeId last_tracking_ref_id_ = 0;
+    KeyframeId last_tracking_curr_id_ = 0;
 
     // ---- 回环状态 ----
     std::unique_ptr<LoopClosure> loop_closure_;

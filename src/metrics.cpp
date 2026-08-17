@@ -67,6 +67,13 @@ void MetricsCollector::recordBackend(const BackendSchedulerStats& stats) {
     backend_stats_ = stats;
 }
 
+void MetricsCollector::recordRuntime(const RuntimeResourceSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    process_rss_bytes_ = static_cast<long long>(snapshot.rss_bytes);
+    process_thread_count_ = static_cast<long long>(snapshot.thread_count);
+    allowed_cpu_count_ = static_cast<long long>(snapshot.allowed_cpu_count);
+}
+
 void MetricsCollector::recordLoopCommitted(long long committed) {
     std::lock_guard<std::mutex> lock(mutex_);
     loop_committed_ = committed;
@@ -153,6 +160,10 @@ MetricsSnapshot MetricsCollector::snapshot() const {
     s.backend_task_age_max_ms = backend_stats_.age_samples > 0
         ? backend_stats_.task_age_max_ms : -1.0;
     s.backend_task_age_avg_ms = backend_stats_.taskAgeAvgMs();
+    s.backend_expired = backend_stats_.expired;
+    s.backend_service_max_ms = backend_stats_.service_samples > 0
+        ? backend_stats_.task_service_max_ms : -1.0;
+    s.backend_service_avg_ms = backend_stats_.taskServiceAvgMs();
     s.backend_committed = backend_stats_.committed;
     s.backend_stale = backend_stats_.stale;
     s.backend_invalid = backend_stats_.invalid;
@@ -165,6 +176,9 @@ MetricsSnapshot MetricsCollector::snapshot() const {
     s.map_image_bytes = map_image_bytes_;
     s.map_snapshot_bytes = map_snapshot_bytes_;
     s.map_estimated_total_bytes = map_estimated_total_bytes_;
+    s.process_rss_bytes = process_rss_bytes_;
+    s.process_thread_count = process_thread_count_;
+    s.allowed_cpu_count = allowed_cpu_count_;
     s.lost_count = lost_count_;
     s.lost_duration_s = lost_duration_s_;
     if (!reloc_latencies_ms_.empty()) {
@@ -214,6 +228,9 @@ std::string MetricsCollector::toJson() const {
     os << "  \"backend_pending\": " << s.backend_pending << ",\n";
     os << "  \"backend_task_age_max_ms\": " << s.backend_task_age_max_ms << ",\n";
     os << "  \"backend_task_age_avg_ms\": " << s.backend_task_age_avg_ms << ",\n";
+    os << "  \"backend_expired\": " << s.backend_expired << ",\n";
+    os << "  \"backend_service_max_ms\": " << s.backend_service_max_ms << ",\n";
+    os << "  \"backend_service_avg_ms\": " << s.backend_service_avg_ms << ",\n";
     os << "  \"backend_committed\": " << s.backend_committed << ",\n";
     os << "  \"backend_stale\": " << s.backend_stale << ",\n";
     os << "  \"backend_invalid\": " << s.backend_invalid << ",\n";
@@ -226,6 +243,9 @@ std::string MetricsCollector::toJson() const {
     os << "  \"map_image_bytes\": " << s.map_image_bytes << ",\n";
     os << "  \"map_snapshot_bytes\": " << s.map_snapshot_bytes << ",\n";
     os << "  \"map_estimated_total_bytes\": " << s.map_estimated_total_bytes << ",\n";
+    os << "  \"process_rss_bytes\": " << s.process_rss_bytes << ",\n";
+    os << "  \"process_thread_count\": " << s.process_thread_count << ",\n";
+    os << "  \"allowed_cpu_count\": " << s.allowed_cpu_count << ",\n";
     os << "  \"lost_count\": " << s.lost_count << ",\n";
     os << "  \"lost_duration_s\": " << s.lost_duration_s << ",\n";
     os << "  \"relocalization_latency_p95_ms\": "
@@ -244,10 +264,12 @@ std::string MetricsCollector::toCsv() const {
           "pnp_rmse_avg,pose_accepted,pose_rejected,pose_prediction_only,"
           "backend_submitted,backend_executed,backend_dropped,backend_pending,"
           "backend_task_age_max_ms,backend_task_age_avg_ms,"
+          "backend_expired,backend_service_max_ms,backend_service_avg_ms,"
           "backend_committed,backend_stale,backend_invalid,backend_not_found,"
           "loop_committed,"
           "map_keyframes,map_points,map_observations,map_descriptor_bytes,"
           "map_image_bytes,map_snapshot_bytes,map_estimated_total_bytes,"
+          "process_rss_bytes,process_thread_count,allowed_cpu_count,"
           "lost_count,lost_duration_s,relocalization_latency_p95_ms\n";
     os << std::fixed << std::setprecision(6);
     os << s.frames_processed << "," << s.deadline_ms << "," << s.deadline_miss
@@ -259,14 +281,18 @@ std::string MetricsCollector::toCsv() const {
        << s.pnp_inlier_ratio_avg << "," << s.pnp_rmse_avg << ","
        << s.pose_accepted << "," << s.pose_rejected << "," << s.pose_prediction_only
        << "," << s.backend_submitted << "," << s.backend_executed << ","
-       << s.backend_dropped << "," << s.backend_pending << ","
-        << s.backend_task_age_max_ms << "," << s.backend_task_age_avg_ms << ","
+         << s.backend_dropped << "," << s.backend_pending << ","
+         << s.backend_task_age_max_ms << "," << s.backend_task_age_avg_ms << ","
+         << s.backend_expired << "," << s.backend_service_max_ms << ","
+         << s.backend_service_avg_ms << ","
         << s.backend_committed << "," << s.backend_stale << ","
         << s.backend_invalid << "," << s.backend_not_found << ","
         << s.loop_committed << "," << s.map_keyframes << "," << s.map_points << ","
        << s.map_observations << "," << s.map_descriptor_bytes << ","
-       << s.map_image_bytes << "," << s.map_snapshot_bytes << ","
-       << s.map_estimated_total_bytes << "," << s.lost_count << ","
+        << s.map_image_bytes << "," << s.map_snapshot_bytes << ","
+        << s.map_estimated_total_bytes << "," << s.process_rss_bytes << ","
+        << s.process_thread_count << "," << s.allowed_cpu_count << ","
+        << s.lost_count << ","
        << s.lost_duration_s << "," << s.relocalization_latency_p95_ms << "\n";
     return os.str();
 }

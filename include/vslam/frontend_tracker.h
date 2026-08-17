@@ -23,6 +23,7 @@ struct TrackerConfig {
     double scale_factor = 1.2;
     int    pyramid_levels = 8;
     int    orb_max_bands = 8;
+    bool   stereo_reverse_prune = true;
     // 匹配 / PnP
     double match_ratio = 0.7;
     double ransac_pixel_threshold = 3.0;
@@ -110,6 +111,7 @@ struct TrackingResult {
     double rotation_delta = 0.0;
     bool recovering = false;               // 需要进入 RECOVERING（跟踪失败/大跳变）
     std::vector<int> pnp_inlier_indices;   // PnP 内点在 pts3d 中的索引（关联用）
+    std::vector<cv::DMatch> match_pairs;   // 本帧 ORB 匹配，供关键帧建点复用
     // 关联的地图点：trainIdx → MapPoint（普通帧不产生正式观测）
     std::vector<std::pair<int, MapPoint::Ptr>> associations;
     // 与 associations 逐位对齐的"版本绑定快照坐标"（pos_s 拷贝）。跟踪在
@@ -166,6 +168,11 @@ public:
     /// 双目/RGB-D：视差（或深度）→ 每特征点相机系 3D 观测 pts_c（写 frame）。
     /// 单目或无右图时不写 pts_c。返回深度统计。
     [[nodiscard]] StereoStats computeStereoDepths(const Frame::Ptr& frame) const;
+    /// 使用调用方已经转换好的原始灰度图，避免同一帧再次 BGR→灰度。
+    [[nodiscard]] StereoStats computeStereoDepths(
+        const Frame::Ptr& frame,
+        const cv::Mat& left_gray,
+        const cv::Mat& right_gray) const;
 
     /// PnP 核心（ORB/LK 共用）：3D-2D → solvePnPRansac → PoseGate 验收。
     /// 返回 TrackingResult（pose/valid/quality/pnp_inlier_indices）；

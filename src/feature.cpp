@@ -17,11 +17,12 @@ FeatureMatcher::FeatureMatcher() {
 }
 
 void FeatureMatcher::setParams(int num_features, double scale_factor, int pyramid_levels,
-                               int orb_max_bands) {
+                               int orb_max_bands, bool stereo_reverse_prune) {
     num_features_ = num_features;
     scale_factor_ = scale_factor;
     pyramid_levels_ = pyramid_levels;
     orb_max_bands_ = std::clamp(orb_max_bands, 1, 8);
+    stereo_reverse_prune_ = stereo_reverse_prune;
     orb_ = cv::ORB::create(num_features, (float)scale_factor, pyramid_levels,
                            15, 0, 2, cv::ORB::HARRIS_SCORE, 19, 10);
 }
@@ -144,27 +145,35 @@ std::vector<cv::DMatch> FeatureMatcher::match(
             good_matches.push_back(m[0]);
         }
     }
-    LOG_INFO("Feature matching: " << good_matches.size() << " / " << knn_matches.size());
+    if (use_ransac)
+        LOG_INFO("Feature matching: " << good_matches.size() << " / " << knn_matches.size());
 
     // Step 2: RANSAC 基础矩阵剔除误匹配
     if (use_ransac && good_matches.size() >= 8) {
-        std::vector<cv::Point2f> pts1, pts2;
-        getMatchedPoints(f1, f2, good_matches, pts1, pts2);
-
-        std::vector<unsigned char> inlier_mask;
-        cv::findFundamentalMat(pts1, pts2, cv::FM_RANSAC, 3.0, 0.99, inlier_mask);
-
-        std::vector<cv::DMatch> inlier_matches;
-        for (size_t i = 0; i < inlier_mask.size(); i++) {
-            if (inlier_mask[i]) {
-                inlier_matches.push_back(good_matches[i]);
-            }
-        }
+        const auto inlier_matches = filterFundamental(
+            f1, f2, good_matches, 3.0);
         LOG_INFO("After RANSAC: " << inlier_matches.size() << " inliers");
         return inlier_matches;
     }
 
     return good_matches;
+}
+
+std::vector<cv::DMatch> FeatureMatcher::filterFundamental(
+    const Frame::Ptr& f1, const Frame::Ptr& f2,
+    const std::vector<cv::DMatch>& matches,
+    double ransac_threshold) const {
+    if (!f1 || !f2 || matches.size() < 8) return matches;
+    std::vector<cv::Point2f> pts1, pts2;
+    getMatchedPoints(f1, f2, matches, pts1, pts2);
+    std::vector<unsigned char> inlier_mask;
+    cv::findFundamentalMat(pts1, pts2, cv::FM_RANSAC,
+                           ransac_threshold, 0.99, inlier_mask);
+    std::vector<cv::DMatch> inlier_matches;
+    inlier_matches.reserve(matches.size());
+    for (size_t i = 0; i < inlier_mask.size() && i < matches.size(); ++i)
+        if (inlier_mask[i]) inlier_matches.push_back(matches[i]);
+    return inlier_matches;
 }
 
 std::vector<unsigned char> FeatureMatcher::trackLK(
@@ -235,15 +244,75 @@ std::vector<unsigned char> FeatureMatcher::matchStereo(
         left_pts, right_pts, status, err,
         cv::Size(31, 31), 5);
 
-    // 右目→左目反向跟踪：仅使用单向 LK 的 status 会把重复纹理上的错误点
-    // 当成有效深度。前后向一致性是稀疏双目最便于理解、也最关键的质量门槛。
-    std::vector<cv::Point2f> back_pts;
-    std::vector<unsigned char> back_status;
-    std::vector<float> back_err;
-    cv::calcOpticalFlowPyrLK(
-        right_gray, left_gray,
-        right_pts, back_pts, back_status, back_err,
-        cv::Size(31, 31), 5);
+    if (!stereo_reverse_prune_) {
+        // 确定性回归兼容路径：保留父版本的全量反向 LK 调用顺序。
+        std::vector<cv::Point2f> back_pts;
+        std::vector<unsigned char> back_status;
+        std::vector<float> back_err;
+        cv::calcOpticalFlowPyrLK(
+            right_gray, left_gray, right_pts, back_pts, back_status, back_err,
+            cv::Size(31, 31), 5);
+        constexpr float kMaxEpipolarError = 1.5f;
+        constexpr float kMaxForwardBackwardError = 1.0f;
+        constexpr float kMaxLkError = 25.0f;
+        for (size_t i = 0; i < status.size(); i++) {
+            if (!status[i] || i >= back_status.size() || !back_status[i]) {
+                status[i] = 0;
+                continue;
+            }
+            const auto& pl = left_pts[i];
+            const auto& pr = right_pts[i];
+            const bool in_image = pr.x >= 1.0f && pr.y >= 1.0f
+                && pr.x < right_gray.cols - 1.0f && pr.y < right_gray.rows - 1.0f;
+            const float fb_error = cv::norm(back_pts[i] - pl);
+            const float stereo_error = i < err.size() ? err[i] : kMaxLkError + 1.0f;
+            const float reverse_error = i < back_err.size() ? back_err[i] : kMaxLkError + 1.0f;
+            if (!in_image || std::abs(pl.y - pr.y) > kMaxEpipolarError
+                || fb_error > kMaxForwardBackwardError
+                || stereo_error > kMaxLkError || reverse_error > kMaxLkError)
+                status[i] = 0;
+        }
+        return status;
+    }
+
+    // 右目→左目反向跟踪：只对正向 LK 已成功且仍在图像内的点做反向检查。
+    // 失败点不可能通过后续深度门，重新把它们送进反向金字塔只增加 CPU 工作。
+    std::vector<int> reverse_indices;
+    std::vector<cv::Point2f> reverse_input;
+    reverse_indices.reserve(status.size());
+    reverse_input.reserve(status.size());
+    for (size_t i = 0; i < status.size() && i < right_pts.size(); ++i) {
+        if (!status[i]) continue;
+        const auto& pr = right_pts[i];
+        if (!std::isfinite(pr.x) || !std::isfinite(pr.y) ||
+            pr.x < 1.0f || pr.y < 1.0f ||
+            pr.x >= right_gray.cols - 1.0f ||
+            pr.y >= right_gray.rows - 1.0f ||
+            std::abs(left_pts[i].y - pr.y) > 1.5f) {
+            status[i] = 0;
+            continue;
+        }
+        reverse_indices.push_back(static_cast<int>(i));
+        reverse_input.push_back(pr);
+    }
+    std::vector<cv::Point2f> reverse_output;
+    std::vector<unsigned char> reverse_status;
+    std::vector<float> reverse_err;
+    if (!reverse_input.empty()) {
+        cv::calcOpticalFlowPyrLK(
+            right_gray, left_gray,
+            reverse_input, reverse_output, reverse_status, reverse_err,
+            cv::Size(31, 31), 5);
+    }
+    std::vector<cv::Point2f> back_pts(left_pts.size());
+    std::vector<unsigned char> back_status(left_pts.size(), 0);
+    std::vector<float> back_err(left_pts.size(), 0.0f);
+    for (size_t j = 0; j < reverse_indices.size(); ++j) {
+        const int i = reverse_indices[j];
+        if (j < reverse_output.size()) back_pts[i] = reverse_output[j];
+        if (j < reverse_status.size()) back_status[i] = reverse_status[j];
+        if (j < reverse_err.size()) back_err[i] = reverse_err[j];
+    }
 
     constexpr float kMaxEpipolarError = 1.5f;
     constexpr float kMaxForwardBackwardError = 1.0f;

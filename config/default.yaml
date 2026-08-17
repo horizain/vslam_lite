@@ -21,27 +21,34 @@ Feature:
   num_features: 1000       # 每帧提取的 ORB 特征数
   scale_factor: 1.2        # 金字塔尺度因子
   pyramid_levels: 8        # 金字塔层数
-  orb_max_bands: 4         # ORB 外层并行分带上限；1=单带。与 opencv_threads 配套收敛
-                           # TBB 嵌套并行度（带×octave 任务成倍放大，超订无益，见 §3.16）
+  orb_max_bands: 4         # 外层任务共享 OpenCV 线程池，不额外创建线程
   match_ratio: 0.7         # 最近邻/次近邻比率测试阈值
   ransac_threshold: 3.0    # RANSAC 重投影误差阈值
 
 # ---- 运行时资源参数 ----
 Runtime:
-  opencv_threads: 16       # OpenCV/TBB 线程数。0=库默认（=全部逻辑核，32 核机器实测进程
-                           # 63 线程、超订无益）；设物理核数（本机 16）实测 FPS 最高且线程
-                           # 减到 47（§3.16 A/B）；移动端建议 2~4
+  opencv_threads: 6        # OpenCV/TBB 请求上限；异步 backend 会预留 1 个核
   async_backend: true      # M6：Committer 追加 rebase 协议完成后恢复默认开启
                            # （Local BA/回环后台执行，前端只跟踪；§3.16 收益
                            # FPS+23%/LOST-97%，M1-M6 事务式写回兜底）。
                            # §3.15 曾因"BA 滞后致前端用陈旧点、LOST +130%"默认关闭；
                            # §3.16 覆盖式队列 + 跳过活动参考帧写回后净收益转正：
                            # 历史性能实验曾有 FPS +23%，但异步回环快照可能与前端新增
-                           # KF/点交错；在 generation/rebase 完成并全程 A/B 前不作为默认。
+                            # KF/点交错；在 generation/rebase 完成并全程 A/B 前不作为默认。
+  max_cpu_cores: 6         # 进程 CPU affinity 硬上限
+  max_rss_mb: 12288        # 进程 RSS 预算（12 GiB）
+  backend_reserved_cores: 1
+  enforce_cpu_affinity: true
+  pin_backend_worker: true
+  max_backend_task_age_ms: 500
+  reuse_keyframe_matches: true
+  stereo_reverse_prune: true
+  use_raw_stereo_gray: true
+  copy_gray_before_clahe: true
 
 # ---- VO 参数 ----
 VO:
-  method: 0                # 0 = ORB匹配, 1 = LK光流
+  method: 0                # ORB 默认路径；LK 轻量档可按 profile 启用
   min_parallax: 0.0175     # 单目初始化最小三角化角（弧度，约1°；不是 ||recoverPose.t||）
   min_init_inliers: 20     # 单目初始化最小对极几何内点数（通用门槛）
   min_matches_init: 100    # 初始化的最小匹配数
@@ -71,6 +78,8 @@ VO:
 Optimizer:
   local_window_size: 10    # 局部 BA 窗口大小
   local_ba_iterations: 10  # 局部 BA 迭代次数
+  local_ba_passes: 1       # 一轮优化；避免同一关键帧重复求解
+  local_ba_max_points: 4000 # 桌面默认保持完整局部约束；轻量档使用更小上限
   local_ba_max_correction: 1.0 # 局部 BA 仅做亚米级精修；大范围校正由位姿图负责
   enable_local_ba: true    # 局部 BA 开关（false 时仅前端跟踪，用于对比实验）
   global_ba_iterations: 0  # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
@@ -93,6 +102,8 @@ MapBudget:
 # ---- 回环检测 (Phase 2) ----
 LoopClosure:
   enable_loop_closure: true   # run_slam 默认开；run_vo 入口强制关闭（A/B 对比）
+  retrieval_backend: "flat_dbow3" # 有界连续词表载荷，避免官方数据库无限增长
+  compact_max_keyframes: 512
   vocab_path: "config/ORBvoc.dbow3"  # 词袋词典（scripts/fetch_vocab.sh 获取）
   min_score: 0.1              # 词袋候选最低分（0.3 召回过低；0.1 + PnP 验证兜底）
   temporal_window: 30         # 跳过最近 N 个关键帧（时间过滤，刚走过的路不算回环）

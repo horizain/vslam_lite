@@ -67,6 +67,30 @@ class BenchmarkGateTest(unittest.TestCase):
         self.assertEqual(gates["deadline_miss_ratio"], {"max": 0.01})
         self.assertFalse(any("{" in str(name) for name in gates))
 
+    def test_metrics_and_trajectory_must_be_nonempty_finite_and_consistent(self):
+        metrics = {
+            "frames_processed": 2, "valid_poses": 1,
+            "valid_ratio": 0.5, "fps": 10.0,
+            "latency_p50_ms": 1.0, "latency_p95_ms": 2.0,
+            "latency_p99_ms": 3.0, "latency_max_ms": 4.0,
+            "deadline_miss_ratio": 0.0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "traj.tum"
+            path.write_text("0 0 0 0 0 0 0 1\n")
+            benchmark.validate_run_metrics(metrics, path, expected_frames=2)
+            path.write_text("0 nan 0 0 0 0 0 1\n")
+            with self.assertRaises(RuntimeError):
+                benchmark.validate_run_metrics(metrics, path, expected_frames=2)
+
+    def test_compare_report_fails_b_side_gate(self):
+        aggregate = {"latency_p99_ms": {"mean": 1.0, "std": 0.0,
+                                         "min": 1.0, "max": 1.0,
+                                         "worst": 1.0}}
+        self.assertEqual(
+            benchmark.check_gates(aggregate, {"latency_p99_ms": {"max": 80}}, True)
+            ["latency_p99_ms"]["status"], "pass")
+
 
 if __name__ == "__main__":
     unittest.main()

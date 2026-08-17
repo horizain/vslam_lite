@@ -21,6 +21,7 @@ mean/std/worst，并按 config/benchmark.yaml 的门限断言，报告通过/失
 """
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -43,10 +44,46 @@ def load_metrics_json(path):
         return json.load(f)
 
 
-def validate_run_metrics(metrics):
+def validate_run_metrics(metrics, trajectory_path=None, expected_frames=None,
+                         require_rss=False):
     """拒绝未实际处理输入的基准轮次，避免空工作被统计成零延迟成功。"""
+    if not isinstance(metrics, dict):
+        raise RuntimeError("metrics JSON 顶层必须是对象")
     if metrics.get("frames_processed", 0) <= 0:
         raise RuntimeError("run_slam 未处理任何帧")
+    frames = int(metrics["frames_processed"])
+    valid = int(metrics.get("valid_poses", 0))
+    if valid < 0 or valid > frames:
+        raise RuntimeError(f"valid_poses 越界: {valid}/{frames}")
+    if expected_frames is not None and frames != expected_frames:
+        raise RuntimeError(f"处理帧数不符合预期: {frames} != {expected_frames}")
+    for key in ("valid_ratio", "fps", "latency_p50_ms", "latency_p95_ms",
+                "latency_p99_ms", "latency_max_ms", "deadline_miss_ratio"):
+        value = metrics.get(key)
+        if value is None or not math.isfinite(float(value)):
+            raise RuntimeError(f"指标不是有限数值: {key}={value}")
+    if trajectory_path is not None:
+        path = Path(trajectory_path)
+        if not path.is_file():
+            raise RuntimeError(f"轨迹文件不存在: {path}")
+        rows = [line for line in path.read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+        if len(rows) != valid:
+            raise RuntimeError(f"轨迹行数与 valid_poses 不一致: {len(rows)} != {valid}")
+        for index, row in enumerate(rows):
+            fields = row.split()
+            if len(fields) != 8:
+                raise RuntimeError(f"轨迹第 {index} 行字段数错误")
+            try:
+                values = [float(value) for value in fields]
+            except ValueError as error:
+                raise RuntimeError(f"轨迹第 {index} 行不可解析") from error
+            if not all(math.isfinite(value) for value in values):
+                raise RuntimeError(f"轨迹第 {index} 行含 NaN/Inf")
+    if require_rss:
+        rss_kb = metrics.get("rss_kb")
+        if rss_kb is None or not math.isfinite(float(rss_kb)) or rss_kb <= 0:
+            raise RuntimeError("RSS 门开启但没有有效 rss_kb")
 
 
 def run_ate(est_tum, gt_tum, alignment):
@@ -73,13 +110,27 @@ def run_once(cfg, args, out_path, run_dir):
         cmd += ["--frames", str(cfg["window_frames"])]
     cmd += ["--metrics-json", metrics_path, "--deadline-ms", str(cfg.get("deadline_ms", 100))]
 
+    execute_cmd = cmd
+    if cfg.get("measure_rss", False):
+        execute_cmd = ["/usr/bin/time", "-v"] + cmd
     with open(log_path, "w") as logf:
-        proc = subprocess.run(cmd, cwd=args.cwd, stdout=logf, stderr=subprocess.STDOUT)
+        proc = subprocess.run(execute_cmd, cwd=args.cwd, stdout=logf,
+                              stderr=subprocess.STDOUT)
     if proc.returncode != 0:
         raise RuntimeError(f"run_slam 失败(returncode={proc.returncode})，见 {log_path}")
 
     m = load_metrics_json(metrics_path)
-    validate_run_metrics(m)
+    if cfg.get("measure_rss", False):
+        txt = Path(log_path).read_text()
+        for line in txt.splitlines():
+            if "Maximum resident set size" in line:
+                m["rss_kb"] = float(line.split()[-1])
+        if "rss_kb" not in m:
+            raise RuntimeError("/usr/bin/time 未输出 Maximum resident set size")
+    window = int(cfg.get("window_frames", 0) or 0)
+    expected = window if window > 0 else cfg.get("expected_frames")
+    validate_run_metrics(m, out_path, expected,
+                         bool(cfg.get("measure_rss", False)))
 
     # GT 精度（可选）
     gt = cfg.get("gt") or args.gt
@@ -100,17 +151,6 @@ def run_once(cfg, args, out_path, run_dir):
             "jumps_10m": ate["jumps_10m"],
         })
 
-    # RSS 峰值（Linux /usr/bin/time -v，可选）
-    if cfg.get("measure_rss", False):
-        time_cmd = ["/usr/bin/time", "-v"] + cmd
-        with open(log_path, "w") as logf:
-            proc = subprocess.run(time_cmd, cwd=args.cwd, stdout=logf,
-                                  stderr=subprocess.STDOUT)
-        if proc.returncode == 0:
-            txt = open(log_path).read()
-            for line in txt.splitlines():
-                if "Maximum resident set size" in line:
-                    m["rss_kb"] = float(line.split()[-1])
     return m
 
 
@@ -123,6 +163,8 @@ def aggregate(rounds):
     out = {}
     for k in rounds[0]:
         vals = np.asarray([r[k] for r in rounds], dtype=float)
+        if not np.isfinite(vals).all():
+            raise RuntimeError(f"多轮指标含 NaN/Inf: {k}")
         out[k] = {"mean": float(vals.mean()), "std": float(vals.std()),
                   "min": float(vals.min()), "max": float(vals.max()),
                   "worst": float(vals.max())}
@@ -186,6 +228,7 @@ def main():
     ap.add_argument("--compare", default=None, help="对比配置 YAML")
     ap.add_argument("--bin", default="build/bin/run_slam")
     ap.add_argument("--gt", default=None, help="真值轨迹（TUM），覆盖 YAML")
+    ap.add_argument("--dataset", default=None, help="数据集路径，覆盖 YAML")
     ap.add_argument("--config", default=None, help="run_slam 配置（默认用 YAML 内 config）")
     ap.add_argument("--cwd", default=".")
     args = ap.parse_args()
@@ -200,6 +243,7 @@ def main():
     if args.runs: bench["runs"] = args.runs
     if args.window: bench["window_frames"] = args.window
     if args.gt: bench["gt"] = args.gt
+    if args.dataset: bench["dataset"] = args.dataset
     if args.config: bench["config"] = args.config
     if "config" not in bench:
         print("错误: benchmark.yaml 缺 Benchmark.config", file=sys.stderr)
@@ -238,7 +282,11 @@ def main():
               f"rounds={runs} =====")
         print_table(all_agg[label], gates, all_gates[label])
 
-    failed = [k for k, v in all_gates["A"].items() if v.get("status") == "fail"]
+    failed = [f"A.{k}" for k, v in all_gates["A"].items()
+              if v.get("status") == "fail"]
+    if "B" in all_gates:
+        failed.extend(f"B.{k}" for k, v in all_gates["B"].items()
+                      if v.get("status") == "fail")
     report = {"config": bench, "gates": gates, "failed": failed,
               "result": "pass" if not failed else "fail",
               "A": all_results["A"], "B": all_results.get("B")}

@@ -17,10 +17,17 @@ namespace vslam {
 FrontendTracker::FrontendTracker(const Camera& camera, const TrackerConfig& config)
     : camera_(camera), cfg_(config) {
     matcher_.setParams(cfg_.num_features, cfg_.scale_factor,
-                       cfg_.pyramid_levels, cfg_.orb_max_bands);
+                       cfg_.pyramid_levels, cfg_.orb_max_bands,
+                       cfg_.stereo_reverse_prune);
 }
 
 StereoStats FrontendTracker::computeStereoDepths(const Frame::Ptr& frame) const {
+    return computeStereoDepths(frame, cv::Mat(), cv::Mat());
+}
+
+StereoStats FrontendTracker::computeStereoDepths(
+    const Frame::Ptr& frame, const cv::Mat& left_gray_input,
+    const cv::Mat& right_gray_input) const {
     StereoStats stats;
     frame->pts_c.clear();
     frame->pts_c.resize(frame->keypoints.size(), Vec3::Zero());
@@ -30,15 +37,20 @@ StereoStats FrontendTracker::computeStereoDepths(const Frame::Ptr& frame) const 
     // 双目匹配用原始灰度（非 CLAHE）：CLAHE 是内容相关的非线性增强，
     // 左右目同一 3D 点的局部直方图不同 → 灰度不一致 → 破坏光度一致性，
     // 显著降低 LK 左右目匹配质量。
-    cv::Mat left_raw, right_raw;
-    if (frame->image.channels() == 3)
-        cv::cvtColor(frame->image, left_raw, cv::COLOR_BGR2GRAY);
-    else
-        left_raw = frame->image;
-    if (frame->image_right.channels() == 3)
-        cv::cvtColor(frame->image_right, right_raw, cv::COLOR_BGR2GRAY);
-    else
-        right_raw = frame->image_right;
+    cv::Mat left_raw = left_gray_input;
+    cv::Mat right_raw = right_gray_input;
+    if (left_raw.empty()) {
+        if (frame->image.channels() == 3)
+            cv::cvtColor(frame->image, left_raw, cv::COLOR_BGR2GRAY);
+        else
+            left_raw = frame->image;
+    }
+    if (right_raw.empty()) {
+        if (frame->image_right.channels() == 3)
+            cv::cvtColor(frame->image_right, right_raw, cv::COLOR_BGR2GRAY);
+        else
+            right_raw = frame->image_right;
+    }
 
     std::vector<cv::Point2f> right_pts;
     auto status = matcher_.matchStereo(left_raw, right_raw, frame->keypoints, right_pts);
@@ -497,6 +509,7 @@ TrackingResult FrontendTracker::trackOrb(
     }
 
     // 收集 3D-2D 对应（保留 pts3d[i] 与 matches 的映射，供内点观测计数）
+    r.match_pairs = matches;
     std::vector<cv::Point3f> pts3d;
     std::vector<cv::Point2f> pts2d;
     std::vector<int> match_idx;

@@ -213,10 +213,12 @@ void test_mobile_config() {
         const auto config_path = std::filesystem::path(__FILE__).parent_path()
             .parent_path() / "config/mobile.yaml";
         const auto cfg = vslam::VOConfig::fromYaml(config_path.string());
-        assert(cfg.num_features == 800);
+        assert(cfg.num_features == 600);
         assert(cfg.pyramid_levels == 8);
-        assert(cfg.orb_max_bands == 2);
-        assert(cfg.opencv_threads == 2);
+        assert(cfg.orb_max_bands == 1);
+        assert(cfg.opencv_threads == 4);
+        assert(cfg.runtime_resources.max_cpu_cores == 4);
+        assert(cfg.runtime_resources.max_rss_mb == 6144);
         assert(cfg.async_backend);
         assert(cfg.local_window_size == 6);
         assert(cfg.local_ba_iterations == 4);

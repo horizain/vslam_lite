@@ -104,6 +104,7 @@ VOConfig deterministicConfig() {
     cfg.stereo_min_points = 40;
     cfg.opencv_threads = 1;     // OpenCV 单线程
     cfg.orb_max_bands = 1;      // 单带串行提取（特征提取确定性）
+    cfg.rng_seed = 0x5A17;       // 每个 VO 实例使用同一 RANSAC 随机序列
     return cfg;
 }
 
@@ -283,8 +284,10 @@ void test_valid_frames_and_equivalence() {
             renderStereoFrame(cam, blks, path[i], l_a, r_a);
             renderStereoFrame(cam, blks, path[i], l_b, r_b);
             const double t = 0.1 * i;
+            cv::setRNGSeed(0x5A17);
             const SE3 raw_pose = raw2.addFrame(l_a, r_a, t);       // T_cw
             const SE3 raw_Twc = raw_pose.inverse();                // T_wc
+            cv::setRNGSeed(0x5A17);
             const auto est = loc2.processFrame(l_b, r_b, t);       // T_bc 单位阵 → T_wb = T_wc
             const double trans_diff = (est.T_wb.t - raw_Twc.t).norm();
             const SE3 recomposed = est.T_wo * est.T_ob;
@@ -292,9 +295,8 @@ void test_valid_frames_and_equivalence() {
                 assert((recomposed.t - est.T_wb.t).norm() < 1e-9);
                 assert(recomposed.q.angularDistance(est.T_wb.q) < 1e-9);
             }
-            // 相对旋转角：T_wb · T_cw 应接近单位
-            const Eigen::Quaterniond rel = est.T_wb.q * raw_pose.q;
-            const double rot_rad = 2.0 * std::acos(std::min(1.0, std::abs(rel.w())));
+            // 直接比较两个 T_wc 的角距离，避免 q/-q 和 acos 近单位病态。
+            const double rot_rad = est.T_wb.q.angularDistance(raw_Twc.q);
             assert(trans_diff < 1e-12);
             assert(rot_rad < 1e-12);
         }

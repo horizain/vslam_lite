@@ -131,6 +131,7 @@ set(VSLAM_SOURCES
     src/frontend_tracker.cpp
     src/local_mapper.cpp
     src/resource_budget.cpp
+    src/runtime_resources.cpp
     src/metrics.cpp)
 
 set(VSLAM_HEADERS
@@ -143,6 +144,7 @@ set(VSLAM_HEADERS
     include/vslam/frontend_tracker.h
     include/vslam/local_mapper.h
     include/vslam/resource_budget.h
+    include/vslam/runtime_resources.h
     include/vslam/metrics.h
     include/vslam/bounded_queue.h
     include/vslam/sensor_packet.h
@@ -364,12 +366,17 @@ if(BUILD_TESTS)
     # 完整档（RSS 门限）与 2 小时档由 nightly 用 --full/--duration-h 执行）
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        set(VSLAM_TEST_DATASET "${CMAKE_SOURCE_DIR}/datasets/kitti/sequences/00")
+        if(NOT EXISTS "${VSLAM_TEST_DATASET}")
+            # 兼容仓库历史数据目录；不改变生产配置和评估路径。
+            set(VSLAM_TEST_DATASET "${CMAKE_SOURCE_DIR}/datasets/sequences/00")
+        endif()
         add_test(NAME test_benchmark_gate_logic
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/test_benchmark.py)
         add_test(NAME test_soak
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/soak_test.py
                          --bin $<TARGET_FILE:run_slam>
-                         --dataset ${CMAKE_SOURCE_DIR}/datasets/kitti/sequences/00
+                         --dataset ${VSLAM_TEST_DATASET}
                          --config ${CMAKE_SOURCE_DIR}/config/default.yaml
                          --robot-yaml ${CMAKE_SOURCE_DIR}/config/robot.yaml
                          --frames 200 --rounds 2)

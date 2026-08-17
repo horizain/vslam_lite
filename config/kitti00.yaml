@@ -59,6 +59,8 @@ VO:
 Optimizer:
   local_window_size: 12    # 共视窗口略增大, 提升局部 BA 的约束数量
   local_ba_iterations: 10
+  local_ba_passes: 1
+  local_ba_max_points: 2000
   local_ba_max_correction: 1.0 # 通用局部优化安全门，不依赖序列/帧号/GT
   enable_local_ba: true
   global_ba_iterations: 0   # M4 暂关：sampled-GBA 与锚定轨迹锯齿不兼容，M6 COW 后恢复（原 20）
@@ -89,8 +91,18 @@ LoopClosure:
 
 # ---- 运行时 ----
 Runtime:
-  opencv_threads: 0
+  opencv_threads: 6
   async_backend: true   # M6：Committer 追加 rebase 协议后默认开启
+  max_cpu_cores: 6
+  max_rss_mb: 12288
+  backend_reserved_cores: 1
+  enforce_cpu_affinity: true
+  pin_backend_worker: true
+  max_backend_task_age_ms: 500
+  reuse_keyframe_matches: true
+  stereo_reverse_prune: true
+  use_raw_stereo_gray: true
+  copy_gray_before_clahe: true
 
 # ---- 可视化 ----
 Viewer:

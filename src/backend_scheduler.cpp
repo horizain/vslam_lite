@@ -1,4 +1,5 @@
 #include "vslam/backend_scheduler.h"
+#include "vslam/runtime_resources.h"
 
 #include <chrono>
 #include <utility>
@@ -21,6 +22,7 @@ void BackendScheduler::start() {
 void BackendScheduler::submit(BackendTask task) {
     const bool accepted = [&] {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_.load()) return false;
         if (task.type == BackendTask::Type::LoopClosure) {
             // LoopClosure 优先：覆盖任何等待任务（含 Local BA）——被覆盖任务计丢弃
             if (slot_.has_value()) dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -77,6 +79,10 @@ BackendSchedulerStats BackendScheduler::stats() const {
     s.task_age_max_ms = task_age_max_ms_.load(std::memory_order_relaxed);
     s.task_age_total_ms = task_age_total_ms_.load(std::memory_order_relaxed);
     s.age_samples = age_samples_.load(std::memory_order_relaxed);
+    s.expired = expired_.load(std::memory_order_relaxed);
+    s.task_service_max_ms = task_service_max_ms_.load(std::memory_order_relaxed);
+    s.task_service_total_ms = task_service_total_ms_.load(std::memory_order_relaxed);
+    s.service_samples = service_samples_.load(std::memory_order_relaxed);
     s.committed = committed_.load(std::memory_order_relaxed);
     s.stale = stale_.load(std::memory_order_relaxed);
     s.invalid = invalid_.load(std::memory_order_relaxed);
@@ -94,8 +100,12 @@ void BackendScheduler::recordTaskOutcome(TaskOutcome outcome) {
 }
 
 void BackendScheduler::loop() {
+    if (worker_cpu_ordinal_ != static_cast<size_t>(-1))
+        (void)RuntimeResources::pinCurrentThread(worker_cpu_ordinal_);
+
     while (true) {
         BackendTask task;
+        double age_ms = 0.0;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [&] { return stop_.load() || slot_.has_value(); });
@@ -103,16 +113,38 @@ void BackendScheduler::loop() {
             task = std::move(*slot_);
             slot_.reset();
             // §6.4（M2.3）：任务等待年龄（入队 → 开始执行）
-            const double age_ms = std::chrono::duration<double, std::milli>(
+            age_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - slot_enqueued_at_).count();
             double max_age = task_age_max_ms_.load(std::memory_order_relaxed);
             while (age_ms > max_age &&
                    !task_age_max_ms_.compare_exchange_weak(max_age, age_ms)) {}
             task_age_total_ms_.fetch_add(age_ms, std::memory_order_relaxed);
             age_samples_.fetch_add(1, std::memory_order_relaxed);
-            executed_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (handler_) handler_(task);
+        if (max_task_age_ms_ > 0.0 && age_ms > max_task_age_ms_) {
+            expired_.fetch_add(1, std::memory_order_relaxed);
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        executed_.fetch_add(1, std::memory_order_relaxed);
+        const auto service_start = std::chrono::steady_clock::now();
+        try {
+            if (handler_) handler_(task);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Backend task failed with exception: " << e.what());
+            invalid_.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+            LOG_ERROR("Backend task failed with unknown exception");
+            invalid_.fetch_add(1, std::memory_order_relaxed);
+        }
+        const double service_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - service_start).count();
+        double max_service = task_service_max_ms_.load(std::memory_order_relaxed);
+        while (service_ms > max_service &&
+               !task_service_max_ms_.compare_exchange_weak(
+                   max_service, service_ms, std::memory_order_relaxed)) {}
+        task_service_total_ms_.fetch_add(service_ms, std::memory_order_relaxed);
+        service_samples_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

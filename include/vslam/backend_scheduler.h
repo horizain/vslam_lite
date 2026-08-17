@@ -46,6 +46,10 @@ struct BackendSchedulerStats {
     double task_age_max_ms = 0.0; ///< 任务入队→开始执行的最大等待时长
     double task_age_total_ms = 0.0;
     long long age_samples = 0;
+    long long expired = 0;         ///< 超过最大排队年龄而未执行的任务
+    double task_service_max_ms = 0.0;
+    double task_service_total_ms = 0.0;
+    long long service_samples = 0;
     // ---- §6.4 backend committed/stale/invalid（M2.3 遗留清理：提交结果）----
     long long committed = 0;      ///< 提交成功并原子写回数
     long long stale = 0;          ///< 过期丢弃数（stale 检查不过）
@@ -54,6 +58,11 @@ struct BackendSchedulerStats {
 
     [[nodiscard]] double taskAgeAvgMs() const {
         return age_samples > 0 ? task_age_total_ms / static_cast<double>(age_samples) : 0.0;
+    }
+
+    [[nodiscard]] double taskServiceAvgMs() const {
+        return service_samples > 0
+            ? task_service_total_ms / static_cast<double>(service_samples) : 0.0;
     }
 };
 
@@ -85,6 +94,12 @@ public:
 
     /// 提交任务到覆盖式单任务槽。永不阻塞（槽满或按优先级丢弃）。
     void submit(BackendTask task);
+
+    /// 设置任务最大排队年龄；<=0 表示不启用年龄淘汰。
+    void setMaxTaskAgeMs(double max_age_ms) { max_task_age_ms_ = max_age_ms; }
+
+    /// 设置 worker 固定 CPU 槽位；必须在 start() 前调用。
+    void setWorkerCpuOrdinal(size_t ordinal) { worker_cpu_ordinal_ = ordinal; }
 
     /// 停止：设置标志 → notify → join 已启动的线程。可安全重复调用；
     /// 停止前仍在槽中的任务会被排空执行（与原 backendLoop 一致）。
@@ -119,6 +134,8 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> running_{false};
+    double max_task_age_ms_ = 0.0;
+    size_t worker_cpu_ordinal_ = static_cast<size_t>(-1);
 
     // ---- §6.4 调度统计（M2.3）----
     std::atomic<long long> submitted_{0};
@@ -127,6 +144,10 @@ private:
     std::atomic<double> task_age_max_ms_{0.0};
     std::atomic<double> task_age_total_ms_{0.0};
     std::atomic<long long> age_samples_{0};
+    std::atomic<long long> expired_{0};
+    std::atomic<double> task_service_max_ms_{0.0};
+    std::atomic<double> task_service_total_ms_{0.0};
+    std::atomic<long long> service_samples_{0};
     // ---- §6.4 提交结果（M2.3 遗留清理）----
     std::atomic<long long> committed_{0};
     std::atomic<long long> stale_{0};

@@ -29,8 +29,13 @@ def load_tum(path):
                 continue
             parts = line.split()
             if len(parts) != 8:
-                continue
-            rows.append(tuple(float(p) for p in parts))
+                raise ValueError(f"轨迹行字段数错误: {path}: {line}")
+            row = tuple(float(p) for p in parts)
+            if not all(math.isfinite(value) for value in row):
+                raise ValueError(f"轨迹含 NaN/Inf: {path}")
+            if math.sqrt(sum(value * value for value in row[4:8])) <= 1e-12:
+                raise ValueError(f"轨迹四元数为零: {path}")
+            rows.append(row)
     return rows
 
 
@@ -40,8 +45,10 @@ def quat_diff_angle(qa, qb):
     相对旋转 q_rel = qa⁻¹ ⊗ qb，用 angle = 2·atan2(‖v_rel‖, |w_rel|) 计算——
     对相同的四元数精确给出 0，避免 acos 在夹角≈0 时的病态放大小角误差。
     """
-    xa, ya, za, wa = qa
-    xb, yb, zb, wb = qb
+    na = math.sqrt(sum(value * value for value in qa))
+    nb = math.sqrt(sum(value * value for value in qb))
+    xa, ya, za, wa = (value / na for value in qa)
+    xb, yb, zb, wb = (value / nb for value in qb)
     w = wa * wb + xa * xb + ya * yb + za * zb
     x = wa * xb - xa * wb - ya * zb + za * yb
     y = wa * yb + xa * zb - ya * wb - za * xb
@@ -60,6 +67,9 @@ def compare_traj(a, b, tol_trans, tol_rot):
     max_t = 0.0
     max_r = 0.0
     for i, (ra, rb) in enumerate(zip(a, b)):
+        if abs(ra[0] - rb[0]) > 1e-12:
+            print(f"[FAIL] 帧 {i}: 时间戳不一致 {ra[0]:.17g} vs {rb[0]:.17g}")
+            ok = False
         ta = ra[1:4]
         tb = rb[1:4]
         dt = math.sqrt(sum((ta[j] - tb[j]) ** 2 for j in range(3)))

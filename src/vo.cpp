@@ -39,6 +39,7 @@ TrackerConfig buildTrackerConfig(const VOConfig& cfg) {
     tc.scale_factor = cfg.scale_factor;
     tc.pyramid_levels = cfg.pyramid_levels;
     tc.orb_max_bands = cfg.orb_max_bands;
+    tc.stereo_reverse_prune = cfg.stereo_reverse_prune;
     tc.match_ratio = cfg.match_ratio;
     tc.ransac_pixel_threshold = cfg.ransac_pixel_threshold;
     tc.min_matches_track = cfg.min_matches_track;
@@ -277,6 +278,30 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (r["opencv_threads"]) cfg.opencv_threads = r["opencv_threads"].as<int>();
             if (r["async_backend"])  cfg.async_backend  = r["async_backend"].as<bool>();
             if (r["rng_seed"])       cfg.rng_seed       = r["rng_seed"].as<int>();
+            if (r["max_cpu_cores"])
+                cfg.runtime_resources.max_cpu_cores = r["max_cpu_cores"].as<size_t>();
+            if (r["max_rss_mb"])
+                cfg.runtime_resources.max_rss_mb = r["max_rss_mb"].as<size_t>();
+            if (r["backend_reserved_cores"])
+                cfg.runtime_resources.backend_reserved_cores =
+                    r["backend_reserved_cores"].as<size_t>();
+            if (r["enforce_cpu_affinity"])
+                cfg.runtime_resources.enforce_cpu_affinity =
+                    r["enforce_cpu_affinity"].as<bool>();
+            if (r["pin_backend_worker"])
+                cfg.runtime_resources.pin_backend_worker =
+                    r["pin_backend_worker"].as<bool>();
+            if (r["max_backend_task_age_ms"])
+                cfg.max_backend_task_age_ms =
+                    r["max_backend_task_age_ms"].as<int>();
+            if (r["reuse_keyframe_matches"])
+                cfg.reuse_keyframe_matches = r["reuse_keyframe_matches"].as<bool>();
+            if (r["stereo_reverse_prune"])
+                cfg.stereo_reverse_prune = r["stereo_reverse_prune"].as<bool>();
+            if (r["use_raw_stereo_gray"])
+                cfg.use_raw_stereo_gray = r["use_raw_stereo_gray"].as<bool>();
+            if (r["copy_gray_before_clahe"])
+                cfg.copy_gray_before_clahe = r["copy_gray_before_clahe"].as<bool>();
         }
         // M2.2 遗留清理：§6.2 MapBudget 段（首版参数；缺省保持默认值）
         if (auto b = root["MapBudget"]) {
@@ -318,6 +343,9 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
         if (auto o = root["Optimizer"]) {
             if (o["local_window_size"])   cfg.local_window_size   = o["local_window_size"].as<int>();
             if (o["local_ba_iterations"]) cfg.local_ba_iterations = o["local_ba_iterations"].as<int>();
+            if (o["local_ba_passes"]) cfg.local_ba_passes = o["local_ba_passes"].as<int>();
+            if (o["local_ba_max_points"])
+                cfg.local_ba_max_points = o["local_ba_max_points"].as<size_t>();
             if (o["local_ba_max_correction"])
                 cfg.local_ba_max_correction = o["local_ba_max_correction"].as<double>();
             if (o["enable_local_ba"])     cfg.enable_local_ba     = o["enable_local_ba"].as<bool>();
@@ -394,15 +422,26 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
     cfg_.loop_region.ransac_pixel_threshold = cfg_.ransac_pixel_threshold;
     cfg_.loop_region.temporal_window = static_cast<size_t>(
         std::max(1, cfg_.temporal_window));
+    const bool affinity_ok = RuntimeResources::configure(
+        cfg_.runtime_resources, cfg_.opencv_threads, cfg_.async_backend);
+    if (cfg_.runtime_resources.enforce_cpu_affinity && !affinity_ok) {
+        LOG_WARN("Runtime CPU affinity could not be narrowed; continuing with OpenCV limit");
+    }
+    backend_scheduler_.setMaxTaskAgeMs(
+        static_cast<double>(cfg_.max_backend_task_age_ms));
+    if (cfg_.async_backend && cfg_.runtime_resources.pin_backend_worker) {
+        const size_t cpus = RuntimeResources::allowedCpuCount();
+        if (cpus > 1) backend_scheduler_.setWorkerCpuOrdinal(cpus - 1);
+    }
     map_ = atlas_->createSubmap(SE3()).map;
     if (cfg_.opencv_threads > 0) {
-        cv::setNumThreads(cfg_.opencv_threads);
         LOG_INFO("OpenCV threads limited to " << cv::getNumThreads());
     }
     // M1 确定性：固定全局 RNG（solvePnPRansac 等内部 RNG），配 deterministic.yaml
     if (cfg_.rng_seed != 0) cv::setRNGSeed((unsigned)cfg_.rng_seed);
     feature_matcher_.setParams(cfg_.num_features, cfg_.scale_factor,
-                               cfg_.pyramid_levels, cfg_.orb_max_bands);
+                               cfg_.pyramid_levels, cfg_.orb_max_bands,
+                               cfg_.stereo_reverse_prune);
     if (cfg_.feature_method != 0) {
         LOG_INFO("feature_method=" << cfg_.feature_method << " (LK 光流)");
     }
@@ -417,6 +456,12 @@ VisualOdometry::VisualOdometry(const Camera& camera, const VOConfig& cfg)
 
 VisualOdometry::~VisualOdometry() {
     if (cfg_.async_backend) backend_scheduler_.stop();
+}
+
+BudgetStatus VisualOdometry::mapBudgetStatus() const {
+    std::shared_lock<std::shared_mutex> lock(map_mutex_);
+    return map_budget_.evaluate(
+        map_, static_cast<size_t>(std::max<long long>(0, mapSnapshotBytes())));
 }
 
 bool VisualOdometry::enableLoopClosure(const std::string& vocab_path) {
@@ -474,7 +519,8 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     Frame::Ptr old_current = curr_frame_;
     if (old_current) old_current->releaseImages(old_current == prev_frame_);
 
-    // 1. 创建当前帧 + CLAHE 增强
+    // 1. 创建当前帧 + CLAHE 增强。原始灰度同时供双目 LK 使用，避免
+    // 在 computeStereoDepths() 中对同一左右图再次做 BGR→灰度转换。
     curr_frame_ = std::make_shared<Frame>(frame_id, timestamp);
     status_.tracking_valid = false;
     status_.pose_valid = false;
@@ -486,10 +532,14 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     status_.pose_rmse = 0.0;
     status_.translation_delta = 0.0;
     status_.rotation_delta = 0.0;
+    cv::Mat left_gray_raw;
+    cv::Mat right_gray_raw;
     if (left_input.channels() == 3)
-        cv::cvtColor(left_input, curr_frame_->image_gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(left_input, left_gray_raw, cv::COLOR_BGR2GRAY);
     else
-        curr_frame_->image_gray = left_input;
+        left_gray_raw = left_input;
+    curr_frame_->image_gray = cfg_.copy_gray_before_clahe
+        ? left_gray_raw.clone() : left_gray_raw;
     curr_frame_->image = left_input;
 
     static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
@@ -499,9 +549,11 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     if (!right_input.empty()) {
         curr_frame_->image_right = right_input;
         if (right_input.channels() == 3)
-            cv::cvtColor(right_input, curr_frame_->image_right_gray, cv::COLOR_BGR2GRAY);
+            cv::cvtColor(right_input, right_gray_raw, cv::COLOR_BGR2GRAY);
         else
-            curr_frame_->image_right_gray = right_input;
+            right_gray_raw = right_input;
+        curr_frame_->image_right_gray = cfg_.copy_gray_before_clahe
+            ? right_gray_raw.clone() : right_gray_raw;
         clahe->apply(curr_frame_->image_right_gray, curr_frame_->image_right_gray);
     }
 
@@ -555,7 +607,10 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     // 2.5 双目/RGB-D：视差（或深度）→ 每特征点的相机系 3D 观测 pts_c
     {
         PERF_SCOPE("vo.stereo_depth");
-        computeStereoDepths();
+        if (right_input.empty() || !cfg_.use_raw_stereo_gray)
+            computeStereoDepths();
+        else
+            computeStereoDepths(left_gray_raw, right_gray_raw);
     }
 
     // 2.6 M2：每帧捕获一次只读快照（版本 + 参考帧位姿/点坐标拷贝）。
@@ -739,10 +794,14 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
 // ============================================================
 // 双目/RGB-D 深度计算：视差（或深度）→ pts_c
 // ============================================================
-void VisualOdometry::computeStereoDepths() {
+void VisualOdometry::computeStereoDepths(const cv::Mat& left_gray,
+                                         const cv::Mat& right_gray) {
     // M1.4：深度计算与统计迁移至 FrontendTracker（frontend_tracker.cpp），
     // 公式与默认值保持不变；这里只应用返回的深度统计到 status_。
-    const StereoStats stats = frontend_tracker_.computeStereoDepths(curr_frame_);
+    const StereoStats stats = left_gray.empty() || right_gray.empty()
+        ? frontend_tracker_.computeStereoDepths(curr_frame_)
+        : frontend_tracker_.computeStereoDepths(
+              curr_frame_, left_gray, right_gray);
     status_.stereo_points = stats.stereo_points;
     status_.median_disparity = stats.median_disparity;
     status_.median_depth = stats.median_depth;
@@ -1209,6 +1268,9 @@ SE3 VisualOdometry::trackFrame() {
                              status_.median_depth};
     TrackingResult r = frontend_tracker_.trackOrb(
         curr_frame_, ref_frame_, ref, normalMotionBaseline(), stereo);
+    last_tracking_matches_ = r.match_pairs;
+    last_tracking_ref_id_ = ref_frame_->id;
+    last_tracking_curr_id_ = curr_frame_->id;
 
     // ---- 方案 B：局部地图投影补匹配 + 精修位姿 ----
     // 首轮 PnP 成功后，把参考 KF 共视的地图点投影进当前帧补充 3D-2D 对应，
@@ -1717,8 +1779,18 @@ bool VisualOdometry::insertKeyFrame() {
         {
             PERF_SCOPE("kf.build_points");
             createMapPointsFromStereo(curr_frame_);
-            triangulateNewPoints(ref_frame_, curr_frame_,
-                feature_matcher_.match(ref_frame_, curr_frame_, cfg_.match_ratio, true));
+            std::vector<cv::DMatch> keyframe_matches;
+            if (cfg_.reuse_keyframe_matches && cfg_.feature_method == 0 &&
+                last_tracking_ref_id_ == prev_kf->id &&
+                last_tracking_curr_id_ == curr_frame_->id) {
+                keyframe_matches = feature_matcher_.filterFundamental(
+                    prev_kf, curr_frame_, last_tracking_matches_,
+                    cfg_.ransac_pixel_threshold);
+            } else {
+                keyframe_matches = feature_matcher_.match(
+                    prev_kf, curr_frame_, cfg_.match_ratio, true);
+            }
+            triangulateNewPoints(ref_frame_, curr_frame_, keyframe_matches);
         }
 
         // Local BA 和新点关联完成后冻结相邻 KF 测量；后续位姿图不得从已优化
@@ -1900,8 +1972,16 @@ bool VisualOdometry::handleLoopCorrection(
     // map 锁重入，且验证使用的 KF/地图点状态与下方全图快照完全一致。
     SE3 T_loop_curr;
     double verified_reference_time = live_loop->timestamp;
-    bool loop_verified = loop_closure_ && loop_closure_->verifyLoop(
-        live_curr, live_loop, T_loop_curr);
+    bool loop_verified = false;
+    if (context.preverified &&
+        context.preverified_geometry_revision == context.map->geometryRevision()) {
+        T_loop_curr = context.preverified_T_loop_curr;
+        verified_reference_time = context.preverified_reference_time;
+        loop_verified = true;
+    } else if (loop_closure_) {
+        loop_verified = loop_closure_->verifyLoop(
+            live_curr, live_loop, T_loop_curr);
+    }
     if (!loop_verified) {
         // 单个历史 KF 可能因点回收/视角变化而稀疏；只在原验证失败后，
         // 从同一历史 Map 构造有界共视+时间邻域。区域 PnP 复用同一几何门，
@@ -2495,7 +2575,11 @@ void VisualOdometry::runWindowLocalBA(
     // 跳过提交任务捕获的 anchor KF（通常是前端 ref_frame_；§3.16/§M0：
     // 后端写回其位姿会被前端误判为跳变 → LOST 带）。
     const std::unordered_set<unsigned long> skip{anchor_kf_id};
-    auto result = Optimizer::solveLocalBA(camera_, snap, cfg_.local_ba_iterations);
+    const size_t ba_max_points = cfg_.local_ba_max_points > 0
+        ? cfg_.local_ba_max_points : 4000;
+    auto result = Optimizer::solveLocalBA(
+        camera_, snap, cfg_.local_ba_iterations, std::nullopt,
+        ba_max_points, cfg_.local_ba_passes);
     if (!result.valid) return;
     // INVALID 直接丢弃；STALE 由覆盖式队列里的更新任务自然追赶。
     // 对同一有效图重算不会改变质量验收结果，只会把 BA 成本翻倍。
@@ -2511,7 +2595,8 @@ OptimizationSnapshot VisualOdometry::buildLocalBASnapshot(
     // M1.5：快照构造迁移至 LocalMapper::buildLocalBASnapshot
     //（local_mapper.cpp，min_observed 门槛 + anchor 连通分量裁剪不变）。
     return local_mapper_.buildLocalBASnapshot(
-        map_, atlas_, window, anchor_kf_id, min_observed);
+        map_, atlas_, window, anchor_kf_id, min_observed,
+        cfg_.local_ba_max_points);
 }
 
 CommitStatus VisualOdometry::applyLocalBAResult(
@@ -2612,6 +2697,12 @@ void VisualOdometry::enforceMapBudget() {
     // M2.2 遗留清理（§6.3）：预算触发点。调用方（insertKeyFrame）已持
     // map_mutex_ 独占锁；evaluate 只读零副作用（预算内确定性不变）。
     // 恢复（解除 stopped）只在 needNewKeyFrame 的完整评估通过时发生。
+    if (!RuntimeResources::withinRssBudget(cfg_.runtime_resources.max_rss_mb)) {
+        map_growth_stopped_ = true;
+        LOG_WARN("Runtime RSS budget exceeded; map growth stopped (limit="
+                 << cfg_.runtime_resources.max_rss_mb << "MiB)");
+        return;
+    }
     const BudgetStatus before = map_budget_.evaluate(map_);
     if (before.within_budget) {
         // 点数恰好达到硬配额并不表示建图停止：下一次 KF 插入会先滚动
@@ -2646,7 +2737,9 @@ void VisualOdometry::enforceMapBudget() {
     }
 
     const BudgetReclaimResult r = map_budget_.reclaim(
-        map_, protected_ids, submap_keyframes, 0, inactive_submaps,
+        map_, protected_ids, submap_keyframes,
+        static_cast<size_t>(std::max<long long>(0, mapSnapshotBytes())),
+        inactive_submaps,
         [this](const Frame::Ptr& removed, const Frame::Ptr& replacement) {
             if (!removed || !replacement) return;
             std::lock_guard<std::mutex> traj_lock(traj_mutex_);
@@ -2769,8 +2862,14 @@ void VisualOdometry::runBackendLocalBA(const BackendTask& task) {
             if (mp) bytes += ResourceBudget::matBytes(mp->descriptor);
     }
     map_snapshot_bytes_ = static_cast<long long>(bytes);
-    runWindowLocalBA(task.window, task.anchor_kf_id,
-                     task.map, task.submap_id);
+    try {
+        runWindowLocalBA(task.window, task.anchor_kf_id,
+                         task.map, task.submap_id);
+    } catch (...) {
+        map_snapshot_bytes_ = 0;
+        throw;
+    }
+    map_snapshot_bytes_ = 0;
 }
 
 void VisualOdometry::runBackendLoopClosure(const Frame::Ptr& curr_kf) {
@@ -2866,6 +2965,11 @@ void VisualOdometry::runBackendLoopClosure(const Frame::Ptr& curr_kf) {
                 preverified_measurement);
         }
         if (!preverified) continue;
+        context.preverified = true;
+        context.preverified_T_loop_curr = preverified_measurement;
+        context.preverified_geometry_revision = current_context.geometry_revision;
+        context.preverified_reference_time = cand.frame
+            ? cand.frame->timestamp : 0.0;
         // 校正（内部三阶段：收集/计算/写回，自行管理锁）
         if (handleLoopCorrection(context)) break;
     }
@@ -2907,6 +3011,11 @@ bool VisualOdometry::needNewKeyFrame() {
     input.map_keyframe_count = map_->keyFrameCount();
     const auto proposal = frontend_tracker_.proposeKeyFrame(input);
     if (!proposal.need) return false;
+
+    if (!RuntimeResources::withinRssBudget(cfg_.runtime_resources.max_rss_mb)) {
+        map_growth_stopped_ = true;
+        return false;
+    }
 
     // M2.2：预算检查必须与地图读锁绑定。MapBudget::evaluate 会遍历
     // keyframe/map-point 容器，不能在无锁的前端提议路径读取。

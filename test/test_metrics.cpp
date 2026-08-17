@@ -242,14 +242,17 @@ void test_json_output() {
                                 "pnp_inliers_avg", "pnp_inlier_ratio_avg", "pnp_rmse_avg",
                                 "pose_accepted", "pose_rejected", "pose_prediction_only",
                                 "failure_reasons", "backend_submitted", "backend_executed",
-                                "backend_dropped", "backend_pending",
-                                "backend_task_age_max_ms", "backend_task_age_avg_ms",
+                                 "backend_dropped", "backend_pending",
+                                 "backend_task_age_max_ms", "backend_task_age_avg_ms",
+                                 "backend_expired", "backend_service_max_ms",
+                                 "backend_service_avg_ms",
                                 "backend_committed", "backend_stale", "backend_invalid",
                                 "backend_not_found",
                                 "loop_committed", "map_keyframes", "map_points",
                                 "map_observations", "map_descriptor_bytes",
-                                "map_image_bytes", "map_snapshot_bytes",
-                                "map_estimated_total_bytes", "lost_count",
+                                 "map_image_bytes", "map_snapshot_bytes",
+                                 "map_estimated_total_bytes", "process_rss_bytes",
+                                 "process_thread_count", "allowed_cpu_count", "lost_count",
                                 "lost_duration_s", "relocalization_latency_p95_ms"}) {
             assert(json.find(key) != std::string::npos);
         }

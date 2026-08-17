@@ -117,7 +117,8 @@ OptimizationResult Optimizer::solveLocalBA(
     const OptimizationSnapshot& snap,
     int max_iterations,
     std::optional<bool> fix_points,
-    size_t max_points) {
+    size_t max_points,
+    int max_passes) {
 
     OptimizationResult result;
     result.submap_id = snap.submap_id;
@@ -340,10 +341,13 @@ OptimizationResult Optimizer::solveLocalBA(
     // ========================================================
     // 6. 执行优化
     // ========================================================
-    optimizer.initializeOptimization();
-    optimizer.optimize(max_iterations);
-    optimizer.initializeOptimization();
-    optimizer.optimize(max_iterations);
+    const int iterations = std::clamp(max_iterations, 1, 30);
+    const int passes = std::clamp(max_passes, 1, 2);
+    for (int pass = 0; pass < passes; ++pass) {
+        optimizer.initializeOptimization();
+        optimizer.optimize(iterations);
+    }
+    result.metrics.iterations = iterations * passes;
 
     // ========================================================
     // 7. 收集候选增量（不修改任何实时对象）

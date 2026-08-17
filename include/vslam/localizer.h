@@ -32,6 +32,9 @@ struct LocalizerConfig {
     // ---- M2.3 结构化指标（§6.4）----
     bool enable_metrics = true;        ///< 内部 MetricsCollector 采集开关
     long long tracking_deadline_ms = 80;  ///< 单帧跟踪硬期限（§6.2：10 Hz 平台 80 ms）
+    long long max_backend_task_age_ms = 500; ///< 后台任务最大排队年龄
+    long long shutdown_timeout_ms = 2000;    ///< 关闭路径诊断期限
+    MapBudgetConfig map_budget;         ///< Robot.MapBudget 覆盖 VO 活动地图预算
 
     /// 从 robot.yaml 的 Robot 段加载（缺省字段保持默认值；T_bc 不做静默归一化，
     /// 非单位四元数由 Localizer 构造时按 §4.3 拒绝）
