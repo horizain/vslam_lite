@@ -21,7 +21,7 @@ Benchmark:
   window_frames: 0        # 0 = 全程；>0 = 只跑前 N 帧（提交门快速档用）
   expected_frames: 4541   # KITTI 00 完整输入帧数；切片时由 --window 覆盖
   deadline_ms: 100        # 10Hz 地面机器人单帧延迟门限
-  measure_rss: false      # true = 用 /usr/bin/time -v 测 RSS 峰值（仅 Linux）
+  measure_rss: true       # 提交门强制测 RSS 峰值（仅 Linux）
 
 # ---- 发布门限（worst 一轮断言；min=越高越好 / max=越低越好）----
 # ate_* 需提供 gt 才生效；无 GT 时自动 skip。
@@ -34,3 +34,4 @@ Gates:
   deadline_miss_ratio: { max: 0.01 }   # §6.5：deadline miss <1%
   ate_rmse:           { max: 40.0 }    # §7.6 M3 阶段门：ATE worst ≤40m
   ate_std:            { max: 8.0 }     # §7.6：ATE std ≤8m
+  rss_kb:             { max: 12582912 } # default.yaml Runtime.max_rss_mb=12288

@@ -38,6 +38,11 @@ set(CMAKE_CXX_FLAGS_DEBUG   "-O0 -g -DDEBUG")
 find_package(OpenCV REQUIRED COMPONENTS
     core imgproc features2d calib3d highgui videoio imgcodecs video)
 
+# OpenCV on this platform uses oneTBB. Link its public global_control API so the
+# runtime resource contract limits the same pool instead of only changing the
+# OpenCV advisory thread count.
+find_library(VSLAM_TBB_LIBRARY NAMES tbb)
+
 # --- Eigen3 (必需) ---
 find_package(Eigen3 REQUIRED)
 
@@ -181,6 +186,9 @@ target_link_libraries(vslam
         Eigen3::Eigen
         ${VSLAM_PANGOLIN_LIBS}
         yaml-cpp)
+if(VSLAM_TBB_LIBRARY)
+    target_link_libraries(vslam PUBLIC ${VSLAM_TBB_LIBRARY})
+endif()
 
 # g2o 的 add_library 目标名不带前缀（core/stuff/...），
 # 这里统一建别名 g2o::* 便于链接与维护。
@@ -343,6 +351,14 @@ if(BUILD_TESTS)
         target_compile_options(test_resource_budget PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_resource_budget COMMAND test_resource_budget)
+
+    # 进程 CPU affinity/OpenCV/TBB 资源契约（独立 CTest）
+    add_executable(test_runtime_resources test/test_runtime_resources.cpp)
+    target_link_libraries(test_runtime_resources vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_runtime_resources PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_runtime_resources COMMAND test_runtime_resources)
 
     # M2.3 结构化指标（独立 CTest）
     add_executable(test_metrics test/test_metrics.cpp)

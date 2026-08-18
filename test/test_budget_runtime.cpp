@@ -143,8 +143,8 @@ void test_yaml_runtime_resource_parsing() {
         assert(mobile.runtime_resources.max_cpu_cores == 4);
         assert(mobile.runtime_resources.max_rss_mb == 6144);
         assert(mobile.runtime_resources.enforce_cpu_affinity);
-        assert(mobile.num_features == 600);
-        assert(mobile.orb_max_bands == 1);
+        assert(mobile.num_features == 800);
+        assert(mobile.orb_max_bands == 2);
     } TEST_PASS();
 }
 

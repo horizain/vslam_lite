@@ -18,15 +18,15 @@ Camera:
   k3: 0.0
 
 Feature:
-  num_features: 600
+  num_features: 800
   scale_factor: 1.2
   pyramid_levels: 8
-  orb_max_bands: 1         # 禁止外层 ORB 分带与 OpenCV 线程池嵌套
+  orb_max_bands: 2         # 两带提取；总 CPU affinity 仍硬限 4 核
   match_ratio: 0.7
   ransac_threshold: 3.0
 
 Runtime:
-  opencv_threads: 4        # 异步 backend 预留 1 核，实际 OpenCV 上限为 3
+  opencv_threads: 2        # ARM/轻量档控制热功耗和线程迁移
   async_backend: true      # PGO 在前缀快照上锁外求解，前端不等待
   max_cpu_cores: 4         # 进程 CPU affinity 硬上限
   max_rss_mb: 6144         # 进程 RSS 预算（6 GiB）
@@ -40,7 +40,7 @@ Runtime:
   copy_gray_before_clahe: true
 
 VO:
-  method: 1                 # 普通帧 LK 光流，关键帧重建 ORB 描述子
+  method: 0                 # ORB 路径；LK 保留为经场景验证后的实验开关
   min_parallax: 0.025      # 单目初始化最小三角化角（弧度，约1.4°）；低资源噪声下略保守
   min_init_inliers: 20
   min_matches_init: 100
@@ -68,7 +68,7 @@ Optimizer:
   local_window_size: 6
   local_ba_iterations: 4
   local_ba_passes: 1
-  local_ba_max_points: 800
+  local_ba_max_points: 4000
   local_ba_max_correction: 1.0
   enable_local_ba: true
   global_ba_iterations: 0   # M4 暂关：sampled-GBA 与锚定轨迹不兼容
@@ -106,6 +106,7 @@ LoopClosure:
   loop_cooldown_kfs: 60  # 回环校正冷却（关键帧数）：挡同区域重复命中
   top_candidates: 20
   mature_verification_limit: 4  # 仅 mobile：最多 4 个成熟 BoW 地点 + 1 个位置先验
+  verification_limit: 5
   position_prior_dist: 25.0
   position_prior_gap: 100
   region_max_keyframes: 8

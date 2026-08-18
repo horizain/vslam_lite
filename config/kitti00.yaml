@@ -84,6 +84,7 @@ LoopClosure:
   top_candidates: 20          # 与 default 一致，不按 sequence 特化
   position_prior_dist: 40.0   # 位置先验距离阈值(m)
   position_prior_gap: 100     # 位置先验最小关键帧间隔
+  verification_limit: 12      # 高精度实验档保持完整地点验证预算
   region_max_keyframes: 12    # 与 default 一致，不使用 sequence/帧号特化
   region_max_points: 800
   region_max_covisible: 4

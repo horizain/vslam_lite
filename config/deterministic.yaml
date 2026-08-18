@@ -103,6 +103,7 @@ LoopClosure:
   top_candidates: 20
   position_prior_dist: 40.0
   position_prior_gap: 100
+  verification_limit: 12
   region_max_keyframes: 12
   region_max_points: 800
   region_max_covisible: 4

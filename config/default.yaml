@@ -102,12 +102,13 @@ MapBudget:
 # ---- 回环检测 (Phase 2) ----
 LoopClosure:
   enable_loop_closure: true   # run_slam 默认开；run_vo 入口强制关闭（A/B 对比）
-  retrieval_backend: "flat_dbow3" # 有界连续词表载荷，避免官方数据库无限增长
-  compact_max_keyframes: 512
+  retrieval_backend: "dbow3"       # 12 GiB 默认档保留官方检索召回
+  mature_verification_limit: 4      # 成熟地点级联；几何接受门不变
+  verification_limit: 4             # 单次查询最多验证 4 个地点
   vocab_path: "config/ORBvoc.dbow3"  # 词袋词典（scripts/fetch_vocab.sh 获取）
   min_score: 0.1              # 词袋候选最低分（0.3 召回过低；0.1 + PnP 验证兜底）
   temporal_window: 30         # 跳过最近 N 个关键帧（时间过滤，刚走过的路不算回环）
-  detection_interval: 5       # 覆盖短重访区间；移动端可按计算预算使用 10
+  detection_interval: 10      # 默认实时档；高精度实验档使用 5
   pnp_inlier_ratio: 0.70      # 通用 RANSAC 内点比门；同时保留 50 内点/3px 双门
   min_loop_inliers: 50        # 几何验证最小内点数（提高，过滤弱验证）
   pnp_max_rmse: 2.5           # 内点重投影 RMSE 硬门

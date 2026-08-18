@@ -127,6 +127,7 @@ struct VOConfig {
     int    loop_cooldown_kfs     = 20;      // 回环校正冷却（关键帧数）：防止同区域连续校正（D 曾改 12，实测同区域 43 KF 内连续回环叠加拉扯变形，回退）
     int    loop_top_candidates   = 20;      // 词袋召回池；聚类后与位置先验合计硬限 12 地点
     int    loop_mature_verification_limit = 0; // 0=验证全部候选；mobile 用有限成熟地点级联
+    int    loop_verification_limit = 12;   // 单次查询最多实际做几轮几何验证
     double loop_position_prior_dist = 40.0; // 位置先验距离阈值(m)：轨迹自交区域补召回（A3 放宽）
     int    loop_position_prior_gap   = 100; // 位置先验最小关键帧间隔
     LoopRegionConfig loop_region;            // 单 KF PnP 失败后的有限历史区域验证

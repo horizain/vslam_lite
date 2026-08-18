@@ -115,6 +115,7 @@ def run_round(args, tmpdir, idx, metrics_checks=True):
     th.join()
 
     report = {"round": idx + 1, "exit_code": rc,
+              "rss_sample_count": len(samples),
               "rss_peak_mb": max((s[1] for s in samples), default=0.0)}
     slope = linear_slope(samples[len(samples) // 2:])
     report["rss_slope_mib_h"] = slope
@@ -227,11 +228,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="vslam_soak_") as tmpdir:
         rss_peaks = []
         rss_slopes = []
+        reports = []
         i = 0
         deadline = (time.time() + args.duration_h * 3600.0) if args.duration_h > 0.0 else None
         while deadline is None or time.time() < deadline:
             ok, rep = run_round(args, tmpdir, i)
             results.append(ok)
+            reports.append(rep)
             rss_peaks.append(rep["rss_peak_mb"])
             if rep["rss_slope_mib_h"] is not None:
                 rss_slopes.append(rep["rss_slope_mib_h"])
@@ -258,7 +261,10 @@ def main():
             peak = max(rss_peaks)
             late = rss_slopes[len(rss_slopes) // 3 * 2:] if len(rss_slopes) > 3 else rss_slopes
             slope = (sum(late) / len(late)) if late else None
-            if peak > args.rss_max_mb:
+            if any(rep.get("rss_sample_count", 0) <= 0 for rep in reports):
+                print("  [FAIL] RSS 门开启但没有有效采样")
+                all_ok = False
+            elif peak > args.rss_max_mb:
                 print(f"  [FAIL] RSS 峰值 {peak:.1f}MB > {args.rss_max_mb}MB（§6.5 <1GiB）")
                 all_ok = False
             else:

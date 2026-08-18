@@ -2167,3 +2167,28 @@ RGB 通道因此通常相同；彩色双目数据会保留真实颜色。
 验证：CMake 重新配置后 `stereo_cloud_viewer`、`run_slam`、`run_vo` 构建通过；KITTI 00
 前 80 帧无头运行成功，导出 `/tmp/stereo_last.ply`，包含 1175 个彩色点。尚未做完整
 4541 帧彩色 viewer 性能门；当前点云是当前帧快照，不是持久化的全局彩色地图。
+
+### 3.45 运行资源契约与稳态/长尾控制（2026-08-18）
+
+本轮按运行时资源、前端稳态、后端长尾和测试门四条路径实施，未修改确定性黄金参考：
+
+- `default.yaml` 现在声明最多 6 个 CPU 核和 12288 MiB RSS，`mobile.yaml` 声明最多
+  4 个核和 6144 MiB RSS。Linux 下运行时收窄 affinity，固定后台 worker 到保留核，
+  同时限制 OpenCV/TBB 并记录实际 RSS、线程数和允许 CPU 数。OpenCV/TBB 的 OS worker
+  数仍由系统库维护，当前只保证活动 CPU 集合和 backend 线程不越界，不能把线程数指标
+  误报为等于核心数。
+- 双目路径复用调用方已生成的原始灰度，反向 LK 只验证正向有效点；ORB 跟踪结果在
+  关键帧建点时复用，避免第二次 O(N²) BF 匹配。关键帧配置保留旧路径开关，确定性档
+  关闭新策略后 L1 逐位一致。
+- Local BA 增加 profile 级点数/优化轮数上限、后台任务最大排队年龄和执行耗时统计；
+  过期任务不进入 g2o。异步回环复用锁外预验证结果，避免在事务入口重复做候选 PnP；
+  默认档使用成熟地点级联和每查询几何验证上限，轻量档继续使用有界 Flat-DBoW3。
+- `benchmark.py` 现在校验有限数值、轨迹非空、轨迹行数与 valid pose 一致、RSS 采样
+  和 B 侧门限；提交门强制 RSS，并兼容仓库历史 `datasets/sequences/00` 路径但不跳过 GT。
+  新增 runtime resource CTest、scheduler 过期任务回归，CTest 数量为 20。
+
+验证：新鲜 Release 提交门 L0/L1/L2 通过；L2 500 帧×3 轮最差 p99 32.43ms、
+valid ratio 0.994、RSS 790648KiB、允许 CPU 6。完整旧路径诊断轮（default，4541 帧）
+为 4446/4541 有效、p99 138.8ms、5 次 LOST、RSS 约 1.30GiB，仍未通过完整长程产品门；
+mobile 200 帧烟雾为 181/200 有效、4 核 affinity、RSS 约 173MiB，不能替代 ARM 实机和
+完整序列验证。依赖摘要：vendored g2o、DBoW3 均可用。

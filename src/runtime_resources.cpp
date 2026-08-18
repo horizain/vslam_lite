@@ -3,8 +3,11 @@
 #include <opencv2/core.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -12,10 +15,25 @@
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+#if __has_include(<oneapi/tbb/global_control.h>)
+#include <oneapi/tbb/global_control.h>
+#define VSLAM_HAS_TBB_GLOBAL_CONTROL 1
+#elif __has_include(<tbb/global_control.h>)
+#include <tbb/global_control.h>
+#define VSLAM_HAS_TBB_GLOBAL_CONTROL 1
 #endif
 
 namespace vslam {
 namespace {
+
+#ifdef VSLAM_HAS_TBB_GLOBAL_CONTROL
+std::mutex tbb_mutex;
+std::unique_ptr<tbb::global_control> tbb_control;
+#endif
 
 #ifdef __linux__
 std::vector<int> allowedCpus() {
@@ -38,6 +56,34 @@ bool restrictCurrentThread(const std::vector<int>& cpus, size_t max_cpu_cores) {
     for (size_t i = 0; i < count; ++i) CPU_SET(cpus[i], &set);
     return sched_setaffinity(0, sizeof(set), &set) == 0;
 }
+
+void restrictExistingThreads(const std::vector<int>& cpus, size_t max_cpu_cores) {
+    if (cpus.empty()) return;
+    const size_t count = std::min(max_cpu_cores, cpus.size());
+    std::error_code ec;
+    const auto task_dir = std::filesystem::path("/proc/self/task");
+    const auto current_tid = static_cast<unsigned long>(syscall(SYS_gettid));
+    size_t ordinal = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(task_dir, ec)) {
+        if (ec) break;
+        unsigned long tid = 0;
+        try {
+            tid = std::stoul(entry.path().filename().string());
+        } catch (...) {
+            continue;
+        }
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (tid == current_tid) {
+            for (size_t i = 0; i < count; ++i) CPU_SET(cpus[i], &set);
+        } else {
+            const size_t cpu_index = count <= 1
+                ? 0 : 1 + (ordinal++ % (count - 1));
+            CPU_SET(cpus[cpu_index], &set);
+        }
+        (void)sched_setaffinity(static_cast<pid_t>(tid), sizeof(set), &set);
+    }
+}
 #else
 std::vector<int> allowedCpus() {
     const unsigned count = std::max(1u, std::thread::hardware_concurrency());
@@ -47,6 +93,7 @@ std::vector<int> allowedCpus() {
 }
 
 bool restrictCurrentThread(const std::vector<int>&, size_t) { return false; }
+void restrictExistingThreads(const std::vector<int>&, size_t) {}
 #endif
 
 }  // namespace
@@ -71,7 +118,26 @@ bool RuntimeResources::configure(const RuntimeResourceConfig& config,
             threads = std::min(
                 threads, max_cores - config.backend_reserved_cores);
         }
-        cv::setNumThreads(static_cast<int>(std::max<size_t>(1, threads)));
+        threads = std::max<size_t>(1, threads);
+#ifdef __linux__
+        const std::string thread_text = std::to_string(threads);
+        (void)setenv("OPENCV_FOR_THREADS_NUM", thread_text.c_str(), 1);
+#endif
+#ifdef VSLAM_HAS_TBB_GLOBAL_CONTROL
+        {
+            std::lock_guard<std::mutex> lock(tbb_mutex);
+            tbb_control = std::make_unique<tbb::global_control>(
+                tbb::global_control::max_allowed_parallelism, threads);
+        }
+#endif
+        cv::setNumThreads(static_cast<int>(threads));
+        if (config.enforce_cpu_affinity) {
+            // 先触发一次 OpenCV parallel backend，让它创建固定 worker 集合；
+            // 随后把已存在的 worker 收窄并轮转固定到允许 CPU，避免 TBB
+            // 线程继续带着启动时的全机 affinity 跨核迁移。
+            cv::parallel_for_(cv::Range(0, 1), [](const cv::Range&) {});
+            restrictExistingThreads(cpus, max_cores);
+        }
     }
     return affinity_ok;
 }
@@ -93,11 +159,16 @@ bool RuntimeResources::pinCurrentThread(size_t ordinal) {
 size_t RuntimeResources::processRssBytes() {
 #ifdef __linux__
     std::ifstream input("/proc/self/status");
-    std::string key;
-    size_t value = 0;
-    std::string unit;
-    while (input >> key >> value >> unit) {
-        if (key == "VmRSS:") return value * 1024;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.starts_with("VmRSS:")) continue;
+        const auto first = line.find_first_of("0123456789");
+        if (first == std::string::npos) return 0;
+        try {
+            return std::stoull(line.substr(first)) * 1024ULL;
+        } catch (...) {
+            return 0;
+        }
     }
 #endif
     return 0;

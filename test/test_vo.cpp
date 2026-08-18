@@ -213,10 +213,10 @@ void test_mobile_config() {
         const auto config_path = std::filesystem::path(__FILE__).parent_path()
             .parent_path() / "config/mobile.yaml";
         const auto cfg = vslam::VOConfig::fromYaml(config_path.string());
-        assert(cfg.num_features == 600);
+        assert(cfg.num_features == 800);
         assert(cfg.pyramid_levels == 8);
-        assert(cfg.orb_max_bands == 1);
-        assert(cfg.opencv_threads == 4);
+        assert(cfg.orb_max_bands == 2);
+        assert(cfg.opencv_threads == 2);
         assert(cfg.runtime_resources.max_cpu_cores == 4);
         assert(cfg.runtime_resources.max_rss_mb == 6144);
         assert(cfg.async_backend);
@@ -243,16 +243,18 @@ void test_mobile_config() {
 }
 
 void test_loop_mature_verification_config_scope() {
-    TEST("回环成熟地点验证上限仅 mobile 配置启用") {
+    TEST("回环成熟地点与几何验证预算按 profile 受限") {
         const auto config_root = std::filesystem::path(__FILE__)
             .parent_path().parent_path() / "config";
         const auto default_cfg = vslam::VOConfig::fromYaml(
             (config_root / "default.yaml").string());
         const auto kitti_cfg = vslam::VOConfig::fromYaml(
             (config_root / "kitti00.yaml").string());
-        assert(default_cfg.loop_mature_verification_limit == 0);
+        assert(default_cfg.loop_mature_verification_limit == 4);
+        assert(default_cfg.loop_verification_limit == 4);
         assert(kitti_cfg.loop_mature_verification_limit == 0);
-        // 未配置 LoopClosure.mature_verification_limit 时保持桌面默认行为。
+        assert(kitti_cfg.loop_verification_limit == 12);
+        // 未配置 LoopClosure.mature_verification_limit 时保持 API 默认行为。
         assert(vslam::VOConfig{}.loop_mature_verification_limit == 0);
     } TEST_PASS();
 }

@@ -257,6 +257,24 @@ void test_submit_after_stop_is_rejected() {
     } TEST_PASS();
 }
 
+void test_expired_task_is_dropped_before_handler() {
+    TEST("后台任务年龄超限：过期任务不进入 handler") {
+        std::atomic<int> handled{0};
+        BackendScheduler sched([&](BackendTask&) { handled.fetch_add(1); });
+        sched.setMaxTaskAgeMs(1.0);
+        sched.submit(makeLocalBA(12));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        sched.start();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        sched.stop();
+        const auto stats = sched.stats();
+        assert(handled.load() == 0);
+        assert(stats.expired == 1);
+        assert(stats.executed == 0);
+        assert(stats.dropped >= 1);
+    } TEST_PASS();
+}
+
 void test_destructor_joins() {
     TEST("析构自动 stop + join（不 detach）") {
         {
@@ -284,6 +302,7 @@ int main() {
     test_stop_drains_pending();
     test_stop_without_start_and_double_stop();
     test_submit_after_stop_is_rejected();
+    test_expired_task_is_dropped_before_handler();
     test_destructor_joins();
 
     std::cout << "全部通过" << std::endl;

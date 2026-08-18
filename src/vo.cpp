@@ -387,6 +387,8 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (lc["mature_verification_limit"])
                 cfg.loop_mature_verification_limit =
                     lc["mature_verification_limit"].as<int>();
+            if (lc["verification_limit"])
+                cfg.loop_verification_limit = lc["verification_limit"].as<int>();
             if (lc["position_prior_dist"]) cfg.loop_position_prior_dist = lc["position_prior_dist"].as<double>();
             if (lc["position_prior_gap"])  cfg.loop_position_prior_gap = lc["position_prior_gap"].as<int>();
             if (lc["region_max_keyframes"]) cfg.loop_region.max_keyframes = lc["region_max_keyframes"].as<size_t>();
@@ -1905,7 +1907,11 @@ bool VisualOdometry::insertKeyFrame() {
                                 curr_frame_, active->id, active->T_ws, poses);
                         }
                     }
+                    const int verification_limit =
+                        std::max(1, cfg_.loop_verification_limit);
+                    int verification_count = 0;
                     for (const auto& cand : cands) {
+                        if (verification_count++ >= verification_limit) break;
                         LoopCorrectionContext context;
                         {
                             std::shared_lock<std::shared_mutex> lock(map_mutex_);
@@ -1948,6 +1954,7 @@ bool VisualOdometry::insertKeyFrame() {
 // ============================================================
 bool VisualOdometry::handleLoopCorrection(
     const LoopCorrectionContext& context) {
+    PERF_SCOPE("loop.transaction");
     // 读阶段与前端 tracking 共享；只暂停 KF/点的拓扑写入。
     // 锁序固定为 map → LoopClosure，禁止反向回调。
     std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
@@ -2148,6 +2155,7 @@ bool VisualOdometry::handleLoopCorrection(
     SE3 old_prefix_endpoint_pose;
     Map::Ptr snap_map;
     {
+        PERF_SCOPE("loop.snapshot");
         snap_map = map_;
         auto all_kfs = map_->getAllKeyFrames();
         if (all_kfs.size() < 2) return false;
@@ -2315,6 +2323,7 @@ bool VisualOdometry::handleLoopCorrection(
     }
 
     // ---- 阶段 3：短独占临界区内验证前缀身份、重基尾段、原子提交 ----
+        PERF_SCOPE("loop.commit");
         std::unique_lock<std::shared_mutex> commit_lock(map_mutex_);
         const auto* commit_submap = atlas_->activeSubmap();
         if (map_ != snap_map || !commit_submap || commit_submap->id != submap_id) {
@@ -2928,7 +2937,10 @@ void VisualOdometry::runBackendLoopClosure(const Frame::Ptr& curr_kf) {
             verification_candidates.push_back(*prior);
         }
     }
+    const int verification_limit = std::max(1, cfg_.loop_verification_limit);
+    int verification_count = 0;
     for (const auto& cand : verification_candidates) {
+        if (verification_count++ >= verification_limit) break;
         LoopCorrectionContext context = current_context;
         Frame::Ptr snap_loop;
         LoopRegionSnapshot loop_region;
