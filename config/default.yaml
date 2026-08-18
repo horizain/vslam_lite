@@ -58,6 +58,7 @@ VO:
   pnp_max_rmse: 2.5        # PnP 内点最大重投影 RMSE（像素）
   max_tracking_failures: 5 # 连续跟踪失败多少帧后进入重定位
   max_relocalize_frames: 20 # 重定位持续失败多少帧后建立新子地图
+  max_relocalization_candidates: 120
   max_frame_translation: 3.0 # 双目相邻有效帧最大平移（米）
   max_frame_rotation: 0.35 # 双目相邻有效帧最大旋转（弧度）
   keyframe_translation: 0.5  # 关键帧选择：最小平移距离（米）
@@ -73,6 +74,9 @@ VO:
   local_map_min_shared: 2        # 局部地图共视 KF 最小共视点数
   local_map_max_points: 400      # 局部地图点预算（按共视降序截断）
   local_map_search_radius_px: 30.0 # 局部地图投影搜索半径(px)
+  local_map_rescue: true
+  local_map_rescue_max_points: 1000
+  local_map_rescue_radius_px: 80.0
 
 # ---- 优化参数 (Phase 1) ----
 Optimizer:

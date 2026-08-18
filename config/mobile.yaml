@@ -50,6 +50,7 @@ VO:
   pnp_max_rmse: 2.5
   max_tracking_failures: 5
   max_relocalize_frames: 20
+  max_relocalization_candidates: 80
   max_frame_translation: 5.0  # KITTI 10Hz 高速段避免把真实运动误拒为 LOST
   max_frame_rotation: 0.35
   keyframe_translation: 0.5
@@ -63,6 +64,9 @@ VO:
   local_map_min_shared: 2
   local_map_max_points: 280
   local_map_search_radius_px: 25.0
+  local_map_rescue: true
+  local_map_rescue_max_points: 600
+  local_map_rescue_radius_px: 40.0
 
 Optimizer:
   local_window_size: 6

@@ -325,6 +325,9 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (v["pnp_max_rmse"])        cfg.pnp_max_rmse         = v["pnp_max_rmse"].as<double>();
             if (v["max_tracking_failures"]) cfg.max_tracking_failures = v["max_tracking_failures"].as<int>();
             if (v["max_relocalize_frames"]) cfg.max_relocalize_frames = v["max_relocalize_frames"].as<int>();
+            if (v["max_relocalization_candidates"])
+                cfg.max_relocalization_candidates =
+                    v["max_relocalization_candidates"].as<int>();
             if (v["max_frame_translation"]) cfg.max_frame_translation = v["max_frame_translation"].as<double>();
             if (v["max_frame_rotation"]) cfg.max_frame_rotation = v["max_frame_rotation"].as<double>();
             if (v["keyframe_translation"]) cfg.keyframe_translation = v["keyframe_translation"].as<double>();
@@ -339,6 +342,11 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (v["local_map_min_shared"])     cfg.local_map_min_shared    = v["local_map_min_shared"].as<int>();
             if (v["local_map_max_points"])     cfg.local_map_max_points    = v["local_map_max_points"].as<int>();
             if (v["local_map_search_radius_px"]) cfg.local_map_search_radius_px = v["local_map_search_radius_px"].as<double>();
+            if (v["local_map_rescue"]) cfg.local_map_rescue = v["local_map_rescue"].as<bool>();
+            if (v["local_map_rescue_max_points"])
+                cfg.local_map_rescue_max_points = v["local_map_rescue_max_points"].as<int>();
+            if (v["local_map_rescue_radius_px"])
+                cfg.local_map_rescue_radius_px = v["local_map_rescue_radius_px"].as<double>();
         }
         if (auto o = root["Optimizer"]) {
             if (o["local_window_size"])   cfg.local_window_size   = o["local_window_size"].as<int>();
@@ -1274,6 +1282,70 @@ SE3 VisualOdometry::trackFrame() {
     last_tracking_ref_id_ = ref_frame_->id;
     last_tracking_curr_id_ = curr_frame_->id;
 
+    // 首轮参考 KF PnP 失败时，ORB 仍可能有大量 2D 匹配，但其中只有少数
+    // 特征仍挂着正式 3D 点。先用运动预测把共视局部地图投影到当前帧，再用
+    // 同一组 PnP 几何/连续性门验收，避免“有匹配却因为 pts3d 太少直接 LOST”。
+    if (!r.valid && cfg_.local_map_rescue &&
+        !snap_.ref_descs.empty() && !snap_.ref_points_s.empty()) {
+        const MotionBaseline motion = normalMotionBaseline();
+        const SE3 seed_pose = motion.predicted_pose_cs
+            ? *motion.predicted_pose_cs : snap_.ref_pose_cs;
+        const size_t rescue_limit = static_cast<size_t>(std::max(
+            8, cfg_.local_map_rescue_max_points));
+        std::vector<Vec3> rescue_points;
+        std::vector<cv::Mat> rescue_descs;
+        std::vector<MapPoint::Ptr> rescue_mps;
+        std::unordered_set<MapPointId> rescue_seen;
+        rescue_points.reserve(rescue_limit);
+        rescue_descs.reserve(rescue_limit);
+        rescue_mps.reserve(rescue_limit);
+        for (size_t i = 0; i < snap_.ref_descs.size() &&
+                            i < snap_.ref_mps.size() &&
+                            i < snap_.ref_points_s.size() &&
+                            rescue_points.size() < rescue_limit; ++i) {
+            const auto& mp = snap_.ref_mps[i];
+            if (!mp || snap_.ref_descs[i].empty() ||
+                !rescue_seen.insert(mp->id).second) continue;
+            rescue_points.push_back(snap_.ref_points_s[i]);
+            rescue_descs.push_back(snap_.ref_descs[i]);
+            rescue_mps.push_back(mp);
+        }
+        // 参考 KF 之外再补充少量共视缓存，覆盖参考点被 cull/遮挡的情况。
+        for (size_t i = 0; i < snap_.local_points_s.size() &&
+                            rescue_points.size() < rescue_limit; ++i) {
+            if (i >= snap_.local_descs.size() || i >= snap_.local_mps.size()) break;
+            const auto& mp = snap_.local_mps[i];
+            if (!mp || snap_.local_descs[i].empty() ||
+                !rescue_seen.insert(mp->id).second) continue;
+            rescue_points.push_back(snap_.local_points_s[i]);
+            rescue_descs.push_back(snap_.local_descs[i]);
+            rescue_mps.push_back(mp);
+        }
+        const LocalMapTrackResult local = frontend_tracker_.trackLocalMap(
+            curr_frame_, rescue_points, rescue_descs, rescue_mps, {}, seed_pose,
+            cfg_.local_map_rescue_radius_px, cfg_.match_ratio);
+        if (local.added >= 8) {
+            TrackingResult rescued = frontend_tracker_.trackPnP(
+                local.pts3d, local.pts2d, snap_.T_ws, motion,
+                cfg_.pnp_min_inliers, cfg_.pnp_min_inlier_ratio,
+                cfg_.pnp_max_rmse);
+            if (rescued.valid) {
+                rescued.matches = std::max(r.matches, local.added);
+                rescued.method = "LOCAL_MAP_PNP";
+                for (const int index : rescued.pnp_inlier_indices) {
+                    if (index < 0 || index >= static_cast<int>(local.mps.size())) continue;
+                    rescued.associations.emplace_back(
+                        local.curr_feature_indices[index], local.mps[index]);
+                    const auto& point = rescue_points[index];
+                    rescued.association_points_s.push_back(point);
+                }
+                r = std::move(rescued);
+                LOG_INFO("Local map rescue: " << local.added
+                         << " projected correspondences, inliers=" << r.inliers);
+            }
+        }
+    }
+
     // ---- 方案 B：局部地图投影补匹配 + 精修位姿 ----
     // 首轮 PnP 成功后，把参考 KF 共视的地图点投影进当前帧补充 3D-2D 对应，
     // 合并后重跑 PnP：新增对应 > 阈值且内点数不减时才采纳（外点交给
@@ -1462,13 +1534,16 @@ bool VisualOdometry::tryRelocalize() {
     // 先搜索当前子地图，再按新旧顺序搜索历史子地图。候选总数设上限，
     // 防止连续丢失时 Atlas 越大、单帧重定位开销越高。
     std::vector<std::pair<unsigned long, Frame::Ptr>> candidates;
-    constexpr int kMaxRelocTries = 60;
+    const int max_reloc_candidates = std::max(
+        1, cfg_.max_relocalization_candidates);
+    const int per_map_limit = std::max(1, max_reloc_candidates / 2);
     auto append_submap = [&](const Submap& submap) {
-        if ((int)candidates.size() >= kMaxRelocTries) return;
+        if ((int)candidates.size() >= max_reloc_candidates) return;
         auto kfs = submap.map->getAllKeyFrames();
         int per_map = 0;
         for (auto kf_it = kfs.rbegin();
-             kf_it != kfs.rend() && per_map < 30 && (int)candidates.size() < kMaxRelocTries;
+             kf_it != kfs.rend() && per_map < per_map_limit &&
+                 (int)candidates.size() < max_reloc_candidates;
              ++kf_it, ++per_map) {
             candidates.emplace_back(submap.id, *kf_it);
         }
@@ -1783,6 +1858,7 @@ bool VisualOdometry::insertKeyFrame() {
             createMapPointsFromStereo(curr_frame_);
             std::vector<cv::DMatch> keyframe_matches;
             if (cfg_.reuse_keyframe_matches && cfg_.feature_method == 0 &&
+                !last_tracking_matches_.empty() &&
                 last_tracking_ref_id_ == prev_kf->id &&
                 last_tracking_curr_id_ == curr_frame_->id) {
                 keyframe_matches = feature_matcher_.filterFundamental(
@@ -2509,6 +2585,21 @@ VisualOdometry::TrackingSnapshot VisualOdometry::captureTrackingSnapshot() {
             if (ref_frame_->map_points[i])
                 snap.ref_points_s[i] = ref_frame_->map_points[i]->pos_s;
         }
+        if (snap_ref_desc_kf_id_ != ref_frame_->id ||
+            snap_ref_desc_topology_rev_ != snap.topology_revision ||
+            snap_ref_desc_geo_rev_ != snap.geometry_revision) {
+            snap_ref_desc_kf_id_ = ref_frame_->id;
+            snap_ref_desc_topology_rev_ = snap.topology_revision;
+            snap_ref_desc_geo_rev_ = snap.geometry_revision;
+            snap_ref_descs_.clear();
+            snap_ref_descs_.resize(ref_frame_->map_points.size());
+            for (size_t i = 0; i < ref_frame_->map_points.size(); ++i) {
+                const auto& mp = ref_frame_->map_points[i];
+                if (mp && !mp->descriptor.empty())
+                    snap_ref_descs_[i] = mp->descriptor.clone();
+            }
+        }
+        snap.ref_descs = snap_ref_descs_;
 
         // ---- 方案 B：共视图局部地图（按 ref KF + 几何版本缓存）----
         // covisibleKeyframes 是 O(KF²) 全量扫描；只在参考 KF 或几何版本
@@ -2517,8 +2608,10 @@ VisualOdometry::TrackingSnapshot VisualOdometry::captureTrackingSnapshot() {
         snap.local_map_kf_id = ref_frame_->id;
         if (cfg_.local_map_tracking &&
             (snap_local_map_kf_id_ != ref_frame_->id ||
+             snap_local_map_topology_rev_ != snap.topology_revision ||
              snap_local_map_geo_rev_ != map_->geometryRevision())) {
             snap_local_map_kf_id_ = ref_frame_->id;
+            snap_local_map_topology_rev_ = snap.topology_revision;
             snap_local_map_geo_rev_ = map_->geometryRevision();
             snap_local_points_s_.clear();
             snap_local_descs_.clear();

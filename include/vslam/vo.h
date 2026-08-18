@@ -77,6 +77,7 @@ struct VOConfig {
     double pnp_max_rmse           = 2.5;    // PnP 最大内点重投影 RMSE(px)
     int    max_tracking_failures  = 5;      // 连续失败多少帧后进入重定位
     int    max_relocalize_frames  = 20;     // 重定位失败多少帧后创建新子地图
+    int    max_relocalization_candidates = 120; // LOST 路径候选硬上限
     double max_frame_translation  = 3.0;    // 双目相邻有效帧最大平移(m)
     double max_frame_rotation     = 0.35;   // 双目相邻有效帧最大旋转(rad)
     double keyframe_translation   = 0.5;    // 关键帧最小平移(m)，单目（尺度归一化后位移小）
@@ -113,6 +114,9 @@ struct VOConfig {
     int    local_map_min_shared    = 2;     // 局部地图共视 KF 最小共视点数
     int    local_map_max_points    = 400;   // 局部地图点预算（按共视降序截断）
     double local_map_search_radius_px = 30.0; // 局部地图投影搜索半径(px)
+    bool   local_map_rescue        = true;  // 首轮 PnP 失败时启用局部地图救援
+    int    local_map_rescue_max_points = 800;
+    double local_map_rescue_radius_px = 50.0;
 
     // ---- 回环检测 (Phase 2) ----
     bool   enable_loop_closure   = false;   // run_slam 默认开、run_vo 默认关（A/B 对比）
@@ -363,6 +367,7 @@ public:
         SE3 ref_pose_cs;                  // 参考帧位姿（子地图局部系 T_cs）
         std::vector<std::shared_ptr<MapPoint>> ref_mps;  // 参考帧 map_points（索引对齐）
         std::vector<Vec3> ref_points_s;   // 对应局部坐标拷贝（版本绑定）
+        std::vector<cv::Mat> ref_descs;   // 参考 KF 地图点描述子快照
         // 方案 B：共视图局部地图（参考 KF 及其共视 KF 的地图点快照，索引对齐）。
         // 只在参考 KF 变化时由 captureTrackingSnapshot 刷新一次（covisibleKeyframes
         // 是 O(KF²) 全量扫描，不能每帧都做）；锁内拷贝保证与几何版本一致。
@@ -580,10 +585,15 @@ private:
     TrackingSnapshot snap_;  // 前端只读快照（M2，每帧开头捕获）
     // 方案 B：局部地图缓存（captureTrackingSnapshot 内按 ref KF + 几何版本刷新）
     unsigned long snap_local_map_kf_id_ = 0;
+    uint64_t snap_local_map_topology_rev_ = std::numeric_limits<uint64_t>::max();
     uint64_t snap_local_map_geo_rev_ = std::numeric_limits<uint64_t>::max();
     std::vector<Vec3> snap_local_points_s_;
     std::vector<cv::Mat> snap_local_descs_;
     std::vector<std::shared_ptr<MapPoint>> snap_local_mps_;
+    unsigned long snap_ref_desc_kf_id_ = 0;
+    uint64_t snap_ref_desc_topology_rev_ = std::numeric_limits<uint64_t>::max();
+    uint64_t snap_ref_desc_geo_rev_ = std::numeric_limits<uint64_t>::max();
+    std::vector<cv::Mat> snap_ref_descs_;
 
     // ---- M2.2 遗留清理：§6.3 地图资源预算运行时接线 ----
     ResourceBudget map_budget_;   ///< 预算引擎（默认 §6.2 参数；VOConfig.map_budget 覆写）

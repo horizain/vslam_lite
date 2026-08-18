@@ -59,6 +59,7 @@ VO:
   pnp_max_rmse: 2.5
   max_tracking_failures: 5
   max_relocalize_frames: 20
+  max_relocalization_candidates: 60
   max_frame_translation: 3.0
   max_frame_rotation: 0.35
   keyframe_translation: 0.5
@@ -73,6 +74,7 @@ VO:
   local_map_min_shared: 2
   local_map_max_points: 400
   local_map_search_radius_px: 30.0
+  local_map_rescue: false
 
 # ---- 优化参数 ----
 Optimizer:

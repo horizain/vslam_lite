@@ -46,6 +46,7 @@ VO:
   pnp_max_rmse: 3.0        # 略放宽: 避免强视差/部分遮挡帧被误拒(由比例+内点数把关)
   max_tracking_failures: 5
   max_relocalize_frames: 20
+  max_relocalization_candidates: 120
   max_frame_translation: 5.0  # KITTI ~1m/帧@10Hz, 高速段放宽防误拒
   max_frame_rotation: 0.35    # 0.35rad≈20°/帧, 弯道足够
   keyframe_translation: 0.5   # (单目用)
@@ -54,6 +55,9 @@ VO:
   min_keyframe_interval: 10
   max_keyframe_interval: 15
   keyframe_max_count: 1800  # KF 规模软顶：超过后平移阈值放大 1.5 倍
+  local_map_rescue: true
+  local_map_rescue_max_points: 800
+  local_map_rescue_radius_px: 50.0
 
 # ---- 优化参数 ----
 Optimizer:
