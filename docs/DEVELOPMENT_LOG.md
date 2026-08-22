@@ -1,7 +1,7 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-22（M3.1 前端质量门见 §3.47；
+> 最后更新: 2026-08-22（M3.1 前端质量门见 §3.47；M3.2 位姿协方差见 §3.48；
 > Flat-DBoW3/mobile 全程与 full gate 失败证据见 §3.43；
 > 彩色双目点云见 §3.44；M2 仍未通过准确度/实时/RSS 产品门）
 >
@@ -2264,3 +2264,49 @@ fault_injection.py 回放框架属 M3.3；③ 模糊/暗亮真实样本未在 KI
 HardReject/Degraded 在真实数据上的触发率未知；④ mobile/ARM 未复测；⑤ 默认档
 完整长程产品门（ATE ≤40m、p99 ≤80ms、跳变 0、子地图重建 ≤1）仍未通过，
 与本任务无关但继续如实记录。
+
+### 3.48 M3.2 位姿数值协方差（2026-08-22）
+
+按 `PRODUCTION_LOCALIZATION_PLAN.md` §7.5 落地 M3.2：最终 PnP 内点的中心有限
+差分数值协方差，替换 `PoseEstimate::covariance` 的 M0 占位单位阵。
+
+**新增纯函数模块 `pose_covariance.{h,cpp}`**（无 RNG、值进出）：
+
+- `se3Exp` / `se3Adjoint`：SE(3) 指数映射与左伴随，切空间顺序固定
+  `[tx,ty,tz,rx,ry,rz]`（§7.5）；伴随满足同态性并经共轭恒等式验证。
+- `pnpPoseCovariance`：对收敛位姿做左扰动 `Exp(δξ_c)·T_cs` 中心差分
+  （平移 1e-4 m / 旋转 1e-6 rad），由最终内点重投影残差构造 J；
+  `σ² = max(0.25, SSE/max(1, 2N−6))`；`H=JᵀJ` 原始特征值上判条件数
+  （>1e8 或非正 → 退化拒绝发布），按 1e-9 下限截断后求逆；
+  `Σ_c = σ²·H⁻¹` 对称化 + 有限/正定校验。视轴共线等病态几何正确触发退化。
+- 内点 <6 直接退化；任一扰动把点投到相机后方判退化。
+
+**传播链路**：`FrontendTracker::estimatePnPCovariance` 聚合入口；
+trackPnP/refinePnP 接受分支填充，trackOrb 与 vo.cpp 局部地图精修的
+"选择性拷贝"处同步透传（漏拷会让最终结果携带陈旧协方差——VO 级测试抓出）。
+`Status` 新增 `pose_covariance/pose_covariance_valid`（每帧复位）。
+Localizer 发布前经 `A = Ad_{T_oc}` 变换到 odom 系（精确覆盖全局校正后
+T_wo≠I 的情形）、PD 校验失败回退占位单位阵、Weak ×4 保持；
+prediction-only 帧按流逝时间每 100ms 至少 ×2（§7.5 第 7 步，500ms 超时仍由
+状态机截断）。EPIPOLAR 回退帧（无尺度、无内点集）按设计无数值协方差。
+
+**范围扩大说明**：vo.{h,cpp}（Status 两字段 + 三处结果合并点透传约 20 行）、
+localizer.{h,cpp}（Ad 变换 + prediction 增长 + 时间戳成员约 25 行）。
+
+**测试**：`test/test_pose_covariance.cpp` 13 项——Exp/伴随代数性质、无噪场景
+有效/对称/正定/σ²下限、同一标准化样本下 σ 二次缩放（迹比 ≈4）、点数信息缩放、
+视轴共线退化拒绝、内点不足退化、逐位确定性、tracker 聚合入口、以及 VO 级端到端
+传播（真实跟踪建立后 PNP 帧 Status 必须携带非占位正定协方差）。另将
+test_localizer_contract 的 M0 占位断言更新为 M3.2 语义（非单位阵且正定）。
+CTest 现在 22 个目标。
+
+**验收**：
+- 全量 CTest 22/22 PASS；`git diff --check` 干净。
+- 新鲜 Release 提交门 L0/L1/L2 PASSED：L1 确定性轨迹逐位一致（协方差为纯
+  数值计算、不消耗 RNG、不改几何决策）；L2 500 帧×3 轮 valid_ratio 1.0、
+  p99 最差 ~33ms、jumps 0。
+
+**未验证边界**：① 协方差数值本身未与 EVO/g2o marginal 协方差交叉标定，
+当前只验证代数/统计性质与退化检测；② Weak ×4 与 prediction 增长作用于真实
+Σ 后的下游消费方（控制器/ESKF）尚不存在（M6）；③ M3.3 fault_injection.py
+故障回放未实施。

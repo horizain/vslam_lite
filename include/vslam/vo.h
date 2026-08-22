@@ -253,6 +253,11 @@ public:
         // HardReject 帧走失败路径，pose_valid=false 且 reason=ImageDegraded。
         FrameQuality  quality       = FrameQuality::Full;
         FailureReason failure_reason = FailureReason::None;
+        // M3.2（§7.5）：接受位姿的数值协方差——ξ=[tx,ty,tz,rx,ry,rz] 左扰动
+        // Exp(δξ)·T_cw 的切空间协方差（相机系）。valid=false 表示退化/不可用，
+        // 消费方必须回退保守占位，不得发布假精度。
+        Mat6          pose_covariance = Mat6::Zero();
+        bool          pose_covariance_valid = false;
     };
 
     VisualOdometry(const Camera& camera, const VOConfig& cfg = VOConfig());

@@ -320,7 +320,11 @@ void test_valid_frames_and_equivalence() {
         assert(est.state == TrackingState::Tracking);   // 连续 3 帧完整验收（§4.2）
         assert(est.pose_valid);
         assert(!est.prediction_only);
-        assert(est.covariance == vslam::Mat6::Identity());  // M0 占位协方差
+        // M3.2（§7.5）：协方差不再是 M0 占位单位阵——双目 PnP 路径发布经
+        // Ad_{T_oc} 变换的数值协方差（有限、对称、正定）。
+        assert(est.covariance.allFinite());
+        assert(est.covariance != vslam::Mat6::Identity());
+        assert(vslam::isPositiveDefiniteCovariance(est.covariance));
     } TEST_PASS();
 }
 

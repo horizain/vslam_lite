@@ -10,6 +10,7 @@
 
 #include <opencv2/core.hpp>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -153,6 +154,10 @@ private:
     double last_timestamp_ = 0.0;  // 处理侧时间戳（同步=调用方线程；异步=worker）
     bool has_last_timestamp_ = false;
     bool stopped_ = false;
+    // M3.2（§7.5 第 7 步）：prediction-only 协方差增长基准——最近一次发布
+    // 非预测帧的时刻（处理墙钟，仅 worker 线程访问）
+    std::chrono::steady_clock::time_point last_published_time_{};
+    bool has_last_published_time_ = false;
 
     // M2.3（§6.4）：结构化指标采集（enable_metrics=false 时为空实现；
     // mutable：const metricsSnapshot() 可刷新 backend/map 统计）

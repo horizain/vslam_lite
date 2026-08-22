@@ -35,6 +35,21 @@ QualityVerdict FrontendTracker::assessFrameQuality(
                                    occupied, cfg_.quality);
 }
 
+PoseCovarianceResult FrontendTracker::estimatePnPCovariance(
+    const SE3& pose_cs,
+    const std::vector<cv::Point3f>& points_s,
+    const std::vector<cv::Point2f>& pixels,
+    const std::vector<int>& inlier_indices) const {
+    // M3.2（§7.5）：中心有限差分数值协方差。纯函数聚合，无 RNG、不触碰
+    // 全局状态；退化判定在 pnpPoseCovariance 内部完成。
+    const cv::Mat K_cv = camera_->K();
+    Mat33 K = Mat33::Identity();
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            K(r, c) = K_cv.at<double>(r, c);
+    return pnpPoseCovariance(pose_cs, points_s, pixels, inlier_indices, K);
+}
+
 StereoStats FrontendTracker::computeStereoDepths(const Frame::Ptr& frame) const {
     return computeStereoDepths(frame, cv::Mat(), cv::Mat());
 }
@@ -145,6 +160,12 @@ TrackingResult FrontendTracker::trackPnP(
             candidate.pose_cs = pose_cs;
             candidate.pnp_inlier_indices = inliers;
             candidate.valid = true;
+            // M3.2（§7.5）：接受位姿的数值协方差（相机系左扰动切空间）。
+            // 退化时 valid=false，调用方回退保守占位。
+            const PoseCovarianceResult cov =
+                estimatePnPCovariance(pose_cs, pts3d, pts2d, inliers);
+            candidate.pose_covariance = cov.covariance_cs;
+            candidate.pose_covariance_valid = cov.valid;
         }
         return candidate;
     };
@@ -252,6 +273,12 @@ TrackingResult FrontendTracker::refinePnP(
     if (accepted) {
         r.pose_cs = candidate_pose;
         r.valid = true;
+        // M3.2（§7.5）：精修接受位姿的数值协方差（输入已按 3D 字典序稳定
+        // 排序，协方差与排序无关，但复用同一数组避免二次拷贝）。
+        const PoseCovarianceResult cov = estimatePnPCovariance(
+            candidate_pose, sorted_3d, sorted_2d, all_indices);
+        r.pose_covariance = cov.covariance_cs;
+        r.pose_covariance_valid = cov.valid;
     }
     return r;
 }
@@ -554,6 +581,9 @@ TrackingResult FrontendTracker::trackOrb(
             r.inliers = pnp.inliers;
             r.valid = true;
             r.method = "PNP";
+            // M3.2（§7.5）：数值协方差随最终结果传播（refine 覆盖时同步更新）
+            r.pose_covariance = pnp.pose_covariance;
+            r.pose_covariance_valid = pnp.pose_covariance_valid;
             // 位姿通过全部质量检查后才关联地图点，避免被拒绝的解污染共视统计。
             for (int idx : pnp.pnp_inlier_indices) {
                 if (idx < 0 || idx >= (int)match_idx.size()) continue;

@@ -222,7 +222,8 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
 
     // M2.3（§6.4）：单帧跟踪延迟（含输入校验后的 VO 处理；异步模式为
     // worker 内处理耗时，排队等待不计入）
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const auto t0 = now;
     // 第一阶段直接委托 VO（§4.1：不修改算法）
     const SE3 T_cw = right.empty()
         ? vo_->addFrame(left, timestamp)
@@ -268,8 +269,34 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
     {
         std::lock_guard<std::mutex> lock(result_mutex_);
         const StateMachineOutput sm_out = state_machine_.on_tracking(q, dt, seq);
-        out.covariance = Mat6::Identity();  // M0 占位；M3 数值 Jacobian 替换
+        // M3.2（§7.5）：真实视觉测量协方差。Σ_c 是 Exp(δξ_c)·T_cw 左扰动
+        // （相机系切空间）的协方差；经左伴随 A = Ad_{T_oc} 变换到 odom 系
+        // （ξ_o = Ad_{T_oc}·ξ_c，符号在二次型中消去，精确覆盖全局校正后
+        // T_wo≠I 的情形）。退化/不可用回退保守单位阵，不得发布假精度。
+        if (st.pose_covariance_valid && st.pose_valid) {
+            const Mat6 adjoint = se3Adjoint(T_oc);
+            const Mat6 cov_odom =
+                (adjoint * st.pose_covariance * adjoint.transpose()).eval();
+            out.covariance = isPositiveDefiniteCovariance(cov_odom)
+                ? Mat6(0.5 * (cov_odom + cov_odom.transpose()))
+                : Mat6::Identity();
+        } else {
+            out.covariance = Mat6::Identity();
+        }
         if (sm_out.quality == FrameQuality::Weak) out.covariance *= 4.0;  // §4.2 弱质量 ×4
+        // §7.5 第 7 步：prediction-only 帧按流逝时间增长——每 100ms 至少 ×2
+        //（500ms 超时后 pose_valid=false 已由状态机截断）。
+        if (sm_out.prediction_only && has_last_published_time_) {
+            const double elapsed_s = std::max(
+                0.0, std::chrono::duration<double>(now - last_published_time_).count());
+            out.covariance *= std::pow(2.0, elapsed_s / 0.1);
+            if (!isPositiveDefiniteCovariance(out.covariance))
+                out.covariance = Mat6::Identity();
+        }
+        if (!sm_out.prediction_only) {
+            last_published_time_ = now;
+            has_last_published_time_ = true;
+        }
         out.state = sm_out.state;
         out.reason = sm_out.reason;
         // §6.3 第 6 步（M2.2 遗留清理）：预算停止建图期间计入 BackendOverloaded

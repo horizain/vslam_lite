@@ -26,8 +26,10 @@
 > 弱质量分层，`tracking_quality.{h,cpp}` + `FailureReason::ImageDegraded` +
 > Localizer Degraded/协方差 ×4 接线）。代码默认关闭，default/mobile 显式开启，
 > deterministic 关闭保持 L1 逐位一致；KITTI 00 完整序列零硬拒绝触发，几何路径
-> 未变。M3.2 协方差与 M3.3 故障回放仍未实施；默认档完整产品门（ATE/p99/跳变/
-> 子地图重建）继续未通过。
+> 未变。同日 M3.2 数值协方差落地（§7.5：中心有限差分 Jacobian → σ²H⁻¹、
+> cond>1e8 判退化、Ad_{T_oc} 变换到 odom 系、prediction-only 每 100ms ×2），
+> `PoseEstimate::covariance` 不再是占位单位阵。M3.3 故障回放未实施；默认档
+> 完整产品门（ATE/p99/跳变/子地图重建）继续未通过。
 > 审计基线：`d90cfac`，2026-08-10
 > 适用范围：把当前单目/双目 VO + Local BA + DBoW3 回环 + Atlas 原型，演进为
 > 可供机器人连续运行 8～24 小时的核心定位组件。

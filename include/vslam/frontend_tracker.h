@@ -5,6 +5,7 @@
 #include "vslam/feature.h"
 #include "vslam/frame.h"
 #include "vslam/mappoint.h"
+#include "vslam/pose_covariance.h"
 #include "vslam/tracking_quality.h"
 
 #include <opencv2/core.hpp>
@@ -121,6 +122,11 @@ struct TrackingResult {
     // 锁外读 live mp->pos_s 违反 M1.4 快照约定（后端 BA 可改写坐标）——
     // 局部地图精修等后续步骤必须复用这份快照，而不是 live 指针坐标。
     std::vector<Vec3> association_points_s;
+    // M3.2（§7.5）：接受位姿的数值协方差——ξ=[tx,ty,tz,rx,ry,rz] 左扰动
+    // Exp(δξ)·pose_cs 的切空间协方差（相机系）。valid=false 表示退化/数值
+    // 不可用，调用方必须回退保守占位（单位阵 ×弱质量系数），不得发布假精度。
+    Mat6 pose_covariance = Mat6::Zero();
+    bool pose_covariance_valid = false;
 };
 
 /// 3D-3D 刚体估计结果（M1.4，值对象）
@@ -176,6 +182,15 @@ public:
         const cv::Mat& raw_gray,
         const std::vector<cv::KeyPoint>& keypoints,
         int image_cols, int image_rows) const;
+
+    /// M3.2（§7.5）：最终 PnP 内点的数值位姿协方差（相机系左扰动切空间）。
+    /// 纯函数聚合：pnpPoseCovariance + 相机内参；退化时 valid=false，
+    /// 调用方不得把该结果当作真实精度发布。
+    [[nodiscard]] PoseCovarianceResult estimatePnPCovariance(
+        const SE3& pose_cs,
+        const std::vector<cv::Point3f>& points_s,
+        const std::vector<cv::Point2f>& pixels,
+        const std::vector<int>& inlier_indices) const;
 
     /// 双目/RGB-D：视差（或深度）→ 每特征点相机系 3D 观测 pts_c（写 frame）。
     /// 单目或无右图时不写 pts_c。返回深度统计。

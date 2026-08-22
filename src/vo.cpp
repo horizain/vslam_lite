@@ -569,6 +569,9 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     status_.rotation_delta = 0.0;
     status_.quality = FrameQuality::Full;
     status_.failure_reason = FailureReason::None;
+    // M3.2：每帧复位协方差（拒绝/退化帧不得沿用上一帧结果）
+    status_.pose_covariance = Mat6::Zero();
+    status_.pose_covariance_valid = false;
     cv::Mat left_gray_raw;
     cv::Mat right_gray_raw;
     if (left_input.channels() == 3)
@@ -1474,6 +1477,9 @@ SE3 VisualOdometry::trackFrame() {
                     r.pose_rmse = refined.pose_rmse;
                     r.translation_delta = refined.translation_delta;
                     r.rotation_delta = refined.rotation_delta;
+                    // M3.2（§7.5）：精修位姿的协方差覆盖首轮结果
+                    r.pose_covariance = refined.pose_covariance;
+                    r.pose_covariance_valid = refined.pose_covariance_valid;
                     // 关联通过重投影筛选的局部地图新增匹配（合并集靠前 = local 部分）
                     for (size_t i = 0; i < keep_local.size(); i++) {
                         if (!keep_local[i] || !keep_all[i]) continue;
@@ -1496,6 +1502,10 @@ SE3 VisualOdometry::trackFrame() {
     status_.pose_rmse = r.pose_rmse;
     status_.translation_delta = r.translation_delta;
     status_.rotation_delta = r.rotation_delta;
+    // M3.2（§7.5）：接受位姿的数值协方差随最终 TrackingResult 传播；
+    // 拒绝/退化帧必须失效，防止陈旧协方差被下一帧误用。
+    status_.pose_covariance = r.pose_covariance;
+    status_.pose_covariance_valid = r.valid && r.pose_covariance_valid;
     if (r.recovering) state_ = State::RECOVERING;
     if (r.valid) {
         status_.tracking_valid = true;
@@ -1561,6 +1571,9 @@ SE3 VisualOdometry::trackFrameLK() {
             status_.pose_rmse = pnp.pose_rmse;
             status_.translation_delta = pnp.translation_delta;
             status_.rotation_delta = pnp.rotation_delta;
+            // M3.2（§7.5）：LK 路径同样传播数值协方差
+            status_.pose_covariance = pnp.pose_covariance;
+            status_.pose_covariance_valid = pnp.pose_covariance_valid;
             // 普通 LK 跟踪帧只继承临时地图点指针；正式观测仅由
             // 关键帧插入/Map::setObservation 记录。
             updateStatus((int)pts3d.size(), pnp.inliers, 0.0);
