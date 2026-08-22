@@ -39,6 +39,7 @@ enum class FailureReason {
     RelocalizationTimeout,      ///< 重定位超时
     BackendOverloaded,          ///< 后端过载
     MapIncompatible,            ///< 地图不兼容
+    ImageDegraded,              ///< M3.1：输入图像质量硬拒绝（模糊/暗/亮超限）
     InternalError               ///< 内部错误
 };
 

@@ -21,6 +21,20 @@ FrontendTracker::FrontendTracker(const Camera& camera, const TrackerConfig& conf
                        cfg_.stereo_reverse_prune);
 }
 
+QualityVerdict FrontendTracker::assessFrameQuality(
+    const cv::Mat& raw_gray,
+    const std::vector<cv::KeyPoint>& keypoints,
+    int image_cols, int image_rows) const {
+    // M3.1（§7.2）：图像统计 + 特征网格占用 → 三档判定。纯函数聚合，
+    // 无 RNG/全局状态；开关关闭时 classifyTrackingQuality 直接 Full 旁路。
+    const ImageQualityStats stats = assessImageQuality(raw_gray);
+    const int occupied = countOccupiedGridCells(
+        keypoints, image_cols, image_rows, cfg_.quality.grid_cols,
+        cfg_.quality.grid_rows);
+    return classifyTrackingQuality(stats, static_cast<int>(keypoints.size()),
+                                   occupied, cfg_.quality);
+}
+
 StereoStats FrontendTracker::computeStereoDepths(const Frame::Ptr& frame) const {
     return computeStereoDepths(frame, cv::Mat(), cv::Mat());
 }

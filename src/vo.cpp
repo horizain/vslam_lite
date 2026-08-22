@@ -68,6 +68,7 @@ TrackerConfig buildTrackerConfig(const VOConfig& cfg) {
     tc.keyframe_min_inliers = cfg.keyframe_min_inliers;
     tc.min_keyframe_interval = cfg.min_keyframe_interval;
     tc.max_keyframe_interval = cfg.max_keyframe_interval;
+    tc.quality = cfg.quality;
     return tc;
 }
 
@@ -348,6 +349,30 @@ VOConfig VOConfig::fromYaml(const std::string& path) {
             if (v["local_map_rescue_radius_px"])
                 cfg.local_map_rescue_radius_px = v["local_map_rescue_radius_px"].as<double>();
         }
+        // M3.1（§7.2）：Quality 段——缺省段保持代码默认（关闭），显式开启
+        // 由产品 profile yaml 控制；阈值边界语义见 tracking_quality.h。
+        if (auto q = root["Quality"]) {
+            if (q["enabled"])
+                cfg.quality.enabled = q["enabled"].as<bool>();
+            if (q["grid_cols"])
+                cfg.quality.grid_cols = q["grid_cols"].as<int>();
+            if (q["grid_rows"])
+                cfg.quality.grid_rows = q["grid_rows"].as<int>();
+            if (q["min_features_tracking"])
+                cfg.quality.min_features_tracking = q["min_features_tracking"].as<int>();
+            if (q["min_occupied_cells"])
+                cfg.quality.min_occupied_cells = q["min_occupied_cells"].as<int>();
+            if (q["hard_reject_blur_variance"])
+                cfg.quality.hard_reject_blur_variance =
+                    q["hard_reject_blur_variance"].as<double>();
+            if (q["degraded_blur_variance"])
+                cfg.quality.degraded_blur_variance =
+                    q["degraded_blur_variance"].as<double>();
+            if (q["max_dark_ratio"])
+                cfg.quality.max_dark_ratio = q["max_dark_ratio"].as<double>();
+            if (q["max_bright_ratio"])
+                cfg.quality.max_bright_ratio = q["max_bright_ratio"].as<double>();
+        }
         if (auto o = root["Optimizer"]) {
             if (o["local_window_size"])   cfg.local_window_size   = o["local_window_size"].as<int>();
             if (o["local_ba_iterations"]) cfg.local_ba_iterations = o["local_ba_iterations"].as<int>();
@@ -542,6 +567,8 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
     status_.pose_rmse = 0.0;
     status_.translation_delta = 0.0;
     status_.rotation_delta = 0.0;
+    status_.quality = FrameQuality::Full;
+    status_.failure_reason = FailureReason::None;
     cv::Mat left_gray_raw;
     cv::Mat right_gray_raw;
     if (left_input.channels() == 3)
@@ -584,10 +611,10 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
             feature_matcher_.extract(curr_frame_);
         }
     }
-    if (curr_frame_->keypoints.empty()) {
-        LOG_WARN("No features extracted, skipping frame");
-        // 即使本帧没有特征，也要先在地图读锁内捕获一致的参考位姿/锚点；
-        // 早退路径不得直接读取可能被回环提交改写的 live ref_frame_。
+    // 不可用帧的统一早退：在地图读锁内捕获一致的参考位姿/锚点后按失败
+    // 计数推进状态（RECOVERING/LOST），发布外推位姿。不读取可能被回环
+    // 提交改写的 live ref_frame_。
+    const auto earlyExitUnusableFrame = [&]() -> SE3 {
         {
             std::shared_lock<std::shared_mutex> lock(map_mutex_);
             const TrackingSnapshot next = captureTrackingSnapshot();
@@ -608,6 +635,31 @@ SE3 VisualOdometry::addFrameImpl(const cv::Mat& left, const cv::Mat& right, doub
         updateStatus(0, 0, 0.0);
         return (state_ != State::INITIALIZING)
             ? curr_frame_->pose_cs * snap_.T_ws.inverse() : SE3();
+    };
+    // M3.1（§7.2）：输入图像与特征分布质量门。评估用 CLAHE 增强前的原始
+    // 灰度（反映传感器输入）；HardReject 跳过本帧跟踪（与无特征路径同一
+    // 计数/状态/外推语义），Degraded 只压低置信度，不改任何几何验收阈值。
+    // 置于无特征检查之前：黑/白帧往往提不出特征，图像级判定必须给出
+    // 结构化原因码，而不是笼统的"无特征"。
+    if (cfg_.quality.enabled) {
+        const QualityVerdict verdict = frontend_tracker_.assessFrameQuality(
+            left_gray_raw, curr_frame_->keypoints,
+            left_gray_raw.cols > 0 ? left_gray_raw.cols : curr_frame_->image_gray.cols,
+            left_gray_raw.rows > 0 ? left_gray_raw.rows : curr_frame_->image_gray.rows);
+        status_.quality = verdict.band == QualityBand::Full
+            ? FrameQuality::Full : FrameQuality::Weak;
+        if (verdict.band == QualityBand::HardReject) {
+            status_.failure_reason = verdict.reason;
+            LOG_WARN("Frame quality hard reject (blur_var="
+                     << verdict.image.blur_variance
+                     << ", dark=" << verdict.image.dark_ratio
+                     << ", bright=" << verdict.image.bright_ratio << ")");
+            return earlyExitUnusableFrame();
+        }
+    }
+    if (curr_frame_->keypoints.empty()) {
+        LOG_WARN("No features extracted, skipping frame");
+        return earlyExitUnusableFrame();
     }
     // 时序 LK 已完成，旧上一帧的左灰度图不再被前端使用。若它同时是历史
     // 关键帧，仅释放像素数据；描述子/关键点/map_points/pts_c 继续留在地图中。

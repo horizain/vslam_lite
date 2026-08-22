@@ -19,6 +19,7 @@
 #include "vslam/relocalizer.h"
 #include "vslam/resource_budget.h"
 #include "vslam/runtime_resources.h"
+#include "vslam/tracking_state_machine.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -117,6 +118,9 @@ struct VOConfig {
     bool   local_map_rescue        = true;  // 首轮 PnP 失败时启用局部地图救援
     int    local_map_rescue_max_points = 800;
     double local_map_rescue_radius_px = 50.0;
+
+    // ---- M3.1 前端质量门（§7.2；代码默认关闭，产品 profile 显式开启）----
+    QualityConfig quality;
 
     // ---- 回环检测 (Phase 2) ----
     bool   enable_loop_closure   = false;   // run_slam 默认开、run_vo 默认关（A/B 对比）
@@ -244,6 +248,11 @@ public:
         double        pose_rmse    = 0.0;
         double        translation_delta = 0.0;
         double        rotation_delta = 0.0;
+        // M3.1（§7.2）：前端质量门判定与输入级拒绝原因。
+        // quality=Weak 时 Localizer 将状态压为 Degraded（协方差 ×4）；
+        // HardReject 帧走失败路径，pose_valid=false 且 reason=ImageDegraded。
+        FrameQuality  quality       = FrameQuality::Full;
+        FailureReason failure_reason = FailureReason::None;
     };
 
     VisualOdometry(const Camera& camera, const VOConfig& cfg = VOConfig());

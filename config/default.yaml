@@ -25,6 +25,18 @@ Feature:
   match_ratio: 0.7         # 最近邻/次近邻比率测试阈值
   ransac_threshold: 3.0    # RANSAC 重投影误差阈值
 
+# ---- M3.1 前端质量门（§7.2 首版参数；阈值非数据集标定值）----
+Quality:
+  enabled: true            # 产品 profile 显式开启；deterministic 档关闭保持逐位一致
+  grid_cols: 8             # 特征分布网格
+  grid_rows: 6
+  min_features_tracking: 300    # 低于该特征数 → 至多 Degraded（不拒绝）
+  min_occupied_cells: 12        # 网格占用低于该值 → 至多 Degraded（不拒绝）
+  hard_reject_blur_variance: 10.0   # Laplacian 方差 <10 → 输入硬拒绝
+  degraded_blur_variance: 60.0      # 方差 [10,60) → 允许跟踪但至多 Degraded
+  max_dark_ratio: 0.80          # gray<=5 占比 >0.8 → 硬拒绝
+  max_bright_ratio: 0.80        # gray>=250 占比 >0.8 → 硬拒绝
+
 # ---- 运行时资源参数 ----
 Runtime:
   opencv_threads: 6        # OpenCV/TBB 请求上限；异步 backend 会预留 1 个核

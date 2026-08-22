@@ -5,6 +5,7 @@
 #include "vslam/feature.h"
 #include "vslam/frame.h"
 #include "vslam/mappoint.h"
+#include "vslam/tracking_quality.h"
 
 #include <opencv2/core.hpp>
 
@@ -62,6 +63,8 @@ struct TrackerConfig {
     int    keyframe_min_inliers = 15;
     int    min_keyframe_interval = 10;
     int    max_keyframe_interval = 15;
+    // M3.1（§7.2）：输入图像与特征分布质量门（代码默认关闭以兼容旧配置）
+    QualityConfig quality;
 };
 
 /// 双目深度统计（M1.4，值对象）
@@ -164,6 +167,15 @@ struct KeyframeInput {
 class FrontendTracker {
 public:
     FrontendTracker(const Camera& camera, const TrackerConfig& config = TrackerConfig());
+
+    /// M3.1（§7.2）：输入图像与特征分布质量评估（纯函数聚合入口）。
+    /// raw_gray 必须是 CLAHE 增强前的原始灰度（统计反映传感器输入）；
+    /// 非空且 8-bit 单通道时做像素级判定，否则只按特征分布降级。
+    /// 只输出 QualityVerdict，不改变任何跟踪决策。
+    [[nodiscard]] QualityVerdict assessFrameQuality(
+        const cv::Mat& raw_gray,
+        const std::vector<cv::KeyPoint>& keypoints,
+        int image_cols, int image_rows) const;
 
     /// 双目/RGB-D：视差（或深度）→ 每特征点相机系 3D 观测 pts_c（写 frame）。
     /// 单目或无右图时不写 pts_c。返回深度统计。

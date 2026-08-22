@@ -1,7 +1,8 @@
 # VSLAM 开发日志
 
 > 创建日期: 2026-07-30
-> 最后更新: 2026-08-11（Flat-DBoW3/mobile 全程与 full gate 失败证据见 §3.43；
+> 最后更新: 2026-08-22（M3.1 前端质量门见 §3.47；
+> Flat-DBoW3/mobile 全程与 full gate 失败证据见 §3.43；
 > 彩色双目点云见 §3.44；M2 仍未通过准确度/实时/RSS 产品门）
 >
 > 阅读说明：本文是追加式开发档案，早期章节保留当时的字段、依赖和实验结论；它们不是
@@ -2206,3 +2207,60 @@ KITTI 00 旧目录独立诊断轮：有效轨迹 `4503/4541`（99.16%）、LOST 
 FPS 28.82、p99 123.6ms、deadline miss 1.06%、RSS 约 1.14GiB；SE3 ATE RMSE
 46.12m、>10m 跳变 2。相对本轮前的 4446/4541、LOST 5，恢复路径有效性改善，但
 ATE/尾延迟/跳变仍未达到完整产品门，不能据此宣称长程实时定位已完成。
+
+### 3.47 M3.1 视觉前端质量门（2026-08-22）
+
+按 `PRODUCTION_LOCALIZATION_PLAN.md` §7.1/§7.2 落地 M3.1（图像质量 + 特征分布
+两层质量门），只做置信度分层，不改变任何几何验收阈值。
+
+**新增纯函数模块 `tracking_quality.{h,cpp}`**（无 RNG、无全局状态、值进出）：
+
+- `assessImageQuality`：Laplacian 方差 + 暗(gray≤5)/亮(gray≥250)占比统计；
+  仅 CV_8UC1 可评估，其他类型 `assessable=false` 不做像素级判定（§7.2）。
+- `countOccupiedGridCells`：特征点 8×6 网格占用格子数（越界忽略、边界归末格）。
+- `classifyTrackingQuality`：三档判定——方差<10 或暗/亮占比>0.8 →
+  `HardReject`+新原因码 `FailureReason::ImageDegraded`；方差∈[10,60) 或特征
+  <300 或占用<12 格 → 至多 `Degraded`（不拒绝、无失败原因码）；否则 `Full`。
+- 阈值为 §7.2 产品规格首版参数，非数据集标定值。
+
+**接线**：`FrontendTracker::assessFrameQuality` 聚合入口（TrackerConfig 嵌入
+`QualityConfig`）；VO 在 `addFrameImpl` 特征提取后调用一次——评估用 CLAHE 增强
+前的原始灰度。HardReject 复用与"无特征"完全相同的早退语义（快照捕获/失败计数/
+RECOVERING→LOST 推进/外推位姿）；Degraded 只写 `Status.quality=Weak`。
+`localizer.cpp` 将 Weak 映射进状态机（连续 2 帧 → Degraded、协方差 ×4），
+输入级硬拒绝时上报结构化原因码。原"无特征"早退块重构为共享 lambda，
+质量门置于其前——黑帧往往提不出特征，图像级判定必须给出结构化原因码而非笼统
+的"无特征"。
+
+**配置**：代码默认 `enabled=false`（旧用户配置缺省段保持旧行为）；
+default/mobile 显式开启（§7.2 数值），deterministic 显式关闭保持 L1 黄金参考
+逐位一致（遵循 §3.45/§3.46 先例）。robot.yaml 是 Localizer Facade 配置，
+VO 质量门随主 profile，不加死配置。
+
+**测试（先红后绿）**：`test/test_tracking_quality.cpp` 19 项——图像统计
+（纹理/纯黑/纯白/高斯模糊/非 8 位）、网格覆盖（满格/单点/边界/越界）、判定
+（Full/Degraded/HardReject、10/60/0.8 边界语义、硬拒优先、开关旁路、不可评估
+退化）、聚合入口开关、以及 VO 级黑帧故障注入（硬拒绝 → pose_valid=false +
+`ImageDegraded` + Map revision 双不变 + 故障消失后重定位恢复跟踪，§7.6 子集；
+场景用带深度变化的唯一灰度 3D 块，避免平面+平移的本质矩阵退化）。CTest 现在
+21 个目标。
+
+**范围扩大说明**（§12 允许清单之外的最小接线）：vo.{h,cpp}（Status 两字段、
+Quality 段 YAML 解析、早退复用与门调用约 60 行）、localizer.cpp（Weak 映射与
+原因码透传约 6 行）；pose_gate.* 本轮未改动。
+
+**验收**：
+- 全量 CTest 21/21 PASS；`git diff --check` 干净。
+- 新鲜 Release 提交门 L0/L1/L2 PASSED：L1 确定性轨迹逐位一致；L2 500 帧×3 轮
+  最差 p99 33.0ms、valid_ratio 1.0、jumps_10m 0、lost 0、submap_reinit 0。
+- KITTI 00 完整序列诊断轮（default.yaml，质量门开启）：**零硬拒绝触发**，
+  4446/4541 有效、LOST 5、回环 0、FPS 26.25、p99 243ms、miss 2.38%——与
+  §3.45 同配置诊断轮（4446/4541、LOST 5、p99 138.8ms）同方差带；弱质量分层
+  不触碰几何路径，本数据上未产生行为差异。
+
+**未验证边界**：① M3.2 协方差仍为占位（单位阵 ×4），Weak 的协方差放大语义要
+到数值 Jacobian 落地才有真实输出；② 故障注入仅覆盖黑帧一类的合成样本，
+fault_injection.py 回放框架属 M3.3；③ 模糊/暗亮真实样本未在 KITTI 出现过，
+HardReject/Degraded 在真实数据上的触发率未知；④ mobile/ARM 未复测；⑤ 默认档
+完整长程产品门（ATE ≤40m、p99 ≤80ms、跳变 0、子地图重建 ≤1）仍未通过，
+与本任务无关但继续如实记录。

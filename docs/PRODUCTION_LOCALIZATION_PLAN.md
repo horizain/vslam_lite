@@ -22,6 +22,12 @@
 > 2026-08-19：增加 topology-aware 参考/局部地图缓存和首轮 PnP 失败后的有界局部地图救援；
 > 独立 KITTI 诊断轮将 LOST 从 5 降至 2、有效轨迹升至 99.16%，但 ATE 46.12m、p99
 > 123.6ms、2 个 >10m 跳变仍未通过完整产品门。
+> 2026-08-22：M3.1 质量门落地（§7.1/§7.2 两层：图像模糊/暗亮硬拒绝 + 特征分布
+> 弱质量分层，`tracking_quality.{h,cpp}` + `FailureReason::ImageDegraded` +
+> Localizer Degraded/协方差 ×4 接线）。代码默认关闭，default/mobile 显式开启，
+> deterministic 关闭保持 L1 逐位一致；KITTI 00 完整序列零硬拒绝触发，几何路径
+> 未变。M3.2 协方差与 M3.3 故障回放仍未实施；默认档完整产品门（ATE/p99/跳变/
+> 子地图重建）继续未通过。
 > 审计基线：`d90cfac`，2026-08-10
 > 适用范围：把当前单目/双目 VO + Local BA + DBoW3 回环 + Atlas 原型，演进为
 > 可供机器人连续运行 8～24 小时的核心定位组件。

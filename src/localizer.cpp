@@ -235,12 +235,15 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
     last_timestamp_ = timestamp;
     has_last_timestamp_ = true;
 
-    // M0 质量映射：pose_valid → Full，否则 Failed；Weak 细分留给 M3 质量门。
+    // M0 质量映射：pose_valid → Full，否则 Failed。
+    // M3.1（§7.2）：前端质量门把模糊/特征稀疏帧压为 Weak——状态机连续
+    // 2 帧后进入 Degraded、协方差 ×4；几何验收阈值不受影响。
     FrameQuality q = st.pose_valid ? FrameQuality::Full : FrameQuality::Failed;
     // M2.2 遗留清理（§6.3 第 6 步）：预算耗尽停止建图期间，跟踪质量压为
     // Weak——状态机连续 2 帧后进入 Degraded；reason 上报 BackendOverloaded。
     const bool budget_stopped = vo_->mapGrowthStopped();
-    if (q == FrameQuality::Full && budget_stopped) q = FrameQuality::Weak;
+    if (q == FrameQuality::Full && (budget_stopped || st.quality == FrameQuality::Weak))
+        q = FrameQuality::Weak;
 
     PoseEstimate out;
     out.sequence = seq;
@@ -272,6 +275,9 @@ PoseEstimate Localizer::processValidFrame(const cv::Mat& left, const cv::Mat& ri
         // §6.3 第 6 步（M2.2 遗留清理）：预算停止建图期间计入 BackendOverloaded
         // （reason 覆盖：质量压弱已使状态进入 Degraded，原因码由预算决定）
         if (budget_stopped && out.pose_valid) out.reason = FailureReason::BackendOverloaded;
+        // M3.1：输入级硬拒绝（图像模糊/暗亮超限）上报结构化原因码
+        if (!out.pose_valid && st.failure_reason != FailureReason::None)
+            out.reason = st.failure_reason;
         out.pose_valid = sm_out.pose_valid;
         out.prediction_only = sm_out.prediction_only;
         latest_estimate_ = out;

@@ -25,6 +25,18 @@ Feature:
   match_ratio: 0.7
   ransac_threshold: 3.0
 
+# ---- M3.1 前端质量门（§7.2 首版参数；与 default.yaml 同源）----
+Quality:
+  enabled: true
+  grid_cols: 8
+  grid_rows: 6
+  min_features_tracking: 300    # mobile 提取 600-800 特征，跟踪期偶发降级为预期行为
+  min_occupied_cells: 12
+  hard_reject_blur_variance: 10.0
+  degraded_blur_variance: 60.0
+  max_dark_ratio: 0.80
+  max_bright_ratio: 0.80
+
 Runtime:
   opencv_threads: 2        # ARM/轻量档控制热功耗和线程迁移
   async_backend: true      # PGO 在前缀快照上锁外求解，前端不等待

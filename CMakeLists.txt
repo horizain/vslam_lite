@@ -132,6 +132,7 @@ set(VSLAM_SOURCES
     src/tracking_state_machine.cpp
     src/localizer.cpp
     src/pose_gate.cpp
+    src/tracking_quality.cpp
     src/relocalizer.cpp
     src/frontend_tracker.cpp
     src/local_mapper.cpp
@@ -145,6 +146,7 @@ set(VSLAM_HEADERS
     include/vslam/tracking_state_machine.h
     include/vslam/localizer.h
     include/vslam/pose_gate.h
+    include/vslam/tracking_quality.h
     include/vslam/relocalizer.h
     include/vslam/frontend_tracker.h
     include/vslam/local_mapper.h
@@ -295,6 +297,14 @@ if(BUILD_TESTS)
         target_compile_options(test_localizer_contract PRIVATE -UNDEBUG)
     endif()
     add_test(NAME test_localizer_contract COMMAND test_localizer_contract)
+
+    # M3.1 前端质量门（图像/特征分布，独立 CTest）
+    add_executable(test_tracking_quality test/test_tracking_quality.cpp)
+    target_link_libraries(test_tracking_quality vslam)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_tracking_quality PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME test_tracking_quality COMMAND test_tracking_quality)
 
     # M1.1 PoseGate（独立 CTest）
     add_executable(test_pose_gate test/test_pose_gate.cpp)
